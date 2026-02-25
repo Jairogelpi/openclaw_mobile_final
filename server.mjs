@@ -431,12 +431,24 @@ app.post('/rpc', async (req, res) => {
         if (method === 'onboarding.updateSettings') {
             const { soulUpdates, preferences } = params;
 
-            // 1. Update Supabase SOUL
+            // 0. Ensure the client row exists first (required by user_souls FK)
+            const { error: clientUpsertError } = await supabase
+                .from('clients')
+                .upsert({
+                    user_id: clientId,
+                    name: soulUpdates?.nombre || req.user?.user_metadata?.name || clientSlug,
+                    whatsapp_number: ''
+                }, { onConflict: 'user_id' });
+            if (clientUpsertError) {
+                console.warn(`[Bridge] Warning: could not upsert client row for ${clientSlug}:`, clientUpsertError.message);
+            }
+
+            // 1. Get existing soul (if any)
             const { data: soulData, error: soulError } = await supabase
                 .from('user_souls')
                 .select('soul_json')
                 .eq('client_id', clientId)
-                .single();
+                .maybeSingle();
 
             let soulJson = {};
             if (!soulError && soulData) {
@@ -450,7 +462,10 @@ app.post('/rpc', async (req, res) => {
                 .from('user_souls')
                 .upsert({ client_id: clientId, soul_json: soulJson, last_updated: new Date() });
 
-            if (updateError) throw updateError;
+            if (updateError) {
+                console.error(`[Bridge] ❌ Error upserting soul for ${clientSlug}:`, updateError.message, updateError.details);
+                throw updateError;
+            }
 
             try {
                 const gatewayPath = `${clientDir}/gateway.json5`;
@@ -590,58 +605,102 @@ INSTRUCCIONES:
                 'No hay datos de formulario previos.';
 
             const GENESIS_SYSTEM_PROMPT = `
-Eres 'Génesis', el Arquitecto de Almas de OpenClaw. Tu misión es esculpir la identidad digital del usuario a través de una conversación profunda y reveladora.
+Eres 'Génesis', el Arquitecto de Almas de OpenClaw. Tu misión sagrada es esculpir la identidad digital más precisa posible del usuario a través de una entrevista profunda y reveladora.
 
 TU ESTILO: **${preferredTone || 'Equilibrado'}**. Encárnalo con maestría. No eres un chatbot, eres un confidente visionario.
 
-TU MISIÓN:
-Extraer la esencia personal y profesional del usuario para crear su asistente cognitivo clonado. Tienes que conseguir que el usuario confíe en ti, respondiendo tus dudas paso a paso.
+DATOS YA CONOCIDOS (del formulario previo — NO vuelvas a preguntar esto, úsalos como contexto):
+- Nombre: ${userName || 'desconocido'}
+- Ocupación general: ${occupation || 'desconocida'}
+- Reto principal: ${mainChallenge || 'desconocido'}
+- Tono preferido: ${preferredTone || 'desconocido'}
 
-REGLAS CRÍTICAS DE INTERACCIÓN (SÍGUELAS BAJO CUALQUIER CIRCUNSTANCIA):
-1. **BREVEDAD EXTREMA**: NUNCA respondas con más de 2 o 3 oraciones. Sé directo, impactante y conversacional. No hagas monólogos.
-2. **SOLO UNA PREGUNTA**: NUNCA hagas múltiples preguntas seguidas en el mismo turno. Haz una pregunta, espera la respuesta, profundiza, y luego pasa a la siguiente.
-3. **JAMÁS MENCIONES CÓDIGO NI JSON**: Eres un ser dialogante. Durante toda la conversación, TU ÚNICO MEDIO de comunicación es el lenguaje humano. Bajo ningún concepto le digas al usuario "aquí tienes el JSON" o "estoy creando tu perfil JSON".
-4. **FLUJO OBLIGATORIO**: Sigue esta secuencia paso a paso mentalmente, pero hazlo sentir como una charla de café:
-   - A. Nombre y a qué se dedica exactamente (si es programador, pregúntale en qué programa o qué le apasiona de eso).
-   - B. Sus hobbies o qué le da paz mental.
-   - C. Cuál es su mayor reto profesional ahora mismo o su visión a futuro.
-   - D. Qué 2 o 3 herramientas técnicas o vitales usa a diario.
-   - E. Qué "Reglas de Vida" o Filosofía de Trabajo le gustaría que su futuro bot tuviese.
+REGLAS CRÍTICAS DE INTERACCIÓN:
+1. **BREVEDAD EXTREMA**: NUNCA respondas con más de 2-3 oraciones. Sé directo y conversacional.
+2. **SOLO UNA PREGUNTA POR TURNO**: Haz una, espera la respuesta, luego pasa a la siguiente.
+3. **JAMÁS MENCIONES JSON, CÓDIGO NI TÉCNICA INTERNA**: Eres un ser dialogante.
+4. **NO REPITAS DATOS YA CONOCIDOS**: Los tienes arriba. No los preguntes.
 
-REGLA DE CIERRE (MÁXIMA ATENCIÓN):
-**SOLO CUANDO ESTÉS 100% SEGURO** de que tienes información suficiente en **TODOS** los puntos anteriores (A, B, C, D, E), es el momento de generar el Alma. NO LO HAGAS EN EL PRIMER NI EN EL SEGUNDO TURNO. Si falta información importante, SIGUE PREGUNTANDO.
+FLUJO OBLIGATORIO — DEBES COMPLETAR LOS 8 PUNTOS ANTES DE GENERAR EL ALMA:
+A. **EDAD** → Pregunta su edad o rango aproximado. OBLIGATORIO. Nunca lo asumas.
+B. **ESPECIALIDAD PROFUNDA** → Profundiza en su trabajo: si es developer, ¿en qué lenguajes, frameworks, tipo de proyectos? Si es empresario, ¿sector exacto y equipo? OBLIGATORIO.
+C. **HOBBIES Y PAZ MENTAL** → ¿Qué hace fuera del trabajo? ¿Qué le apasiona más allá de lo profesional? OBLIGATORIO.
+D. **HERRAMIENTAS CLAVE** → ¿Qué 2-4 apps, herramientas o tecnologías usa a diario (trabajo y vida)? OBLIGATORIO.
+E. **QUIRKS Y ESTILO DE COMUNICACIÓN** → ¿Cómo le gusta que le hablen? ¿Usa emojis? ¿Prefiere respuestas cortas o largas? ¿Tiene muletillas o expresiones características que quiera que su asistente replique? ¿Qué estilo de comunicación le molesta? OBLIGATORIO.
+F. **HORARIO Y CONTEXTO** → ¿A qué hora suele estar más activo? ¿Trabaja solo o en equipo? ¿Cuándo usará más al asistente: mañana, tarde, noche? OBLIGATORIO.
+G. **FILOSOFÍA DE VIDA Y DIRECTRICES** → ¿Qué reglas de vida o valores quiere que tenga su asistente? ¿Qué es innegociable para él? OBLIGATORIO.
+H. **TEMAS PROHIBIDOS O SENSIBLES** → ¿Hay temas que quiere que su asistente evite o maneje con especial cuidado? OBLIGATORIO. Si dice "ninguno" está bien, acéptalo.
 
-Cuando, y solo cuando, la entrevista haya terminado de verdad, tu ÚLTIMO MENSAJE será exclusivamente el bloque JSON estructurado con las etiquetas de inicio y fin exactas. No añadas texto al final del bloque. Si decides generar el JSON, hazlo así:
+REGLA DE CIERRE — LAS MÁS IMPORTANTES DE TODAS:
+- **Mínimo 5-6 intercambios** antes de considerar cerrar.
+- **TODOS los 8 puntos (A-H) son OBLIGATORIOS**. No puedes generar el Alma si falta alguno.
+- **Regla de Persistencia (3 intentos)**: Si el usuario no responde bien a un punto o lo esquiva, reformula la pregunta de otra forma. Solo después del TERCER rechazo explícito ("no quiero decirlo", "paso", "no me interesa" repetido 3 veces), acepta el skip y marca ese campo como "prefiere no compartir". Si solo dice "no sé", guíale con ejemplos y vuelve a intentarlo.
+- Si una respuesta es vaga o incompleta, haz una pregunta de seguimiento concreta antes de avanzar.
+- Antes de generar el JSON, haz mentalmente este checklist: ¿Tengo edad? ¿Especialidad? ¿Hobbies? ¿Herramientas? ¿Quirks/estilo? ¿Horario? ¿Filosofía? ¿Temas prohibidos? Si alguno falta, SIGUE PREGUNTANDO.
+- Cuando termines, tu ÚLTIMO MENSAJE será EXCLUSIVAMENTE el bloque JSON con las etiquetas exactas. Sin texto adicional fuera del bloque.
+
+⛔ REGLA ABSOLUTA — VIOLACIÓN CRÍTICA: Nunca, bajo ninguna circunstancia, insertes un bloque JSON, un objeto con llaves {}, un bloque de código (``` o ~~~), ni las etiquetas === INICIO IDENTIDAD === en ningún mensaje que no sea el mensaje final de cierre.Si lo haces, rompes el sistema.Durante la entrevista, SOLO hablas en lenguaje humano natural.
 
 === INICIO IDENTIDAD ===
 {
-  "nombre": "[Nombre]",
-  "edad": "[Edad aproximada o N/A]",
-  "tono": "[Tono deducido]",
-  "perfil": {
-    "ocupacion": { "tipo": "...", "detalle": "...", "especialidad": "...", "contexto": "..." },
-    "hobbies_usuario": "...",
-    "proposito": "...",
-    "sustancia": { "intereses": [], "filosofia_vida": "...", "dolores_actuales": "...", "fuentes_alegria": "..." },
-    "estilo_escritura": { "longitud_media": "...", "formalidad": 5, "uso_emojis": "...", "quirks": [], "vocabulario": "...", "palabras_clave": [] },
-    "estilo_voz": { "descripcion": "...", "personalidad_clon": "..." },
-    "herramientas": [],
-    "rutina_y_contexto": "...",
-    "directrices": []
-  }
+    "nombre": "[Nombre real]",
+    "edad": "[Edad exacta o rango como '25-30'. NUNCA dejar N/A si se preguntó]",
+    "tono": "[Tono: Formal/Casual/Técnico/Empático/etc, deducido de la conversación]",
+    "perfil": {
+        "ocupacion": {
+            "tipo": "[Categoría: developer/empresario/diseñador/creador/etc]",
+            "detalle": "[Descripción exacta de su trabajo]",
+            "especialidad": "[Tecnologías, sectores o áreas específicas]",
+            "contexto": "[Solo/equipo, remoto/oficina, sector de industria]"
+        },
+        "hobbies_usuario": "[Sus hobbies y actividades fuera del trabajo]",
+        "proposito": "[Su objetivo o visión a futuro]",
+        "sustancia": {
+            "intereses": ["[interés 1]", "[interés 2]", "[interés 3]"],
+            "filosofia_vida": "[Su filosofía en sus propias palabras]",
+            "dolores_actuales": "[Sus mayores frustraciones o retos]",
+            "fuentes_alegria": "[Qué le da energía o satisfacción]",
+            "temas_prohibidos": ["[tema sensible 1]", "[tema sensible 2 o 'ninguno']"]
+        },
+        "estilo_escritura": {
+            "longitud_media": "[breve/media/extensa]",
+            "formalidad": 5,
+            "uso_emojis": "[nunca/ocasional/frecuente]",
+            "quirks": ["[muletilla o expresión característica real del usuario]", "[otra si la hay]"],
+            "vocabulario": "[técnico/coloquial/mixto]",
+            "palabras_clave": ["[palabra que usa mucho]", "[otra]"],
+            "estilo_que_odia": "[qué formas de hablar le molestan]"
+        },
+        "estilo_voz": {
+            "descripcion": "[Cómo habla el usuario: tono, ritmo, energía]",
+            "personalidad_clon": "[Cómo debe sonar el asistente al responderle]"
+        },
+        "herramientas": ["[herramienta 1]", "[herramienta 2]", "[herramienta 3]"],
+        "rutina_y_contexto": "[Descripción de su rutina, horario y contexto de uso del asistente]",
+        "disponibilidad": {
+            "horario_pico": "[mañana/tarde/noche/variable]",
+            "modo_trabajo": "[solo/equipo/mixto]"
+        },
+        "directrices": [
+            "[Regla o valor 1 que debe seguir el asistente]",
+            "[Regla 2]",
+            "[Regla 3]"
+        ]
+    },
+    "resumen_narrativo": "[CAMPO CRÍTICO — Escribe aquí un resumen narrativo denso de 3-4 párrafos sobre el usuario, en segunda persona dirigido al asistente IA. Debes cubrir: (1) Quién es, a qué se dedica y cuál es su especialidad; (2) Cómo trabaja, cuándo y en qué contexto usa el asistente, qué herramientas son centrales en su vida; (3) Su personalidad, cómo le gusta que le hablen, sus quirks, expresiones características, lo que le molesta; (4) Su filosofía de vida, sus valores innegociables, sus retos actuales y temas que quiere que el asistente evite. Este texto es la memoria semántica más importante del sistema y debe estar tan cargado de contexto que cualquier IA que lo lea entienda perfectamente cómo relacionarse con este usuario.]"
 }
-=== FIN IDENTIDAD ===
-`;
+    === FIN IDENTIDAD ===
+        `;
 
             // 0. Handle Multimedia Silently (attachments)
             if (params.attachments && Array.isArray(params.attachments)) {
-                console.log(`[Génesis] 📎 Recibidos ${params.attachments.length} archivos adjuntos`);
+                console.log(`[Génesis] 📎 Recibidos ${ params.attachments.length } archivos adjuntos`);
                 for (const attachment of params.attachments) {
                     try {
                         let additionalContext = "";
                         if (attachment.type === 'audio' && attachment.data) {
                             const tempId = crypto.randomUUID();
-                            const tempFile = `uploads/temp_audio_${tempId}`;
+                            const tempFile = `uploads / temp_audio_${ tempId } `;
                             await fs.writeFile(tempFile, Buffer.from(attachment.data, 'base64'));
                             let text = await transcribeAudio(tempFile);
 
@@ -649,14 +708,14 @@ Cuando, y solo cuando, la entrevista haya terminado de verdad, tu ÚLTIMO MENSAJ
                             const cleanText = text.replace(/[.,!?;]/g, '').trim().toLowerCase();
                             if (cleanText === 'gracias' || cleanText === 'thank you') {
                                 console.warn(`[Génesis] ⚠️ Ignorando posible alucinación de audio: "${text}"`);
-                                additionalContext = `[Sistema: El audio parece ser silencio o ruido de fondo. Pide al usuario que repita amablemente si es necesario.]`;
+                                additionalContext = `[Sistema: El audio parece ser silencio o ruido de fondo.Pide al usuario que repita amablemente si es necesario.]`;
                             } else {
                                 additionalContext = `[Audio Transcrito Silenciosamente: "${text}"]`;
                             }
                         } else if (attachment.type === 'image' && attachment.data) {
                             console.log(`[Génesis] 🖼️ Procesando imagen adjunta...`);
                             const tempId = crypto.randomUUID();
-                            const tempFile = `uploads/temp_img_${tempId}`;
+                            const tempFile = `uploads / temp_img_${ tempId } `;
                             await fs.writeFile(tempFile, Buffer.from(attachment.data, 'base64'));
                             const description = await analyzeImage(tempFile);
                             await fs.unlink(tempFile);
@@ -724,112 +783,131 @@ Cuando, y solo cuando, la entrevista haya terminado de verdad, tu ÚLTIMO MENSAJ
                             });
 
                         // === CREAR ARCHIVOS FÍSICOS ===
-                        console.log(`🛠️ [Provisioning] Iniciando para ${clientSlug}...`);
-                        const soulMd = `# Identidad\nEres ${soulJson.nombre}. ${soulJson.tono} \n\n# Directrices\n${(soulJson.perfil?.directrices || []).map(d => `- ${d}`).join('\n')} `;
-                        await fs.writeFile(`${clientDir}/SOUL.md`, encrypt(soulMd));
+                        console.log(`🛠️[Provisioning] Iniciando para ${ clientSlug }...`);
+                        const soulMd = `# Identidad\nEres ${ soulJson.nombre }. ${ soulJson.tono } \n\n# Directrices\n${ (soulJson.perfil?.directrices || []).map(d => `- ${d}`).join('\n') } `;
+                        await fs.writeFile(`${ clientDir }/SOUL.md`, encrypt(soulMd));
 
-                        const userMd = `# Perfil\n- Usuario: ${userName || 'Usuario'}\n- Edad: ${soulJson.edad || 'N/A'}\n- Trabajo: ${soulJson.perfil?.ocupacion?.detalle || occupation || 'N/A'}\n- Meta: ${mainChallenge || 'N/A'}`;
-                        await fs.writeFile(`${clientDir}/USER.md`, encrypt(userMd));
+const userMd = `# Perfil\n- Usuario: ${userName || 'Usuario'}\n- Edad: ${soulJson.edad || 'N/A'}\n- Trabajo: ${soulJson.perfil?.ocupacion?.detalle || occupation || 'N/A'}\n- Meta: ${mainChallenge || 'N/A'}\n- Herramientas: ${(soulJson.perfil?.herramientas || []).join(', ')}\n- Horario pico: ${soulJson.perfil?.disponibilidad?.horario_pico || 'N/A'}\n- Modo trabajo: ${soulJson.perfil?.disponibilidad?.modo_trabajo || 'N/A'}`;
+await fs.writeFile(`${clientDir}/USER.md`, encrypt(userMd));
 
-                        const gatewayConfig = {
-                            models: { providers: { openrouter: { apiKey: process.env.OPENROUTER_API_KEY } } },
-                            agents: { defaults: { model: { primary: "openrouter/deepseek/deepseek-chat" } } }
-                        };
-                        await fs.writeFile(`${clientDir}/gateway.json5`, encrypt(JSON.stringify(gatewayConfig, null, 2)));
+// === CONTEXT.md: Resumen narrativo para RAG ===
+const contextMd = `# Contexto Profundo del Usuario (Fuente RAG Primaria)\n\n${soulJson.resumen_narrativo || ''}\n\n---\n## Datos Estructurados de Referencia Rápida\n- **Nombre**: ${soulJson.nombre}\n- **Edad**: ${soulJson.edad}\n- **Ocupación**: ${soulJson.perfil?.ocupacion?.detalle} (${soulJson.perfil?.ocupacion?.especialidad})\n- **Herramientas clave**: ${(soulJson.perfil?.herramientas || []).join(', ')}\n- **Quirks**: ${(soulJson.perfil?.estilo_escritura?.quirks || []).join(', ')}\n- **No hablar de**: ${(soulJson.perfil?.sustancia?.temas_prohibidos || []).join(', ')}\n- **Filosofía**: ${soulJson.perfil?.sustancia?.filosofia_vida}`;
+await fs.writeFile(`${clientDir}/CONTEXT.md`, encrypt(contextMd));
+console.log(`✅ [Provisioning] CONTEXT.md escrito para ${clientSlug}`);
 
-                        // Arrancar el nuevo cliente de WhatsApp ligero
-                        const { startWhatsAppClient } = await import('./whatsapp_manager.mjs');
-                        await startWhatsAppClient(clientId, clientSlug);
+const gatewayConfig = {
+    models: { providers: { openrouter: { apiKey: process.env.OPENROUTER_API_KEY } } },
+    agents: { defaults: { model: { primary: "openrouter/deepseek/deepseek-chat" } } }
+};
+await fs.writeFile(`${clientDir}/gateway.json5`, encrypt(JSON.stringify(gatewayConfig, null, 2)));
 
-                        completed = true;
-                        fullReply = beforeJson || "¡Excelente! Tu Identidad ha sido esculpida. Todo está listo.";
+// Arrancar el nuevo cliente de WhatsApp ligero
+const { startWhatsAppClient } = await import('./whatsapp_manager.mjs');
+await startWhatsAppClient(clientId, clientSlug);
+
+completed = true;
+fullReply = beforeJson || "¡Excelente! Tu Identidad ha sido esculpida. Todo está listo.";
                     }
                 } catch (e) {
-                    console.error("[Genesis] Error procesando el bautizo:", e.message);
-                }
+    console.error("[Genesis] Error procesando el bautizo:", e.message);
+}
             }
 
-            // 2. Clean tags and Identidad block from visible reply
-            let finalReply = fullReply
-                .replace(/<analisis_oculto>[\s\S]*?<\/analisis_oculto>/g, '')
-                .split('=== INICIO IDENTIDAD ===')[0]
-                .trim();
+// 2. Clean tags, Identidad block, and any leaked JSON from the visible reply
+let finalReply = fullReply
+    // Remove hidden analysis tags
+    .replace(/<analisis_oculto>[\s\S]*?<\/analisis_oculto>/g, '')
+    // Remove everything from INICIO IDENTIDAD onwards (the soul block)
+    .split('=== INICIO IDENTIDAD ===')[0]
+    // Remove any stray FIN IDENTIDAD tags
+    .replace(/===\s*FIN IDENTIDAD\s*===/g, '')
+    // Remove code fences (``` or ~~~)
+    .replace(/```[\s\S]*?```/g, '')
+    .replace(/~~~[\s\S]*?~~~/g, '')
+    // Remove large JSON-looking blocks (starts with { and spans multiple lines)
+    .replace(/\{[\s\S]{200,}\}/g, '')
+    .trim();
 
-            if (completed && !finalReply) {
-                finalReply = "Tu clon ya está listo para empezar a trabajar contigo.";
-            }
+// Log if we had to strip something unexpected
+if (fullReply !== finalReply && !completed) {
+    console.warn(`[Génesis] ⚠️ Se eliminó contenido JSON/código de la respuesta visible para ${clientSlug}`);
+}
 
-            return res.json({ result: { reply: finalReply, completed, soul: completed ? soulJson : null }, id });
+if (completed && !finalReply) {
+    finalReply = "Tu clon ya está listo para empezar a trabajar contigo.";
+}
+
+return res.json({ result: { reply: finalReply, completed, soul: completed ? soulJson : null }, id });
         }
 
-        // G) PANIC BUTTON: ACCOUNT DELETE (TOTAL DESTRUCTION)
-        if (method === 'account.delete') {
-            console.log(`🚨 [Panic Button] Destrucción total solicitada para: ${clientSlug} (${clientId})`);
+// G) PANIC BUTTON: ACCOUNT DELETE (TOTAL DESTRUCTION)
+if (method === 'account.delete') {
+    console.log(`🚨 [Panic Button] Destrucción total solicitada para: ${clientSlug} (${clientId})`);
 
-            // 1. WhatsApp Unlink (via client's assigned port)
-            try {
-                const { data: delPortData } = await supabase
-                    .from('user_souls')
-                    .select('port')
-                    .eq('client_id', clientId)
-                    .single();
+    // 1. WhatsApp Unlink (via client's assigned port)
+    try {
+        const { data: delPortData } = await supabase
+            .from('user_souls')
+            .select('port')
+            .eq('client_id', clientId)
+            .single();
 
-                if (delPortData?.port) {
-                    await axios.post(`http://localhost:${delPortData.port}/rpc`, {
-                        method: 'whatsapp.unlink',
-                        params: {},
-                        id: 'internal'
-                    }, {
-                        headers: {
-                            'x-openclaw-state-dir': stateDir,
-                            'Authorization': `Bearer ${GATEWAY_TOKEN}`
-                        }
-                    });
+        if (delPortData?.port) {
+            await axios.post(`http://localhost:${delPortData.port}/rpc`, {
+                method: 'whatsapp.unlink',
+                params: {},
+                id: 'internal'
+            }, {
+                headers: {
+                    'x-openclaw-state-dir': stateDir,
+                    'Authorization': `Bearer ${GATEWAY_TOKEN}`
                 }
-            } catch (e) { }
-
-            // 2. Delete Supabase Data (Cascade will handle messages/memories)
-            await supabase.from('user_souls').delete().eq('client_id', clientId);
-
-            // 3. Delete Local Files
-            try {
-                await fs.rm(clientDir, { recursive: true, force: true });
-            } catch (e) {
-                console.log("[Delete] Error removing client folder:", e.message);
-            }
-
-            // 4. Delete Auth User (Admin API)
-            const { error: authError } = await supabase.auth.admin.deleteUser(clientId);
-            if (authError) {
-                console.warn("[Delete] Could not delete auth user:", authError.message);
-            }
-
-            return res.json({ result: { success: true }, id });
+            });
         }
+    } catch (e) { }
 
-        return res.status(404).json({ error: { message: `Method ${method} not found` }, id });
+    // 2. Delete Supabase Data (Cascade will handle messages/memories)
+    await supabase.from('user_souls').delete().eq('client_id', clientId);
+
+    // 3. Delete Local Files
+    try {
+        await fs.rm(clientDir, { recursive: true, force: true });
+    } catch (e) {
+        console.log("[Delete] Error removing client folder:", e.message);
+    }
+
+    // 4. Delete Auth User (Admin API)
+    const { error: authError } = await supabase.auth.admin.deleteUser(clientId);
+    if (authError) {
+        console.warn("[Delete] Could not delete auth user:", authError.message);
+    }
+
+    return res.json({ result: { success: true }, id });
+}
+
+return res.status(404).json({ error: { message: `Method ${method} not found` }, id });
 
     } catch (err) {
-        const errorMsg = err.response?.data?.error?.message || err.message || 'Unknown RPC execution error';
-        console.error(`[Bridge] ❌ Error execution "${method}":`, errorMsg);
+    const errorMsg = err.response?.data?.error?.message || err.message || 'Unknown RPC execution error';
+    console.error(`[Bridge] ❌ Error execution "${method}":`, errorMsg);
 
-        if (err.code === 'ECONNREFUSED') {
-            console.error(`[Bridge] CRITICAL: Cannot reach client session. Is it initializing?`);
-        }
-
-        if (err.response) {
-            console.error(`[Bridge] Gateway Response (${err.response.status}):`, JSON.stringify(err.response.data, null, 2));
-        } else if (err.request) {
-            console.error(`[Bridge] No response received from Gateway. Check if port 3001 is open.`);
-        } else {
-            console.error(`[Bridge] Error details:`, err.stack);
-        }
-
-        return res.status(err.response?.status || 500).json({
-            error: { message: errorMsg, code: err.code || 'BRIDGE_ERROR' },
-            id
-        });
+    if (err.code === 'ECONNREFUSED') {
+        console.error(`[Bridge] CRITICAL: Cannot reach client session. Is it initializing?`);
     }
+
+    if (err.response) {
+        console.error(`[Bridge] Gateway Response (${err.response.status}):`, JSON.stringify(err.response.data, null, 2));
+    } else if (err.request) {
+        console.error(`[Bridge] No response received from Gateway. Check if port 3001 is open.`);
+    } else {
+        console.error(`[Bridge] Error details:`, err.stack);
+    }
+
+    return res.status(err.response?.status || 500).json({
+        error: { message: errorMsg, code: err.code || 'BRIDGE_ERROR' },
+        id
+    });
+}
 });
 
 /**

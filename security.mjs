@@ -17,10 +17,18 @@ function getEncryptionKey() {
     return null;
 }
 
-// Check initial state
-if (!getEncryptionKey()) {
-    console.warn('🛡️ [Security] ⚠️ ENCRYPTION_KEY no encontrada. Cifrado desactivado.');
+// Lazy check: log on first actual use, not at import time
+// (ESM module resolution order can cause false warnings when dotenv hasn't loaded yet)
+let _initialCheckDone = false;
+export function ensureEncryptionReady() {
+    if (_initialCheckDone) return;
+    _initialCheckDone = true;
+    if (!getEncryptionKey()) {
+        console.warn('[Security] ⚠️ ENCRYPTION_KEY no encontrada o inválida. Cifrado desactivado.');
+    }
 }
+// Still run the check for processes that import security.mjs directly (like server.mjs)
+setTimeout(() => ensureEncryptionReady(), 0);
 
 /**
  * Detecta si un texto ya fue cifrado por este módulo.

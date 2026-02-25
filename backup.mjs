@@ -91,11 +91,15 @@ async function runBackup() {
         console.log('✅ [Backup] Proceso completo.');
     } catch (err) {
         console.error('❌ [Backup] Error:', err.message);
-        await supabase.from('system_logs').insert({
-            level: 'ERROR',
-            message: `Backup fallido: ${err.message}`,
-            client_id: 'system'
-        });
+        try {
+            await supabase.from('system_logs').insert({
+                level: 'ERROR',
+                message: `Backup fallido: ${err.message}`,
+                client_id: 'system'
+            });
+        } catch (logErr) {
+            console.error('❌ [Backup] Error logging to system_logs:', logErr.message);
+        }
     }
 }
 
