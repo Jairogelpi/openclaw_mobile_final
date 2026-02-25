@@ -13,40 +13,61 @@ import { encrypt, decrypt } from './security.mjs';
 // === CONFIG ===
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY;
-const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
+const GROQ_API_KEY = process.env.GROQ_API_KEY;
 
-if (!SUPABASE_URL || !SUPABASE_KEY || !OPENROUTER_API_KEY) {
-    console.error('❌ Error: Faltan variables de entorno (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, OPENROUTER_API_KEY).');
+if (!SUPABASE_URL || !SUPABASE_KEY || !GROQ_API_KEY) {
+    console.error('❌ Error: Faltan variables de entorno (SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, GROQ_API_KEY).');
     process.exit(1);
 }
 
-if (!OPENAI_API_KEY) {
-    console.warn('⚠️ OPENAI_API_KEY no encontrada. La vectorización de memoria estará desactivada.');
-}
-
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
+import Groq from 'groq-sdk';
+const groq = new Groq({ apiKey: GROQ_API_KEY });
+
+import { pipeline } from '@huggingface/transformers';
 
 // === EMBEDDING ===
-async function generateEmbedding(text) {
-    const response = await fetch('https://api.openai.com/v1/embeddings', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${OPENAI_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            model: "text-embedding-3-small",
-            input: text
-        })
-    });
-    const result = await response.json();
-    return result.data[0].embedding;
+let localEmbedder = null;
+
+async function generateEmbedding(text, isQuery = false) {
+    if (!localEmbedder) {
+        console.log('🧠 [RAG Local] Inicializando red neuronal (Nomic-Embed-Text)...');
+        localEmbedder = await pipeline('feature-extraction', 'Xenova/nomic-embed-text-v1.5', {
+            quantized: true
+        });
+    }
+    const prefix = isQuery ? 'search_query: ' : 'search_document: ';
+    const output = await localEmbedder(prefix + text, { pooling: 'mean', normalize: true });
+    return Array.from(output.data);
 }
 
-// === DISTILL + VECTORIZE ===
+// Guarda un Nodo en Supremo y retorna true si fue insertado/actualizado
+async function upsertKnowledgeNode(clientId, entityName, entityType, description) {
+    // Verificar si existe para no duplicar
+    const { data: existing } = await supabase
+        .from('knowledge_nodes')
+        .select('id')
+        .eq('client_id', clientId)
+        .eq('entity_name', entityName)
+        .single();
+
+    if (existing) return; // Ya existe, podríamos actualizar description, pero para simplicidad lo dejamos así
+
+    // Generar el vector del nodo
+    const embedding = await generateEmbedding(entityName + " " + (description || ""));
+
+    await supabase.from('knowledge_nodes').insert({
+        client_id: clientId,
+        entity_name: entityName,
+        entity_type: entityType,
+        description: description,
+        embedding: embedding
+    });
+}
+
+// === DISTILL + GRAPHRAG VECTORIZE ===
 async function distillAndVectorize(clientId) {
-    console.log(`\n🧠 [Event-Memory] Procesando memoria para: ${clientId}`);
+    console.log(`\n🧠 [GraphRAG] Procesando memoria para: ${clientId}`);
 
     try {
         // 1. Obtener mensajes sin procesar
@@ -62,106 +83,89 @@ async function distillAndVectorize(clientId) {
 
         const rawContent = messages.map(m => `${m.sender_role}: ${m.content}`).join('\n');
 
-        // 2. Leer MEMORY.md físico actual para mantener continuidad
-        const clientDir = `./clients/${clientId}`;
-        const memoryPath = path.join(clientDir, 'MEMORY.md');
-        let currentMemory = "";
-        try {
-            const rawMemory = await fs.readFile(memoryPath, 'utf8');
-            currentMemory = decrypt(rawMemory);
-        } catch (e) { /* Archivo nuevo */ }
+        console.log(`🔍 [GraphRAG] Extrayendo Triplets Lógicos con Llama 3 8B...`);
 
-        // 3. Destilación con DeepSeek (Reglas Estrictas)
-        const response = await fetch('https://openrouter.ai/api/v1/chat/completions', {
-            method: 'POST',
-            headers: {
-                'Authorization': `Bearer ${OPENROUTER_API_KEY}`,
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                model: 'deepseek/deepseek-chat',
-                messages: [
-                    {
-                        role: 'system',
-                        content: `Eres el motor de memoria de OpenClaw. Actualiza el perfil (MEMORY) del usuario.
-                        
-REGLAS ESTRICTAS:
-1. Escribe SOLO en viñetas (bullet points) Markdown.
-2. MÁXIMO 100 LÍNEAS. Si te pasas, consolida o elimina lo más antiguo/irrelevante.
-3. HECHOS DENSOS: "El usuario programa en React", "Su perro Toby está enfermo".
-
-MEMORIA ACTUAL:
-${currentMemory}`
-                    },
-                    { role: 'user', content: `NUEVOS MENSAJES A INTEGRAR:\n${rawContent}` }
-                ]
-            })
+        // 2. Extracción de Triplets con Groq (rápido y barato)
+        const response = await groq.chat.completions.create({
+            model: 'llama-3.1-8b-instant',
+            response_format: { type: 'json_object' },
+            messages: [
+                {
+                    role: 'system',
+                    content: `Eres un experto extractor de Grafos de Conocimiento. 
+Analiza la conversación y extrae hechos en formato de Triplets Lógicos (Sujeto -> Relación -> Objeto).
+Debes devolver UNICAMENTE un objeto JSON con una propiedad "triplets" que contenga un array de objetos.
+Formato:
+{
+  "triplets": [
+    {
+      "source": "Nombre exacto de la entidad origen",
+      "source_type": "PERSONA|LUGAR|OBJETO|DATO",
+      "target": "Nombre exacto de la entidad destino",
+      "target_type": "PERSONA|LUGAR|OBJETO|DATO",
+      "relation": "TIENE_WIFI|ES_MASCOTA_DE|VIVE_EN|GUSTA_DE (VERBO EN MAYUSCULAS, 1-3 palabras separadas por _)",
+      "context": "Breve explicación adicional o dejar vacío"
+    }
+  ]
+}
+Si la conversación son solo saludos o no contiene datos relevantes factuales, devuelve { "triplets": [] }.`
+                },
+                { role: 'user', content: `CONVERSACIÓN:\n${rawContent}` }
+            ]
         });
 
-        const result = await response.json();
-        const updatedMemory = result.choices?.[0]?.message?.content;
+        const graphData = JSON.parse(response.choices[0].message.content);
+        const triplets = graphData.triplets || [];
+        console.log(`🕸️ [GraphRAG] Extraídos ${triplets.length} triplets.`);
 
-        if (updatedMemory) {
-            // 4. PERSISTENCIA FÍSICA: Sobreescribir el archivo del cliente
-            await fs.mkdir(clientDir, { recursive: true });
-            await fs.writeFile(memoryPath, encrypt(updatedMemory), 'utf8');
-        }
+        // 3. Inserción en la Base de Datos Híbrida
+        for (const t of triplets) {
+            try {
+                // Upsert Nodos
+                await upsertKnowledgeNode(clientId, t.source, t.source_type, "Entidad extraída automáticamente.");
+                await upsertKnowledgeNode(clientId, t.target, t.target_type, t.context || "Entidad extraída automáticamente.");
 
-        // 5. VECTORIZACIÓN: Convertir cada mensaje en un recuerdo eterno
-        if (OPENAI_API_KEY) {
-            console.log(`📦 Vectorizando ${messages.length} mensajes para la eternidad...`);
-            for (const msg of messages) {
-                try {
-                    const embedding = await generateEmbedding(msg.content);
-                    await supabase.from('user_memories').insert({
-                        client_id: clientId,
-                        content: msg.content,
-                        sender: msg.sender_role,
-                        embedding: embedding,
-                        metadata: {
-                            date: new Date().toISOString(),
-                            original_id: msg.id
-                        }
-                    });
-                } catch (e) {
-                    console.error(`❌ Error vectorizando mensaje ${msg.id}:`, e.message);
-                }
+                // Insertar Arista (Relación)
+                // Usamos UPSERT silencioso atrapando el error de UNIQUE si ya existe la misma relación
+                await supabase.from('knowledge_edges').insert({
+                    client_id: clientId,
+                    source_node: t.source,
+                    relation_type: t.relation,
+                    target_node: t.target,
+                    context: t.context
+                }).catch(() => { }); // Si viola la clave única, simplemente lo ignora (ya sabemos ese hecho)
+
+            } catch (e) {
+                console.error(`❌ Error insertando Triplet [${t.source}]->[${t.target}]:`, e.message);
             }
         }
 
-        // 6. AMNESIA: Borrar mensajes procesados de Supabase
-        await supabase.from('raw_messages').delete().in('id', messages.map(m => m.id));
-        console.log(`✅ Memoria vectorizada y limpia para ${clientId}.`);
-    } catch (err) {
-        console.error(`❌ Error procesando cliente ${clientId}:`, err.message);
-    }
-}
-
-// === SCALE-TO-ZERO REAPER ===
-async function reapInactiveContainers() {
-    console.log('💤 [Scale-to-Zero] Buscando contenedores inactivos...');
-
-    const twoHoursAgo = new Date(Date.now() - 2 * 60 * 60 * 1000).toISOString();
-
-    const { data: inactiveClients } = await supabase
-        .from('user_souls')
-        .select('slug')
-        .lt('last_active', twoHoursAgo);
-
-    if (!inactiveClients) return;
-
-    for (const client of inactiveClients) {
-        if (!client.slug) continue;
-        const containerName = `openclaw_${client.slug.replace(/-/g, '_')}`;
-        try {
-            await fs.access(`./clients/${client.slug}`);
-            await execPromise(`docker stop ${containerName}`);
-            console.log(`[Scale-to-Zero] 😴 Contenedor suspendido por inactividad: ${containerName}`);
-        } catch (e) {
-            // Silencioso si el contenedor no existe o ya está parado
+        // 4. (Opcional pero recomendado para backwards compatibility) Vectorizar mensajes crudos
+        // Conservamos los mensajes también en la tabla clásica por si las moscas
+        for (const msg of messages) {
+            try {
+                const embedding = await generateEmbedding(msg.content);
+                await supabase.from('user_memories').insert({
+                    client_id: clientId,
+                    content: msg.content,
+                    sender: msg.sender_role,
+                    embedding: embedding,
+                    metadata: { date: new Date().toISOString() }
+                });
+            } catch (e) {
+                // Ignorar error individual
+            }
         }
+
+        // 5. AMNESIA: Borrar mensajes procesados de Supabase
+        await supabase.from('raw_messages').delete().in('id', messages.map(m => m.id));
+        console.log(`✅ [GraphRAG] Memoria estructurada, vectorizada y lista para ${clientId}.`);
+    } catch (err) {
+        console.error(`❌ Error general procesando cliente ${clientId}:`, err.message);
     }
 }
+
+
 
 // === MAIN: REDIS EVENT LISTENER ===
 async function main() {
@@ -185,9 +189,7 @@ async function main() {
 
     console.log('👂 Escuchando eventos de expiración de Redis...');
 
-    // 2. Scale-to-Zero Reaper: cada 2 horas
-    reapInactiveContainers(); // Ejecutar al inicio
-    setInterval(reapInactiveContainers, 2 * 60 * 60 * 1000);
+    // 2. Ya no hay Docker. Scale-To-Zero se maneja internamente.
 
     // 3. Fallback: cada 30 min, procesar clientes que puedan haberse escapado
     setInterval(async () => {

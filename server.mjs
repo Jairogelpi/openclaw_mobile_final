@@ -23,6 +23,7 @@ import * as xlsx from 'xlsx';
 import { createClient as createRedisClient } from 'redis';
 import jwt from 'jsonwebtoken';
 import { encrypt, decrypt } from './security.mjs';
+import { startWhatsAppClient, qrCodes } from './channels/whatsapp.mjs';
 // El dotenv se carga en la línea 1 vía import 'dotenv/config';
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const upload = multer({ dest: 'uploads/' });
@@ -260,90 +261,8 @@ async function strictAuth(req, res, next) {
     }
 }
 
-/**
- * Verifica si el contenedor de un cliente está corriendo. 
- * Si no, lo arranca y actualiza la fecha de actividad.
- */
-async function ensureContainerRunning(clientSlug, clientId) {
-    const containerName = `openclaw_${clientSlug.replace(/-/g, '_')}`;
 
-    // 1. Actualizar última actividad en Supabase
-    await supabase
-        .from('user_souls')
-        .update({ last_active: new Date() })
-        .eq('client_id', clientId);
 
-    try {
-        // 2. Verificar estado y memoria en Docker
-        const { stdout } = await execPromise(`docker inspect -f '{{.State.Running}} {{.HostConfig.Memory}}' ${containerName}`);
-        const [isRunning, memory] = stdout.trim().split(' ');
-
-        // Si no es 1GB (1073741824 bytes), recreamos para asegurar estabilidad
-        if (memory !== '1073741824') {
-            console.log(`[Scale-to-Zero] 🛠️ Corrigiendo configuración de memoria para ${clientSlug}...`);
-            const { data: soul } = await supabase.from('user_souls').select('port').eq('client_id', clientId).single();
-            if (soul && soul.port) {
-                await execPromise(`docker rm -f ${containerName}`).catch(() => { });
-                const dockerCmd = `docker run -d --name ${containerName} --memory="1024m" --memory-reservation="512m" -e NODE_OPTIONS="--max-old-space-size=768" -p ${soul.port}:18789 -v "${process.cwd()}/clients/${clientSlug}":/app/workspace --restart unless-stopped ghcr.io/openclaw/openclaw:latest`;
-                await execPromise(dockerCmd);
-                await new Promise(resolve => setTimeout(resolve, 3000));
-                return;
-            }
-        }
-
-        if (isRunning !== 'true') {
-            console.log(`[Scale-to-Zero] 🌙 Despertando a ${clientSlug}...`);
-            await ensureContainerRunning(client.slug, client.client_id);
-            await new Promise(resolve => setTimeout(resolve, 3000));
-        }
-    } catch (e) {
-        console.error(`[Scale-to-Zero] Error asegurando contenedor ${containerName}:`, e.message);
-    }
-}
-
-/**
- * Genera el embedding de un texto usando OpenAI text-embedding-3-small.
- * Coste ínfimo: ~$0.00002 por cada 1k tokens.
- */
-async function generateEmbedding(text) {
-    const response = await fetch('https://api.openai.com/v1/embeddings', {
-        method: 'POST',
-        headers: {
-            'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
-            'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-            model: "text-embedding-3-small",
-            input: text
-        })
-    });
-    const result = await response.json();
-    return result.data[0].embedding;
-}
-
-/**
- * Recupera los 5 recuerdos más relevantes del pasado usando búsqueda vectorial.
- */
-async function getRelevantContext(clientId, userQuery) {
-    try {
-        const queryVector = await generateEmbedding(userQuery);
-        const { data: memories } = await supabase.rpc('match_memories', {
-            query_embedding: queryVector,
-            match_threshold: 0.75,
-            match_count: 5,
-            p_client_id: clientId
-        });
-
-        if (!memories?.length) return "No hay recuerdos específicos sobre este tema.";
-
-        return memories.map(m =>
-            `[${m.date}] ${m.sender}: ${m.content}`
-        ).join('\n');
-    } catch (e) {
-        console.error("[RAG] Error recuperando contexto:", e.message);
-        return "";
-    }
-}
 
 /**
  * RPC GATEWAY
@@ -458,25 +377,16 @@ app.post('/rpc', async (req, res) => {
 
         // A) WHATSAPP: PAIR
         if (method === 'whatsapp.pair') {
-            if (!clientPort) throw new Error('Puerto no asignado para este cliente. Completa el onboarding primero.');
-            const { phoneNumber } = params;
+            // 1. Iniciamos el cliente de WhatsApp nativo
+            await startWhatsAppClient(clientId, clientSlug);
 
-            // --- Despertar si está dormido ---
-            await ensureContainerRunning(clientSlug, clientId);
-            // --- Disparar temporizador de memoria ---
-            await triggerMemoryTimer(clientId);
-
-            const response = await axios.post(`http://localhost:${clientPort}/rpc`, {
-                method: 'whatsapp.pair',
-                params: { phoneNumber },
-                id
-            }, {
-                headers: {
-                    'x-openclaw-state-dir': stateDir,
-                    'Authorization': `Bearer ${GATEWAY_TOKEN}`
-                }
-            });
-            return res.json(response.data);
+            // 2. Comprobamos si hay un QR listo para enviar a la App
+            const qr = qrCodes.get(clientId);
+            if (qr) {
+                return res.json({ result: { status: 'qr_ready', qr }, id });
+            } else {
+                return res.json({ result: { status: 'starting', message: 'Iniciando WhatsApp, vuelve a consultar en 3 segundos...' }, id });
+            }
         }
 
         // B) SOUL: GET
@@ -795,27 +705,19 @@ NO añadas texto después del bloque JSON. Antes del bloque, puedes decir una fr
                     if (jsonStr) {
                         soulJson = JSON.parse(jsonStr);
 
-                        // Update Supabase with soul
+                        // 1. Obtener el puerto disponible (¡Esto faltaba!)
+                        const nextPort = await getNextAvailablePort();
+
+                        // 2. Guardar el negocio en la BD (Corregido el error de sintaxis)
                         await supabase
-                            .from('user_souls')
-                            .upsert({
-                                client_id: clientId,
-                                soul_json: soulJson,
-                                slug: clientSlug,
-                                last_updated: new Date()
-                            });
-
-                        completed = true;
-                        // Forzamos un mensaje limpio si el bot dijo algo antes del bloque
-                        fullReply = beforeJson || "¡Excelente! Tu Identidad ha sido esculpida. Todo está listo.";
-
                             .from('clients')
                             .upsert({
                                 user_id: clientId,
                                 name: userName || soulJson.nombre || 'Nuevo Cliente',
-                                whatsapp_number: params.phoneNumber || ''
+                                whatsapp_number: params.phoneNumber || '' // En el futuro cambiaremos esto a canales genéricos
                             }, { onConflict: 'user_id' });
 
+                        // 3. Guardar el cerebro (Soul) en la BD
                         await supabase
                             .from('user_souls')
                             .upsert({
@@ -826,12 +728,12 @@ NO añadas texto después del bloque JSON. Antes del bloque, puedes decir una fr
                                 last_updated: new Date()
                             });
 
-                        // === MULTI-TENANT: Crear archivos físicos y contenedor Docker ===
-                        console.log(`🛠️[Provisioning] Iniciando para ${clientSlug}...`);
+                        // === CREAR ARCHIVOS FÍSICOS ===
+                        console.log(`🛠️ [Provisioning] Iniciando para ${clientSlug}...`);
                         const soulMd = `# Identidad\nEres ${soulJson.nombre}. ${soulJson.tono} \n\n# Directrices\n${(soulJson.perfil?.directrices || []).map(d => `- ${d}`).join('\n')} `;
                         await fs.writeFile(`${clientDir}/SOUL.md`, encrypt(soulMd));
 
-                        const userMd = `# Perfil\n- Usuario: ${userName}\n- Edad: ${soulJson.edad || 'N/A'}\n- Trabajo: ${soulJson.perfil?.ocupacion?.detalle || occupation}\n- Meta: ${mainChallenge}`;
+                        const userMd = `# Perfil\n- Usuario: ${userName || 'Usuario'}\n- Edad: ${soulJson.edad || 'N/A'}\n- Trabajo: ${soulJson.perfil?.ocupacion?.detalle || occupation || 'N/A'}\n- Meta: ${mainChallenge || 'N/A'}`;
                         await fs.writeFile(`${clientDir}/USER.md`, encrypt(userMd));
 
                         const gatewayConfig = {
@@ -840,17 +742,15 @@ NO añadas texto después del bloque JSON. Antes del bloque, puedes decir una fr
                         };
                         await fs.writeFile(`${clientDir}/gateway.json5`, encrypt(JSON.stringify(gatewayConfig, null, 2)));
 
-                        const onboardContainerName = `openclaw_${clientSlug.replace(/-/g, '_')}`;
-                        await execPromise(`docker rm -f ${onboardContainerName}`).catch(() => { });
-                        const dockerCmd = `docker run -d --name ${onboardContainerName} --memory="1024m" --memory-reservation="512m" -e NODE_OPTIONS="--max-old-space-size=768" -p ${nextPort}:18789 -v "${process.cwd()}/clients/${clientSlug}":/app/workspace --restart unless-stopped ghcr.io/openclaw/openclaw:latest`;
-                        await execPromise(dockerCmd);
+                        // Arrancar el nuevo cliente de WhatsApp ligero
+                        const { startWhatsAppClient } = await import('./whatsapp_manager.mjs');
+                        await startWhatsAppClient(clientId, clientSlug);
 
                         completed = true;
-                        // Forzamos un mensaje limpio si el bot dijo algo antes del bloque
                         fullReply = beforeJson || "¡Excelente! Tu Identidad ha sido esculpida. Todo está listo.";
                     }
                 } catch (e) {
-                    console.error("[Genesis] Error parsing/saving soul JSON:", e.message);
+                    console.error("[Genesis] Error procesando el bautizo:", e.message);
                 }
             }
 
@@ -919,7 +819,7 @@ NO añadas texto después del bloque JSON. Antes del bloque, puedes decir una fr
         console.error(`[Bridge] ❌ Error execution "${method}":`, errorMsg);
 
         if (err.code === 'ECONNREFUSED') {
-            console.error(`[Bridge] CRITICAL: Cannot reach client container. Is Docker running?`);
+            console.error(`[Bridge] CRITICAL: Cannot reach client session. Is it initializing?`);
         }
 
         if (err.response) {
@@ -996,23 +896,20 @@ app.get('/admin/health', async (req, res) => {
     try {
         const { data: clients } = await supabase
             .from('user_souls')
-            .select('slug, port, last_active, restart_count');
+            .select('client_id, slug, port, last_active, restart_count');
 
-        let dockerStats = '';
-        try {
-            const { stdout } = await execPromise(`docker stats --no-stream --format "{{.Name}}: {{.MemUsage}} | CPU {{.CPUPerc}}"`);
-            dockerStats = stdout;
-        } catch (e) {
-            dockerStats = 'Docker no disponible';
-        }
+        // Obtener uso de RAM del proceso Node.js actual
+        const memoryUsage = process.memoryUsage();
+        const ramMB = (memoryUsage.rss / 1024 / 1024).toFixed(2);
+
+        // Importamos dinámicamente el activeSessions para ver quién está conectado
+        const { activeSessions } = await import('./channels/whatsapp.mjs');
 
         const report = (clients || []).map(c => {
-            const containerName = `openclaw_${(c.slug || '').replace(/-/g, '_')}`;
-            const stats = dockerStats.split('\n').find(s => s.includes(containerName)) || '🔴 Offline';
+            const isOnline = activeSessions.has(c.client_id);
             return {
                 slug: c.slug || 'N/A',
-                port: c.port || '-',
-                docker: stats,
+                status: isOnline ? '🟢 Online (Node)' : '🔴 Suspendido',
                 restarts: c.restart_count || 0,
                 lastActive: c.last_active ? new Date(c.last_active).toLocaleString('es-ES') : 'Nunca'
             };
@@ -1041,21 +938,20 @@ app.get('/admin/health', async (req, res) => {
 <h1>🚀 Control de Misión OpenClaw</h1>
 <p class="subtitle">${report.length} cliente(s) registrado(s) | Auto-refresh: <a href="?token=${token}" style="color:#00d4ff">↻</a></p>
 <table>
-  <tr><th>Cliente</th><th>Puerto</th><th>RAM / CPU</th><th>Reinicios</th><th>Última Actividad</th><th>Acciones</th></tr>
+  <tr><th>Cliente</th><th>Estado</th><th>Reinicios</th><th>Última Actividad</th><th>Acciones</th></tr>
   ${report.map(r => `<tr>
     <td><b>${r.slug}</b></td>
-    <td>${r.port}</td>
-    <td>${r.docker}</td>
+    <td>${r.status}</td>
     <td class="${r.restarts > 3 ? 'err' : r.restarts > 0 ? 'warn' : 'ok'}">${r.restarts}</td>
     <td>${r.lastActive}</td>
     <td class="actions">
       <form method="POST" action="/admin/restart/${r.slug}?token=${token}">
-        <button class="btn btn-restart" type="submit">🔄 Reiniciar</button>
+        <button class="btn btn-restart" type="submit">🔄 Iniciar/Reiniciar</button>
       </form>
       <a href="/admin/logs/${r.slug}?token=${token}" target="_blank">
         <button class="btn btn-logs" type="button">📋 Logs</button>
       </a>
-      <form method="POST" action="/admin/delete/${r.slug}?token=${token}" onsubmit="return confirm('⚠️ ¿ELIMINAR a ${r.slug}? Esto borrará su Docker, archivos y datos. IRREVERSIBLE.')">
+      <form method="POST" action="/admin/delete/${r.slug}?token=${token}" onsubmit="return confirm('⚠️ ¿ELIMINAR a ${r.slug}? Esto borrará sus archivos y datos. IRREVERSIBLE.')">
         <button class="btn btn-delete" type="submit">🗑️ Borrar</button>
       </form>
     </td>
@@ -1079,11 +975,17 @@ app.all('/admin/restart/:slug', async (req, res) => {
         const { data: soul } = await supabase.from('user_souls').select('client_id').eq('slug', slug).single();
         if (!soul?.client_id) throw new Error("Cliente no encontrado en DB");
 
-        await ensureContainerRunning(slug, soul.client_id);
-        console.log(`🔄 [Admin] Contenedor ${slug} reiniciado/asegurado manualmente.`);
+        console.log(`🔄 [Admin] Reiniciando sesión de WhatsApp para ${slug}...`);
+
+        // Importamos y lanzamos el cliente
+        const { startWhatsAppClient, activeSessions } = await import('./channels/whatsapp.mjs');
+
+        // Si ya había una sesión, idealmente habría que cerrarla, pero startWhatsAppClient 
+        // ya maneja la reinicialización o podemos simplemente pisarla por ahora.
+        await startWhatsAppClient(soul.client_id, slug);
 
         await supabase.from('system_logs').insert({
-            level: 'INFO', message: `Reinicio manual (y chequeo de 1GB): ${slug}`, client_id: soul.client_id
+            level: 'INFO', message: `Reinicio manual de sesión Node: ${slug}`, client_id: soul.client_id
         });
         res.redirect(`/admin/health?token=${req.query.token}`);
     } catch (err) {
@@ -1095,11 +997,17 @@ app.all('/admin/restart/:slug', async (req, res) => {
 app.all('/admin/delete/:slug', async (req, res) => {
     if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).send('No autorizado');
     const { slug } = req.params;
-    const containerName = `openclaw_${slug.replace(/-/g, '_')}`;
 
     try {
-        // 1. Apagar y destruir el contenedor Docker (Ignora errores si ya no existe)
-        await execPromise(`docker stop ${containerName} && docker rm ${containerName}`).catch(() => { });
+        // 1. Cerrar sesión activa si existe
+        const { activeSessions } = await import('./channels/whatsapp.mjs');
+        const { data: soul } = await supabase.from('user_souls').select('client_id').eq('slug', slug).single();
+
+        if (soul?.client_id && activeSessions.has(soul.client_id)) {
+            const client = activeSessions.get(soul.client_id);
+            try { await client.destroy(); } catch (e) { }
+            activeSessions.delete(soul.client_id);
+        }
 
         // 2. Borrar su carpeta física
         await fs.rm(`./clients/${slug}`, { recursive: true, force: true }).catch(() => { });
@@ -1136,18 +1044,22 @@ app.all('/admin/delete/:slug', async (req, res) => {
 app.get('/admin/logs/:slug', async (req, res) => {
     if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).send('No autorizado');
     const { slug } = req.params;
-    const containerName = `openclaw_${slug.replace(/-/g, '_')}`;
 
     try {
-        let logOutput = '';
-        try {
-            const { stdout } = await execPromise(`docker logs --tail 100 ${containerName} 2>&1`);
-            logOutput = stdout;
-        } catch (dockerErr) {
-            if (dockerErr.message.includes('No such container')) {
-                logOutput = `🔴 El contenedor ${containerName} no existe en este servidor.\n\nEsto puede ocurrir si:\n1. El cliente nunca ha completado el onboarding.\n2. El contenedor fue eliminado manualmente.\n3. El sistema está en proceso de aprovisionamiento.`;
-            } else {
-                throw dockerErr;
+        const { data: soul } = await supabase.from('user_souls').select('client_id').eq('slug', slug).single();
+
+        let logOutput = 'No se encontraron logs recientes en la base de datos para este cliente.';
+
+        if (soul?.client_id) {
+            const { data: logs } = await supabase
+                .from('system_logs')
+                .select('*')
+                .eq('client_id', soul.client_id)
+                .order('created_at', { ascending: false })
+                .limit(100);
+
+            if (logs && logs.length > 0) {
+                logOutput = logs.map(l => `[${new Date(l.created_at).toLocaleString()}] [${l.level}] ${l.message}`).join('\n');
             }
         }
 
@@ -1165,7 +1077,7 @@ app.get('/admin/logs/:slug', async (req, res) => {
 
         res.send(html);
     } catch (err) {
-        res.status(500).send(`Error crítico obteniendo logs de ${containerName}: ${err.message}`);
+        res.status(500).send(`Error crítico obteniendo logs de ${slug}: ${err.message}`);
     }
 });
 
@@ -1208,63 +1120,3 @@ httpServer.on('upgrade', async (request, socket, head) => {
 httpServer.listen(PORT, '0.0.0.0', () => {
     console.log(`🚀 SaaS Bridge listening on http://0.0.0.0:${PORT}`);
 });
-
-// === SELF-HEALING WATCHDOG ===
-async function containerWatchdog() {
-    console.log('🛡️ [Watchdog] Verificando salud de los contenedores...');
-
-    try {
-        // Obtener todos los clientes que tienen un puerto asignado
-        const { data: clients, error } = await supabase
-            .from('user_souls')
-            .select('client_id, slug, port, restart_count')
-            .not('port', 'is', null);
-
-        if (error) throw error;
-        if (!clients?.length) return;
-
-        for (const client of clients) {
-            if (!client.slug) continue;
-            const containerName = `openclaw_${client.slug.replace(/-/g, '_')}`;
-
-            try {
-                // Inspeccionar estado y código de salida
-                const { stdout } = await execPromise(
-                    `docker inspect -f '{{.State.Running}} {{.State.ExitCode}}' ${containerName}`
-                );
-
-                const [isRunning, exitCode] = stdout.trim().split(' ');
-
-                // Solo reiniciar si crashó (ExitCode != 0). 
-                // ExitCode 0 = Scale-to-Zero voluntario, no tocar.
-                if (isRunning === 'false' && parseInt(exitCode) !== 0) {
-                    console.warn(`🚨 [Watchdog] Contenedor ${containerName} caído (Error ${exitCode}). Reiniciando...`);
-                    await ensureContainerRunning(client.slug, client.client_id);
-                    console.log(`✅ [Watchdog] ${containerName} ha vuelto a la vida.`);
-
-                    // Registrar incidente
-                    await supabase.from('system_logs').insert({
-                        level: 'ERROR',
-                        message: `Auto-healing: Contenedor ${containerName} reiniciado tras caída (ExitCode: ${exitCode}).`,
-                        client_id: client.client_id
-                    });
-
-                    // Incrementar contador de reinicios
-                    await supabase
-                        .from('user_souls')
-                        .update({ restart_count: (client.restart_count || 0) + 1 })
-                        .eq('slug', client.slug)
-                        ;
-                }
-            } catch (e) {
-                // Contenedor no creado aún, ignorar
-            }
-        }
-    } catch (err) {
-        console.error('❌ [Watchdog] Error en el ciclo de verificación:', err.message);
-    }
-}
-
-// Ejecutar watchdog cada 60 segundos
-containerWatchdog();
-setInterval(containerWatchdog, 60000);
