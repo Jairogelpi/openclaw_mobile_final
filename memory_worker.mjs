@@ -114,9 +114,15 @@ Si la conversación son solo saludos o no contiene datos relevantes factuales, d
             ]
         });
 
-        const graphData = JSON.parse(response.choices[0].message.content);
-        const triplets = graphData.triplets || [];
-        console.log(`🕸️ [GraphRAG] Extraídos ${triplets.length} triplets.`);
+        let triplets = [];
+        try {
+            const graphData = JSON.parse(response.choices[0].message.content);
+            triplets = graphData.triplets || [];
+            console.log(`🕸️ [GraphRAG] Extraídos ${triplets.length} triplets.`);
+        } catch (parseError) {
+            console.warn(`⚠️ [GraphRAG] LLM no devolvió JSON válido. Ignorando extracción en esta ronda.`);
+            triplets = [];
+        }
 
         // 3. Inserción en la Base de Datos Híbrida
         for (const t of triplets) {
