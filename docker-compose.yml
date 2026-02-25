@@ -1,0 +1,10 @@
+version: '3.8'
+
+services:
+  bot_cliente_1:
+    image: ghcr.io/openclaw/openclaw:latest
+    container_name: openclaw_c1
+    restart: unless-stopped
+    volumes:
+      # Aquí le indicamos tu nueva estructura de carpetas
+      - ./clients/cliente_1:/app/workspace

@@ -1,0 +1,37 @@
+﻿{
+  "logging": {
+    "level": "info"
+  },
+  "models": {
+    "providers": {
+      "openrouter": {
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "apiKey": "${OPENROUTER_API_KEY}",
+        "api": "openai-responses",
+        "models": [
+          {
+            "id": "deepseek/deepseek-chat",
+            "name": "DeepSeek V3"
+          }
+        ]
+      }
+    }
+  },
+  "agents": {
+    "defaults": {
+      "model": {
+        "primary": "openrouter/deepseek/deepseek-chat"
+      }
+    }
+  },
+  "gateway": {
+    "port": 3001,
+    "auth": {
+      "mode": "token",
+      "token": "64a329039125d3765dcb73d60ba93580a15f3272ab6139b6"
+    }
+  },
+  "plugins": {
+    "enabled": true
+  }
+}
