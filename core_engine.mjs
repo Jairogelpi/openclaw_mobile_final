@@ -120,18 +120,22 @@ export async function processMessage(incomingEvent) {
             return cachedReply;
         }
 
-        // 2. Recuperar la Identidad
-        const clientDir = `./ clients / ${clientSlug} `;
-        let soul = "", userProfile = "", memory = "";
+        // 2. Recuperar la Identidad (DB-First)
+        const { data: soulData, error: soulError } = await supabase
+            .from('user_souls')
+            .select('soul_json, settings')
+            .eq('client_id', clientId)
+            .single();
 
-        try {
-            soul = decrypt(await fs.readFile(`${clientDir}/SOUL.md`, 'utf8'));
-            userProfile = decrypt(await fs.readFile(`${clientDir}/USER.md`, 'utf8'));
-            memory = decrypt(await fs.readFile(`${clientDir}/MEMORY.md`, 'utf8').catch(() => ""));
-        } catch (e) {
-            console.error(`❌ [Core Engine] Identidad corrupta para ${clientSlug}`);
+        if (soulError || !soulData) {
+            console.error(`❌ [Core Engine] Identidad no encontrada en DB para ${clientId}`);
             return "Lo siento, mi núcleo de memoria está inaccesible.";
         }
+
+        const soulJson = soulData.soul_json || {};
+        const soul = JSON.stringify(soulJson);
+        const userProfile = JSON.stringify(soulJson.profile || "{}"); // Simplified profile
+        const memory = JSON.stringify(soulJson.key_facts || "{}");
 
         // 3. ADVANCED AGENTIC RAG: "EL CIRUJANO"
         console.log(`🧭 [Agentic RAG V2] Buscando contexto en profundidad...`);
@@ -316,32 +320,48 @@ REGLAS DE ORO:
             
             Responde JSON: { "approved": boolean, "score": number, "critique": "string", "suggestions": "string" }`;
 
-            try {
-                const auditRaw = await groqChat('llama-3.3-70b-versatile', [
-                    { role: 'system', content: critiquePrompt }
-                ], { temperature: 0.1, response_format: { type: 'json_object' } });
+            let audit = { approved: false, score: 0 };
+            let retryCount = 0;
+            const MAX_AUDIT_RETRIES = 2;
 
-                const audit = parseLLMJson(auditRaw);
+            while (!audit.approved && retryCount <= MAX_AUDIT_RETRIES) {
+                try {
+                    const auditRaw = await groqChat('llama-3.3-70b-versatile', [
+                        { role: 'system', content: critiquePrompt }
+                    ], {
+                        temperature: 0.1 + (retryCount * 0.2),
+                        response_format: { type: 'json_object' }
+                    });
 
-                if (audit.approved) {
-                    console.log(`✅ [Reflection] Auditoría aprobada.`);
+                    audit = parseLLMJson(auditRaw);
+
+                    if (audit.approved || audit.score >= 8) {
+                        console.log(`✅ [Reflection] Auditoría aprobada (${audit.score}/10) en intento ${retryCount + 1}.`);
+                        isApproved = true;
+                        break;
+                    } else {
+                        console.warn(`🛑 [Reflection] Auditoría RECHAZADA (${audit.score}/10). Sugerencia: ${audit.suggestions}`);
+                        retryCount++;
+
+                        if (retryCount <= MAX_AUDIT_RETRIES) {
+                            history = [
+                                { role: 'system', content: systemPrompt },
+                                { role: 'user', content: text },
+                                { role: 'assistant', content: aiReply },
+                                { role: 'system', content: `CRÍTICA DEL AUDITOR: ${audit.critique}. SUGERENCIAS: ${audit.suggestions}. CORRIGE Y REINTENTA.` }
+                            ];
+                            aiReply = await groqChat('llama-3.3-70b-versatile', history, {
+                                temperature: 0.3 + (retryCount * 0.1)
+                            });
+                        }
+                    }
+                } catch (e) {
+                    console.error('❌ [Reflection] Error en auditoría:', e.message);
                     isApproved = true;
-                } else {
-                    console.warn(`🛑 [Reflection] Intento ${attempts} RECHAZADO: ${audit.critique}`);
-                    // Solo mantenemos el sistema y el último intento para no saturar memoria
-                    history = [
-                        { role: 'system', content: systemPrompt },
-                        { role: 'user', content: text },
-                        {
-                            role: 'system', content: `⚠️ ERROR CRÍTICO DETECTADO POR EL AUDITOR: ${audit.critique}. 
-                        INSTRUCCIÓN DE REPARACIÓN: ${audit.suggestions}. 
-                        DEBES CORREGIR ESTO EN TU PRÓXIMA RESPUESTA. DI LA VERDAD BASADA EN EL CONOCIMIENTO REAL.` }
-                    ];
+                    break;
                 }
-            } catch (e) {
-                console.error(`⚠️ [Reflection] Error auditando, aprobando por seguridad.`);
-                isApproved = true;
             }
+            if (isApproved) break;
         }
 
         // Final check to ensure aiReply is not empty

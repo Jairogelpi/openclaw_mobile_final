@@ -115,18 +115,30 @@ async function autonomousDistillation(clientId, clientSlug, messages) {
                 }
             };
 
-            // A. Guardar en DB
-            await supabase
+            // A. Guardar en DB (Single Source of Truth)
+            const { error: updateError } = await supabase
                 .from('user_souls')
-                .update({ soul_json: updatedSoul })
+                .update({
+                    soul_json: updatedSoul,
+                    updated_at: new Date().toISOString()
+                })
                 .eq('client_id', clientId);
 
-            // B. Sincronizar con SOUL.md (Cifrado)
-            const soulPath = path.join('./clients', clientSlug, 'SOUL.md');
-            const soulText = JSON.stringify(updatedSoul, null, 2);
-            await fs.writeFile(soulPath, encrypt(soulText));
+            if (updateError) throw new Error(`DB Update Failed: ${updateError.message}`);
 
-            console.log(`✨ [Auto-Soul] Memoria e Identidad (Estilo) actualizadas para ${clientSlug}.`);
+            // B. Exportar a SOUL.md (Caché local / Auditoría)
+            try {
+                const clientDir = path.join('./clients', clientSlug);
+                await fs.mkdir(clientDir, { recursive: true });
+                const soulPath = path.join(clientDir, 'SOUL.md');
+                const soulText = JSON.stringify(updatedSoul, null, 2);
+                await fs.writeFile(soulPath, encrypt(soulText));
+                console.log(`✨ [Auto-Soul] Exportado exitosamente a ${soulPath}`);
+            } catch (fileErr) {
+                console.warn(`⚠️ [Auto-Soul] Error exportando a archivo (DB está OK):`, fileErr.message);
+            }
+
+            console.log(`✨ [Auto-Soul] Memoria e Identidad (Estilo) actualizadas en DB para ${clientSlug}.`);
         }
 
         // 4. Upsert en el Grafo
@@ -373,9 +385,11 @@ Formato JSON esperado:
 
             for (let i = 1; i < convMsgs.length; i++) {
                 const sim = cosineSimilarity(msgEmbeddings[i - 1], msgEmbeddings[i]);
+                const timeDiffMs = new Date(convMsgs[i].created_at) - new Date(convMsgs[currentChunk[0]].created_at);
+                const MAX_TIME_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
 
-                if (sim < SIMILARITY_THRESHOLD || currentChunk.length >= MAX_CHUNK_SIZE) {
-                    // Topic boundary detected or max size reached → finalize chunk
+                if (sim < SIMILARITY_THRESHOLD || currentChunk.length >= MAX_CHUNK_SIZE || timeDiffMs > MAX_TIME_WINDOW_MS) {
+                    // Topic boundary detected, max size reached, or time window exceeded → finalize chunk
                     chunks.push(currentChunk.map(idx => convMsgs[idx]));
                     currentChunk = [i];
                 } else {
@@ -398,6 +412,14 @@ Formato JSON esperado:
 
             for (const windowMsgs of windows) {
                 const chunkText = windowMsgs.map(m => `${m.sender_role}: ${m.content}`).join('\n');
+
+                // GUARDRAIL: Evitar fragmentación de mensajes cortos sin valor (ej: "Ok", "Vale")
+                const wordCount = chunkText.split(/\s+/).length;
+                if (wordCount < 10 && windowMsgs.length < 2) {
+                    skipped++;
+                    continue;
+                }
+
                 const contentHash = crypto.createHash('sha256')
                     .update(`${clientId}:chunk:${chunkText}`)
                     .digest('hex');
@@ -454,8 +476,10 @@ Formato JSON esperado:
 
         console.log(`📡 [Chunking] ${totalChunks} chunks creados de ${messages.length} mensajes (${skipped} dedup skips).`);
 
-        // 4. AMNESIA: Borrar mensajes procesados
-        await supabase.from('raw_messages').delete().in('id', messages.map(m => m.id));
+        // 4. AMNESIA: Marcar como procesado (Retención de 7 días activa)
+        await supabase.from('raw_messages')
+            .update({ processed: true })
+            .in('id', messages.map(m => m.id));
 
         // 5. AUTO-SOUL: Destilar conocimiento fijos y relaciones
         await autonomousDistillation(clientId, clientSlug, messages);
