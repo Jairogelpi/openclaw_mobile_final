@@ -1,8 +1,10 @@
-import { makeWASocket, useMultiFileAuthState, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import { makeWASocket, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
+import { useSupabaseAuthState } from '../utils/whatsapp_db_auth.mjs';
 import pino from 'pino';
 import { processMessage } from '../core_engine.mjs';
 import redisClient from '../config/redis.mjs';
 import groq from '../services/groq.mjs';
+import supabase from '../config/supabase.mjs';
 
 /**
  * Resetea el temporizador de inactividad para un cliente.
@@ -81,11 +83,9 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
         return { status: 'already_running' };
     }
 
-    // Cada cliente tendrá su propia subcarpeta para guardar sus llaves criptográficas de sesión
-    const sessionDir = `./clients_sessions/${clientSlug}`;
     let state, saveCreds;
     try {
-        const auth = await useMultiFileAuthState(sessionDir);
+        const auth = await useSupabaseAuthState(clientId);
         state = auth.state;
         saveCreds = auth.saveCreds;
     } catch (authErr) {
@@ -111,7 +111,7 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
         version: waVersion,
         printQRInTerminal: !phoneNumber,
         browser: ['Mac OS', 'Chrome', '121.0.6167.85'],
-        syncFullHistory: false,
+        syncFullHistory: true, // Habilitado para cumplir con la ingesta de 1 año
         markOnlineOnConnect: false,
         qrTimeout: 120_000, // 2 minutos por ciclo QR (default: 60s) — da más tiempo al usuario
         logger: pino({ level: 'silent' })
@@ -235,235 +235,95 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
 
     // 3. El Tubo Neural: Escuchar mensajes y enviarlos a nuestro Cerebro Central
     sock.ev.on('messages.upsert', async (m) => {
-        const msg = m.messages[0];
-        console.log(`📩📩📩 UPSERT HANDLER RECEIVED [${clientSlug}] msgId=${msg.key.id} AT ${new Date().toISOString()}`);
-        console.log(`[WhatsApp-Event] 📩 Evento [${clientSlug}] recibido: type=${m.type}, msgId=${msg.key.id}`);
-
-        // Solo ignoramos si no tienen cuerpo
-        if (!msg.message) {
-            console.log(`[WhatsApp-Event] ℹ️ [${clientSlug}] Mensaje sin cuerpo ignorado (Protocolo/Status/BaileysSync).`);
-            return;
-        }
-
-        const isSentByMe = msg.key.fromMe;
-        const senderId = msg.key.remoteJid;
-        const msgContent = msg.message;
-        if (!msgContent) {
-            console.log(`[${clientSlug}] ℹ️ Mensaje sin msgContent ignorado.`);
-            return;
-        }
-
-        const hasImage = !!msgContent.imageMessage;
-        const hasAudio = !!(msgContent.audioMessage || msgContent.pttMessage);
-        const hasDocument = !!msgContent.documentMessage;
-        const hasVideo = !!msgContent.videoMessage;
-        const hasSticker = !!msgContent.stickerMessage;
-
-        // === MULTI-MODAL: Detect text AND media ===
-        let text = extractMessageContent(msgContent);
-        if (!text) {
-            console.log(`[${clientSlug}] 🔍 DEBUG RAW CONTENT:`, JSON.stringify(msgContent, null, 2));
-        }
-        let mediaDescription = '';
-
         try {
+            const msg = m.messages[0];
+            if (!msg.message) {
+                console.log(`[${clientSlug}] ℹ️ Mensaje sin cuerpo ignorado (Protocolo/Status/BaileysSync).`);
+                return;
+            }
+
+            console.log(`📩 [${clientSlug}] msgId=${msg.key.id} RECEIVED`);
+
+            const isSentByMe = msg.key.fromMe;
+            const senderId = msg.key.remoteJid;
+            const msgContent = msg.message;
+            const pushName = msg.pushName || (isSentByMe ? 'Yo' : 'Contacto');
+            const isGroup = senderId.endsWith('@g.us');
+
+            const hasImage = !!msgContent.imageMessage;
+            const hasAudio = !!(msgContent.audioMessage || msgContent.pttMessage);
+            const hasDocument = !!msgContent.documentMessage;
+            const hasVideo = !!msgContent.videoMessage;
+            const hasSticker = !!msgContent.stickerMessage;
+
+            let text = extractMessageContent(msgContent);
+            let mediaDescription = '';
+
+            // Procesar Media
             if (hasImage || hasAudio || hasDocument) {
-                const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
-                const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                const { processAttachment } = await import('../utils/media.mjs');
+                try {
+                    const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
+                    const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                    const { processAttachment } = await import('../utils/media.mjs');
 
-                const attachment = {
-                    type: hasImage ? 'image' : hasAudio ? 'audio' : 'document',
-                    mimetype: msgContent.imageMessage?.mimetype || msgContent.audioMessage?.mimetype || msgContent.documentMessage?.mimetype,
-                    filename: msgContent.documentMessage?.fileName || (hasImage ? 'image.jpg' : hasAudio ? 'audio.ogg' : 'file'),
-                    data: buffer.toString('base64')
-                };
-
-                const attachmentResult = await processAttachment(attachment);
-                mediaDescription = attachmentResult.text;
-
-                // RAG V5: Guardar fragmentos contextualizados si existen
-                if (attachmentResult.chunks && attachmentResult.chunks.length > 0) {
-                    console.log(`[${clientSlug}] 🧠 Guardando ${attachmentResult.chunks.length} fragmentos en memoria (RAG V5)...`);
-                    for (const chunk of attachmentResult.chunks) {
-                        try {
-                            const supabase = (await import('../config/supabase.mjs')).default;
-                            await supabase.from('raw_messages').insert([{
-                                client_id: clientId,
-                                sender_role: pushName || senderId,
-                                content: chunk.contextualized,
-                                remote_id: senderId,
-                                metadata: { ...attachment, is_chunk: true, chunk_index: chunk.index, filename: attachment.filename }
-                            }]);
-                        } catch (err) {
-                            console.error(`[${clientSlug}] ❌ Fallo guardando chunk ${chunk.index}:`, err.message);
-                        }
-                    }
+                    const attachmentResult = await processAttachment({
+                        type: hasImage ? 'image' : hasAudio ? 'audio' : 'document',
+                        mimetype: msgContent.imageMessage?.mimetype || msgContent.audioMessage?.mimetype || msgContent.documentMessage?.mimetype,
+                        filename: msgContent.documentMessage?.fileName || (hasImage ? 'image.jpg' : hasAudio ? 'audio.ogg' : 'file'),
+                        data: buffer.toString('base64')
+                    });
+                    mediaDescription = attachmentResult.text;
+                } catch (e) {
+                    console.warn(`[${clientSlug}] ⚠️ Media Error:`, e.message);
+                    mediaDescription = '[Error procesando adjunto]';
                 }
-            } else if (hasVideo) {
-                mediaDescription = '[🎬 Video adjunto]';
-            } else if (hasSticker) {
-                mediaDescription = '[🏷️ Sticker]';
             }
-        } catch (mediaErr) {
-            console.warn(`[${clientSlug}] ⚠️ Media processing error:`, mediaErr.message);
-            mediaDescription = '[Error procesando archivo adjunto]';
-        }
 
-        // Combine text + media description
-        let finalText = [mediaDescription, text].filter(Boolean).join(' ');
+            let finalText = [mediaDescription, text].filter(Boolean).join(' ');
 
-        // --- FALLBACK CRÍTICO PARA INGESTIÓN ---
-        // Si el mensaje viene de mí o es importante para la identidad, NUNCA abortar si tiene algún tipo de estructura.
-        if (!finalText) {
-            if (hasImage) finalText = '[Imagen sin pie de foto]';
-            else if (hasAudio) finalText = '[Nota de voz / Audio]';
-            else if (hasVideo) finalText = '[Video sin pie de foto]';
-            else if (hasSticker) finalText = '[Sticker]';
-            else if (msgContent.locationMessage) finalText = `[Ubicación: ${msgContent.locationMessage.degreesLatitude}, ${msgContent.locationMessage.degreesLongitude}]`;
-            else if (msgContent.contactMessage) finalText = `[Contacto: ${msgContent.contactMessage.displayName}]`;
-            else if (isSentByMe) finalText = '[Mensaje enviado sin contenido de texto descifrable]';
-        }
-
-        if (!finalText) {
-            console.log(`[${clientSlug}] ℹ️ Mensaje realmente vacío (status/protocolo) ignorado.`);
-            return;
-        }
-
-        console.log(`[${clientSlug} - ${isSentByMe ? 'Enviado' : 'Recibido'}]: ${finalText.slice(0, 100)} (de ${pushName}${isGroup ? ' en grupo' : ''})`);
-
-        // --- Insight Pasivo-Agresivo (Análisis Semántico Ultra-rápido) ---
-        let insightData = null;
-        if (!isSentByMe && text && text.trim().length > 3) {
-            try {
-                // Usamos el modelo más rápido posible (8b)
-                const insightRaw = await groq.chat.completions.create({
-                    model: 'llama-3.1-8b-instant',
-                    temperature: 0.1,
-                    max_tokens: 150,
-                    response_format: { type: 'json_object' },
-                    messages: [
-                        {
-                            role: 'system', content: `Eres un psicólogo experto en comunicación no violenta. Analiza este mensaje breve de WhatsApp.
-                        ¿Tiene un tono pasivo-agresivo, manipulador, enfadado encubierto o contiene un doble sentido negativo?
-                        Responde SOLO con este JSON:
-                        {
-                          "is_toxic": boolean,
-                          "analysis": "Explicación brevísima (1 línea) de la intención oculta real",
-                          "suggested_reply": "Respuesta estratégica sugerida (corta)"
-                        }` },
-                        { role: 'user', content: `El usuario "${pushName}" me ha escrito esto: "${text}"` }
-                    ]
-                });
-                const parsedInsight = JSON.parse(insightRaw.choices[0].message.content);
-                if (parsedInsight.is_toxic) {
-                    insightData = {
-                        analysis: parsedInsight.analysis,
-                        suggested_reply: parsedInsight.suggested_reply
-                    };
-                    console.log(`⚠️ [Insight] Toxicidad detectada en ${pushName}: ${parsedInsight.analysis}`);
-                }
-            } catch (e) {
-                console.warn(`[Insight] Falló el análisis de tono para ${msg.key.id}:`, e.message);
+            // Fallback
+            if (!finalText) {
+                if (hasImage) finalText = '[Imagen]';
+                else if (hasAudio) finalText = '[Audio]';
+                else if (hasVideo) finalText = '[Video]';
+                else if (hasSticker) finalText = '[Sticker]';
+                else if (isSentByMe) finalText = '[Mensaje del usuario]';
             }
-        }
 
-        const incomingEvent = {
-            clientId: clientId,
-            clientSlug: clientSlug,
-            channel: 'whatsapp',
-            senderId: senderId,
-            text: finalText,
-            isSentByMe: isSentByMe,
-            metadata: {
-                pushName: pushName,
-                isGroup: isGroup,
-                groupName: isGroup ? 'Grupo de WhatsApp' : null,
-                hasMedia: !!(hasImage || hasAudio || hasDocument || hasVideo),
-                mediaType: hasImage ? 'image' : hasAudio ? 'audio' : hasDocument ? 'document' : hasVideo ? 'video' : null,
-                insight: insightData, // Guardamos el análisis psicológico
-                avatarUrl: await (async () => {
-                    const cacheKey = `${clientId}:${senderId}`;
-                    const cached = profilePicCache.get(cacheKey);
-                    if (cached && (Date.now() - cached.timestamp < 3600000)) {
-                        return cached.url;
-                    }
-                    try {
-                        const url = await sock.profilePictureUrl(senderId, 'image');
-                        profilePicCache.set(cacheKey, { url, timestamp: Date.now() });
-                        return url;
-                    } catch (e) {
-                        return null;
-                    }
-                })()
+            if (!finalText) {
+                console.log(`[${clientSlug}] ℹ️ Mensaje vacío ignorado.`);
+                return;
             }
-        };
-        console.log(`[${clientSlug}] 🛰️ Evento incomingEvent preparado para remoteId: ${senderId}`);
 
-        // ✅ [Unified Memory] Registrar el mensaje (tanto entrante como saliente) para el Scraper
-        try {
-            console.log(`[${clientSlug}] 📝 Intentando registrar mensaje en raw_messages para remoteId: ${senderId}...`);
+            console.log(`[${clientSlug} - ${isSentByMe ? 'Sent' : 'Recv'}]: ${finalText.slice(0, 50)}...`);
+
+            // INSERTAR EN DB
             const supabase = (await import('../config/supabase.mjs')).default;
             const { error: dbErr } = await supabase.from('raw_messages').insert([{
                 client_id: clientId,
                 sender_role: isSentByMe ? 'user_sent' : pushName,
                 content: finalText,
                 remote_id: senderId,
-                metadata: incomingEvent.metadata, // Contiene info de media si existe
-                created_at: new Date().toISOString()
+                metadata: {
+                    pushName,
+                    isGroup,
+                    hasMedia: !!mediaDescription,
+                    historical: false
+                }
             }]);
-            if (dbErr) throw dbErr;
-            console.log(`[${clientSlug}] ✅ Mensaje registrado en raw_messages (sender: ${isSentByMe ? 'user_sent' : pushName})`);
-        } catch (dbErr) {
-            console.error(`[${clientSlug}] ❌ Fallo registrando mensaje en raw_messages:`, dbErr.message);
-        }
 
-        /* --- Proceso de Respuesta AI (DESHABILITADO por petición del usuario) ---
-        if (!isSentByMe) {
-            const aiReply = await processMessage(incomingEvent);
-            if (aiReply) {
-                await sock.sendMessage(senderId, { text: aiReply });
+            if (dbErr) {
+                console.error(`[${clientSlug}] ❌ DB Insert Error:`, dbErr.message);
+            } else {
+                console.log(`[${clientSlug}] ✅ Message stored in raw_messages`);
             }
-            // Trigger memory worker distillation after message exchange
-            await triggerMemoryTimer(clientId);
-        }
-        */
 
-        // Aun así disparamos el timer para que el worker procese el inbox (resúmenes) 
-        // pero sin generar respuesta automática.
-        if (!isSentByMe) {
-            await triggerMemoryTimer(clientId);
-        }
-
-        // 🔴 REAL-TIME BROADCAST: Push message to connected mobile app via WebSocket
-        try {
-            // Import wss from server — we use a lazy dynamic import to avoid circular deps
-            const { default: http } = await import('http');
-            // Access the global wss instance if available
-            if (global.__wss) {
-                const payload = JSON.stringify({
-                    type: 'whatsapp_message',
-                    data: {
-                        id: msg.key.id,
-                        conversationId: senderId,
-                        text: finalText,
-                        sender: pushName,
-                        isMe: isSentByMe,
-                        timestamp: new Date().toISOString(),
-                        hasMedia: !!(hasImage || hasAudio || hasDocument || hasVideo),
-                        mediaType: hasImage ? 'image' : hasAudio ? 'audio' : hasDocument ? 'document' : hasVideo ? 'video' : null,
-                        insight: insightData, // Emitir también por WebSocket
-                    }
-                });
-                global.__wss.clients.forEach(ws => {
-                    if (ws.readyState === 1 && ws.userId === clientId) {
-                        ws.send(payload);
-                    }
-                });
+            if (!isSentByMe) {
+                await triggerMemoryTimer(clientId);
             }
-        } catch (broadcastErr) {
-            // Non-critical — don't let broadcast failures crash the message pipeline
-            console.warn('[WS Broadcast] Error:', broadcastErr.message);
+
+        } catch (handlerErr) {
+            console.error(`[${clientSlug}] 💀 CRITICAL HANDLER ERROR:`, handlerErr.message);
         }
     });
 

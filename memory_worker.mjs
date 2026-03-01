@@ -13,6 +13,7 @@ import crypto from 'node:crypto';
 import { generateEmbedding, cosineSimilarity } from './services/local_ai.mjs';
 import redisClient from './config/redis.mjs';
 import { upsertKnowledgeNode, upsertKnowledgeEdge } from './services/graph.service.mjs';
+import cron from 'node-cron';
 
 /**
  * Resetea el temporizador de inactividad para un cliente.
@@ -481,158 +482,170 @@ async function main() {
 
     // 2. Ya no hay Docker. Scale-To-Zero se maneja internamente.
 
-    // 3. Fallback: cada 30 min, procesar clientes que puedan haberse escapado
-    setInterval(async () => {
-        console.log('🔄 [Fallback] Barrido de seguridad...');
+    // Run once at startup after 30 seconds
+    setTimeout(consolidateMemories, 30 * 1000);
+    setTimeout(cleanupRawMessages, 60 * 1000);
+
+    // ══════════════════════════════════════════════════════════
+    // 6. FORMAL SCHEDULING (node-cron)
+    // ══════════════════════════════════════════════════════════
+
+    // Fallback: cada 30 min, procesar clientes que puedan haberse escapado
+    cron.schedule('*/30 * * * *', async () => {
+        console.log('🔄 [Cron: Fallback] Barrido de seguridad...');
         const { data: clients } = await supabase
             .from('raw_messages')
             .select('client_id')
-            .eq('processed', false);
+            .eq('processed', false); // Added .eq('processed', false) for correctness
 
         const uniqueClients = [...new Set(clients?.map(c => c.client_id))];
         for (const clientId of uniqueClients) {
             await distillAndVectorize(clientId);
         }
-    }, 30 * 60 * 1000);
+    });
 
-    // ══════════════════════════════════════════════════════════
-    // 4. MEMORY CONSOLIDATION — Every 6 hours, merge old chunks
-    // ══════════════════════════════════════════════════════════
-    async function consolidateMemories() {
-        console.log('🧹 [Consolidation] Iniciando consolidación de memorias antiguas...');
-        try {
-            const DAYS_THRESHOLD = 14; // ← Antes: 30 días. Ahora más agresivo.
-            const cutoffDate = new Date(Date.now() - DAYS_THRESHOLD * 24 * 60 * 60 * 1000).toISOString();
+    // Memory Consolidation: Cada 3 horas
+    cron.schedule('0 */3 * * *', async () => {
+        await consolidateMemories();
+    });
 
-            // Get all clients with old memories
-            const { data: oldMemories, error } = await supabase
-                .from('user_memories')
-                .select('id, client_id, content, metadata, created_at')
-                .lt('created_at', cutoffDate)
-                .is('metadata->>consolidated', null) // Not already consolidated
-                .order('created_at', { ascending: true })
-                .limit(500);
+    // Raw Messages Cleanup: Cada 6 horas
+    cron.schedule('0 */6 * * *', async () => {
+        await cleanupRawMessages();
+    });
 
-            if (error || !oldMemories?.length) {
-                console.log(`🧹 [Consolidation] ${error ? 'Error: ' + error.message : 'No hay memorias antiguas para consolidar.'}`);
-                return;
-            }
+    console.log('📅 [Scheduler] Tareas programadas: Fallback (30m), Consolidación (3h), Purga (6h).');
+}
 
-            // Group by client_id + remoteId
-            const groups = {};
-            for (const mem of oldMemories) {
-                const remoteId = mem.metadata?.remoteId || 'unknown';
-                const key = `${mem.client_id}::${remoteId}`;
-                if (!groups[key]) groups[key] = { clientId: mem.client_id, remoteId, memories: [] };
-                groups[key].memories.push(mem);
-            }
+// ══════════════════════════════════════════════════════════
+// 4. MEMORY CONSOLIDATION — Every 6 hours, merge old chunks
+// ══════════════════════════════════════════════════════════
+async function consolidateMemories() {
+    console.log('🧹 [Consolidation] Iniciando consolidación de memorias antiguas...');
+    try {
+        const DAYS_THRESHOLD = 14; // ← Antes: 30 días. Ahora más agresivo.
+        const cutoffDate = new Date(Date.now() - DAYS_THRESHOLD * 24 * 60 * 60 * 1000).toISOString();
 
-            let consolidated = 0;
-            let deleted = 0;
+        // Get all clients with old memories
+        const { data: oldMemories, error } = await supabase
+            .from('user_memories')
+            .select('id, client_id, content, metadata, created_at')
+            .lt('created_at', cutoffDate)
+            .is('metadata->>consolidated', null) // Not already consolidated
+            .order('created_at', { ascending: true })
+            .limit(500);
 
-            for (const [key, group] of Object.entries(groups)) {
-                if (group.memories.length < 3) continue; // Not worth consolidating
+        if (error || !oldMemories?.length) {
+            console.log(`🧹 [Consolidation] ${error ? 'Error: ' + error.message : 'No hay memorias antiguas para consolidar.'}`);
+            return;
+        }
 
-                // Build a text block for summarization
-                const fullText = group.memories
-                    .map(m => m.content)
-                    .join('\n---\n')
-                    .slice(0, 6000); // Cap to avoid token limits
+        // Group by client_id + remoteId
+        const groups = {};
+        for (const mem of oldMemories) {
+            const remoteId = mem.metadata?.remoteId || 'unknown';
+            const key = `${mem.client_id}::${remoteId}`;
+            if (!groups[key]) groups[key] = { clientId: mem.client_id, remoteId, memories: [] };
+            groups[key].memories.push(mem);
+        }
 
-                try {
-                    const summaryResponse = await groq.chat.completions.create({
-                        model: 'llama-3.1-8b-instant',
-                        messages: [{
-                            role: 'system',
-                            content: `Eres un sistema de consolidación de memoria. Dado un conjunto de fragmentos de conversación, genera un resumen conciso que capture:
+        let consolidated = 0;
+        let deleted = 0;
+
+        for (const [key, group] of Object.entries(groups)) {
+            if (group.memories.length < 3) continue; // Not worth consolidating
+
+            // Build a text block for summarization
+            const fullText = group.memories
+                .map(m => m.content)
+                .join('\n---\n')
+                .slice(0, 6000); // Cap to avoid token limits
+
+            try {
+                const summaryResponse = await groq.chat.completions.create({
+                    model: 'llama-3.1-8b-instant',
+                    messages: [{
+                        role: 'system',
+                        content: `Eres un sistema de consolidación de memoria. Dado un conjunto de fragmentos de conversación, genera un resumen conciso que capture:
 1. Los temas principales discutidos
 2. Hechos clave mencionados (nombres, fechas, planes)
 3. El tono y estilo de la conversación
 4. Cualquier decisión o acuerdo tomado
 
 Formato: Resumen narrativo en 2-3 párrafos. Mantén el idioma original. NO añadas comentarios propios.`
-                        }, {
-                            role: 'user',
-                            content: `Consolida estos ${group.memories.length} fragmentos de conversación con ${group.remoteId}:\n\n${fullText}`
-                        }],
-                        temperature: 0.2,
-                        max_tokens: 500,
-                    });
+                    }, {
+                        role: 'user',
+                        content: `Consolida estos ${group.memories.length} fragmentos de conversación con ${group.remoteId}:\n\n${fullText}`
+                    }],
+                    temperature: 0.2,
+                    max_tokens: 500,
+                });
 
-                    const summary = summaryResponse.choices[0].message.content;
+                const summary = summaryResponse.choices[0].message.content;
 
-                    // Generate embedding for the summary
-                    const embedding = await generateEmbedding(summary);
+                // Generate embedding for the summary
+                const embedding = await generateEmbedding(summary);
 
-                    // Insert consolidated memory
-                    const dateStart = group.memories[0].created_at;
-                    const dateEnd = group.memories[group.memories.length - 1].created_at;
+                // Insert consolidated memory
+                const dateStart = group.memories[0].created_at;
+                const dateEnd = group.memories[group.memories.length - 1].created_at;
 
-                    await supabase.from('user_memories').insert({
-                        client_id: group.clientId,
-                        content: `[RESUMEN CONSOLIDADO — ${group.memories.length} fragmentos]\n${summary}`,
-                        sender: 'system_consolidation',
-                        embedding: embedding,
-                        content_hash: crypto.createHash('sha256').update(`consolidated:${key}:${dateStart}:${dateEnd}`).digest('hex'),
-                        metadata: {
-                            remoteId: group.remoteId,
-                            isGroup: group.remoteId.includes('@g.us'),
-                            dateStart,
-                            dateEnd,
-                            consolidated: true,
-                            originalCount: group.memories.length,
-                            chunkSize: group.memories.length,
-                        }
-                    });
+                await supabase.from('user_memories').insert({
+                    client_id: group.clientId,
+                    content: `[RESUMEN CONSOLIDADO — ${group.memories.length} fragmentos]\n${summary}`,
+                    sender: 'system_consolidation',
+                    embedding: embedding,
+                    content_hash: crypto.createHash('sha256').update(`consolidated:${key}:${dateStart}:${dateEnd}`).digest('hex'),
+                    metadata: {
+                        remoteId: group.remoteId,
+                        isGroup: group.remoteId.includes('@g.us'),
+                        dateStart,
+                        dateEnd,
+                        consolidated: true,
+                        originalCount: group.memories.length,
+                        chunkSize: group.memories.length,
+                    }
+                });
 
-                    // Delete original old memories
-                    const idsToDelete = group.memories.map(m => m.id);
-                    await supabase.from('user_memories').delete().in('id', idsToDelete);
+                // Delete original old memories
+                const idsToDelete = group.memories.map(m => m.id);
+                await supabase.from('user_memories').delete().in('id', idsToDelete);
 
-                    consolidated++;
-                    deleted += idsToDelete.length;
-                    console.log(`🧹 [Consolidation] ${group.remoteId.slice(0, 12)}...: ${idsToDelete.length} chunks → 1 resumen`);
-                } catch (e) {
-                    console.warn(`[Consolidation] Error procesando ${key}:`, e.message);
-                }
+                consolidated++;
+                deleted += idsToDelete.length;
+                console.log(`🧹 [Consolidation] ${group.remoteId.slice(0, 12)}...: ${idsToDelete.length} chunks → 1 resumen`);
+            } catch (e) {
+                console.warn(`[Consolidation] Error procesando ${key}:`, e.message);
             }
-
-            console.log(`✅ [Consolidation] ${consolidated} grupos consolidados, ${deleted} chunks eliminados.`);
-        } catch (err) {
-            console.error('[Consolidation] Error general:', err.message);
         }
+
+        console.log(`✅ [Consolidation] ${consolidated} grupos consolidados, ${deleted} chunks eliminados.`);
+    } catch (err) {
+        console.error('[Consolidation] Error general:', err.message);
     }
+}
 
-    // ═══════════════════════════════════════════════════════════
-    // 5. RAW MESSAGES CLEANUP — Purge processed msgs older than 7 days
-    // ═══════════════════════════════════════════════════════════
-    async function cleanupRawMessages() {
-        console.log('🗑️ [Cleanup] Purgando raw_messages procesados (+7 días)...');
-        try {
-            const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-            const { count, error } = await supabase
-                .from('raw_messages')
-                .delete({ count: 'exact' })
-                .eq('processed', true)
-                .lt('created_at', cutoff);
+// ═══════════════════════════════════════════════════════════
+// 5. RAW MESSAGES CLEANUP — Purge processed msgs older than 7 days
+// ═══════════════════════════════════════════════════════════
+async function cleanupRawMessages() {
+    console.log('🗑️ [Cleanup] Purgando raw_messages procesados (+7 días)...');
+    try {
+        const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+        const { count, error } = await supabase
+            .from('raw_messages')
+            .delete({ count: 'exact' })
+            .eq('processed', true)
+            .lt('created_at', cutoff);
 
-            if (error) {
-                console.error('[Cleanup] Error:', error.message);
-            } else {
-                console.log(`✅ [Cleanup] ${count || 0} mensajes antiguos eliminados.`);
-            }
-        } catch (e) {
-            console.error('[Cleanup] Error general:', e.message);
+        if (error) {
+            console.error('[Cleanup] Error:', error.message);
+        } else {
+            console.log(`✅ [Cleanup] ${count || 0} mensajes antiguos eliminados.`);
         }
+    } catch (e) {
+        console.error('[Cleanup] Error general:', e.message);
     }
-
-    // Run consolidation every 3 hours (antes: 6h)
-    setInterval(consolidateMemories, 3 * 60 * 60 * 1000);
-    // Run raw_messages cleanup every 6 hours
-    setInterval(cleanupRawMessages, 6 * 60 * 60 * 1000);
-    // Run once at startup after 2 minutes
-    setTimeout(consolidateMemories, 2 * 60 * 1000);
-    setTimeout(cleanupRawMessages, 3 * 60 * 1000);
 }
 
 main().catch(err => {

@@ -285,20 +285,25 @@ REGLAS DE ORO:
             aiReply = await groqChat('llama-3.3-70b-versatile', history, { temperature: 0.3 });
 
             // CRÍTICA INTERNA - Enfocada en Identidad
-            const critiquePrompt = `Eres el Auditor de Identidad de OpenClaw. 
-            PERFIL DE ESTILO DEL DUEÑO:
+            const critiquePrompt = `Eres el Auditor de Identidad de OpenClaw. Tu objetivo es el "Espejo Semántico Perfecto".
+            
+            PERFIL DE ESTILO REQUERIDO:
             ${styleInfo}
-            EJEMPLOS REALES:
+            
+            EJEMPLOS REALES DEL DUEÑO:
             ${userStyleExamples}
             
             RESPUESTA A EVALUAR: "${aiReply}"
             
-            TAREA: ¿Esta respuesta parece escrita por el dueño de la cuenta?
-            - ¿Usa los mismos emojis?
-            - ¿Tiene el mismo uso de mayúsculas/puntuación?
-            - ¿Es demasiado educado o servicial (típico de bot)?
+            TAREA: Evalúa la respuesta en una escala de 0 a 10 en los siguientes criterios:
+            1. TONO: ¿Coincide con la personalidad detectada?
+            2. FORMATO: ¿Usa las mismas mayúsculas y puntuación?
+            3. EMOJIS: ¿Usa la cantidad y tipo correctos?
+            4. FLUIDEZ: ¿Suena a humano o a asistente IA?
             
-            Responde JSON: { "approved": boolean, "critique": "string", "suggestions": "string" }`;
+            REGLA DE ORO: Si la respuesta empieza con "Como asistente..." o es demasiado servicial, CALIFICA 0.
+            
+            Responde JSON: { "approved": boolean, "score": number, "critique": "string", "suggestions": "string" }`;
 
             try {
                 const auditRaw = await groqChat('llama-3.3-70b-versatile', [
