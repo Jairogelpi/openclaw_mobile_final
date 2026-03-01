@@ -11,61 +11,25 @@ const execPromise = util.promisify(exec);
 import { encrypt, decrypt } from './security.mjs';
 import crypto from 'node:crypto';
 import { generateEmbedding, cosineSimilarity } from './services/local_ai.mjs';
+import redisClient from './config/redis.mjs';
+import { upsertKnowledgeNode, upsertKnowledgeEdge } from './services/graph.service.mjs';
+
+/**
+ * Resetea el temporizador de inactividad para un cliente.
+ */
+async function triggerMemoryTimer(clientId) {
+    if (!redisClient) return;
+    try {
+        await redisClient.set(`idle:${clientId}`, 'process', { EX: 60 });
+        console.log(`[Timer] ⏳ Reloj reseteado para ${clientId}. Procesando en 60s de inactividad.`);
+    } catch (e) {
+        console.warn('[Timer] Error reseteando temporizador:', e.message);
+    }
+}
 
 // No local initializations needed anymore as they are in config/services
 
-// Guarda un Nodo en Supremo y retorna su ID
-async function upsertKnowledgeNode(clientId, entityName, entityType, description) {
-    // Verificar si existe para no duplicar
-    const { data: existing } = await supabase
-        .from('knowledge_nodes')
-        .select('id')
-        .eq('client_id', clientId)
-        .eq('entity_name', entityName)
-        .single();
-
-    if (existing) return existing.id;
-
-    // Generar el vector del nodo
-    const embedding = await generateEmbedding(entityName + " " + (description || ""));
-
-    const { data: inserted, error } = await supabase.from('knowledge_nodes').insert({
-        client_id: clientId,
-        entity_name: entityName,
-        entity_type: entityType,
-        description: description,
-        embedding: embedding
-    }).select('id').single();
-
-    if (error) {
-        console.error('❌ [Graph] Error insertando nodo:', error.message);
-        return null;
-    }
-    return inserted.id;
-}
-
-// Crea una relación entre dos nodos
-async function upsertKnowledgeEdge(clientId, sourceId, targetId, relationType) {
-    if (!sourceId || !targetId) return;
-
-    // Evitar relaciones circulares simples o duplicados idénticos en el mismo sentido
-    const { data: existing } = await supabase
-        .from('knowledge_edges')
-        .select('id')
-        .eq('source_node', sourceId)
-        .eq('target_node', targetId)
-        .eq('relation_type', relationType)
-        .single();
-
-    if (existing) return;
-
-    await supabase.from('knowledge_edges').insert({
-        client_id: clientId,
-        source_node: sourceId,
-        target_node: targetId,
-        relation_type: relationType
-    });
-}
+// No longer needed: local upsertKnowledgeNode and upsertKnowledgeEdge removed to use services/graph.service.mjs
 
 // === AUTONOMOUS KNOWLEDGE DISTILLATION (AUTO-SOUL) ===
 async function autonomousDistillation(clientId, clientSlug, messages) {
@@ -83,31 +47,44 @@ async function autonomousDistillation(clientId, clientSlug, messages) {
 
         const currentSoul = soulRow?.soul_json || {};
 
-        // 2. Extraer hechos y tripletes con LLM (70b para máxima precisión)
+        // 2. Extraer hechos, tripletes y PERFIL DE ESTILO
         const textBlock = messages.map(m => `${m.sender_role}: ${m.content}`).join('\n');
 
         const response = await groq.chat.completions.create({
             model: 'llama-3.3-70b-versatile',
             messages: [{
                 role: 'system',
-                content: `Eres un extractor de conocimiento experto de OpenClaw. Tu misión es extraer hechos sobre el USUARIO y relaciones para su Grafo de Conocimiento.
+                content: `Eres el Arquitecto de Identidad de OpenClaw. Analiza esta conversación.
                 
-                SOUL ACTUAL DEL USUARIO:
+                SOUL ACTUAL:
                 ${JSON.stringify(currentSoul)}
                 
-                CONVERSACIÓN RECIENTE:
+                CONVERSACIÓN:
                 ${textBlock}
                 
                 INSTRUCCIONES:
-                1. "soul_patch": Identifica nuevos rasgos, preferencias, alergias, pasatiempos o hechos fijos del usuario. No repitas lo que ya está en el SOUL. Devuelve un JSON con CAMPOS NUEVOS o ACTUALIZADOS.
-                2. "triplets": Identifica relaciones semánticas importantes. Formato: [Sujeto, Predicado, Objeto]. 
-                   Sujeto SIEMPRE debe ser "Usuario" si el hecho es sobre el dueño de la cuenta. 
-                   Ejemplo: ["Usuario", "GUSTA_DE", "Café"], ["Usuario", "HIJO_DE", "Pedro"].
+                1. "soul_patch": Hechos directos (Preferencias, nombres, metas).
+                2. "triplets": Relaciones [Sujeto, Predicado, Objeto].
+                3. "style_profile": ANALIZA SOLO LOS MENSAJES DE 'user_sent'.
+                   - "common_emojis": Lista de emojis que el usuario usa frecuentemente.
+                   - "tone": (e.g., informal, sarcástico, seco, entusiasta).
+                   - "slang_and_vocabulary": Palabras o frases únicas que repite.
+                   - "punctuation_style": (e.g., "no usa mayúsculas", "usa muchos puntos suspensivos").
+                   - "message_length": (e.g., "muy corto/directo", "párrafos largos").
+                   - "casing_and_formatting": (e.g., "todo minúsculas", "usa negritas").
                 
-                Devuelve SOLO un JSON con este formato:
+                Responde SOLO JSON:
                 {
-                  "soul_patch": { "campo": "valor" },
-                  "triplets": [ ["S", "P", "O"], ... ]
+                  "soul_patch": {},
+                  "triplets": [],
+                  "style_profile": {
+                    "common_emojis": [],
+                    "tone": "",
+                    "slang_and_vocabulary": [],
+                    "punctuation_style": "",
+                    "message_length": "",
+                    "casing_and_formatting": ""
+                  }
                 }`
             }],
             response_format: { type: 'json_object' },
@@ -116,9 +93,16 @@ async function autonomousDistillation(clientId, clientSlug, messages) {
 
         const result = JSON.parse(response.choices[0].message.content);
 
-        // 3. Aplicar Parche al SOUL
-        if (result.soul_patch && Object.keys(result.soul_patch).length > 0) {
-            const updatedSoul = { ...currentSoul, ...result.soul_patch };
+        // 3. Aplicar Parche al SOUL e Identidad
+        if ((result.soul_patch && Object.keys(result.soul_patch).length > 0) || result.style_profile) {
+            const updatedSoul = {
+                ...currentSoul,
+                ...result.soul_patch,
+                style_profile: {
+                    ...(currentSoul.style_profile || {}),
+                    ...(result.style_profile || {})
+                }
+            };
 
             // A. Guardar en DB
             await supabase
@@ -131,17 +115,17 @@ async function autonomousDistillation(clientId, clientSlug, messages) {
             const soulText = JSON.stringify(updatedSoul, null, 2);
             await fs.writeFile(soulPath, encrypt(soulText));
 
-            console.log(`✨ [Auto-Soul] Soul actualizado:`, Object.keys(result.soul_patch));
+            console.log(`✨ [Auto-Soul] Memoria e Identidad (Estilo) actualizadas para ${clientSlug}.`);
         }
 
         // 4. Upsert en el Grafo
         if (result.triplets && result.triplets.length > 0) {
             for (const [s, p, o] of result.triplets) {
-                const sId = await upsertKnowledgeNode(clientId, s, 'ENTITY', '');
-                const oId = await upsertKnowledgeNode(clientId, o, 'ENTITY', '');
-                await upsertKnowledgeEdge(clientId, sId, oId, p);
+                await upsertKnowledgeNode(clientId, s, 'ENTITY', '');
+                await upsertKnowledgeNode(clientId, o, 'ENTITY', '');
+                await upsertKnowledgeEdge(clientId, s, o, p);
             }
-            console.log(`🕸️ [Auto-Soul] ${result.triplets.length} tripletes añadidos al grafo.`);
+            console.log(`🕸️ [Auto-Soul] ${result.triplets.length} tripletes añadidos.`);
         }
 
     } catch (e) {
@@ -152,7 +136,7 @@ async function autonomousDistillation(clientId, clientSlug, messages) {
 // === DISTILL + GRAPHRAG VECTORIZE + INBOX SUMMARIES ===
 async function distillAndVectorize(clientId) {
     // Obtener slug del cliente para rutas de archivos
-    const { data: client } = await supabase.from('clients').select('slug').eq('id', clientId).single();
+    const { data: client } = await supabase.from('user_souls').select('slug').eq('client_id', clientId).single();
     if (!client) return;
     const clientSlug = client.slug;
 
@@ -196,7 +180,7 @@ async function distillAndVectorize(clientId) {
 
             try {
                 const summaryResponse = await groq.chat.completions.create({
-                    model: 'llama-3.1-70b-versatile', // Upgrade for better nuance
+                    model: 'llama-3.3-70b-versatile',
                     messages: [
                         {
                             role: 'system',
@@ -213,82 +197,140 @@ Ve directo al grano con elegancia.`
                 const isGroup = remoteId.includes('@g.us');
 
                 // Upsert en inbox_summaries
-                await supabase.from('inbox_summaries').upsert({
+                const { error: upsertError } = await supabase.from('inbox_summaries').upsert({
                     client_id: clientId,
                     conversation_id: remoteId,
                     summary: summary,
                     last_message_text: conv.lastText,
                     contact_name: isGroup ? null : (conv.lastSender.startsWith('[Grupo]') ? null : conv.lastSender),
                     group_name: isGroup ? conv.lastSender.replace('[Grupo] ', '') : null,
-                    avatar_url: conv.avatarUrl, // Nueva columna
+                    avatar_url: conv.avatarUrl,
                     is_unread: true,
                     last_updated: new Date().toISOString()
                 }, { onConflict: 'client_id, conversation_id' });
+
+                if (upsertError) {
+                    console.error(`❌ [Inbox] Error haciendo upsert para ${remoteId}:`, upsertError.message);
+                } else {
+                    console.log(`✅ [Inbox] Resumen guardado exitosamente para ${remoteId}`);
+                }
+
+                // --- PARTE A.2: EXTRACCIÓN DE PERFIL DE RELACIÓN (PERSONA) ---
+                console.log(`🎭 [Persona] Extrayendo perfil de relación para: ${remoteId}`);
+                try {
+                    const personaResponse = await groq.chat.completions.create({
+                        model: 'llama-3.3-70b-versatile',
+                        messages: [
+                            {
+                                role: 'system',
+                                content: `Eres un analista de perfiles psicológicos. 
+Analiza esta conversación de WhatsApp entre "Usuario" (el dueño de la cuenta) y su contacto.
+Tu tarea es extraer un JSON con el "tono" y "dinámica" de ESTA relación específica.
+
+Campos requeridos en el JSON:
+- formalidad (ej: "muy informal", "profesional", "respetuoso")
+- tono (ej: "bromista", "cariñoso", "cortante", "amigable")
+- largo_mensajes (ej: "cortos y rápidos", "párrafos largos")
+- emojis (ej: "usa muchos emojis", "casi nulo")
+- relacion_detectada (ej: "amigo cercano", "colega de trabajo", "familiar", "desconocido")
+- muletillas (lista de arrays con palabras repetidas del usuario. ej: ["jaja", "wey", "tipo"])
+
+Devuelve SOLO EL JSON y nada más.`
+                            },
+                            { role: 'user', content: `CONVERSACIÓN:\n${conv.messages.join('\n')}` }
+                        ],
+                        response_format: { type: 'json_object' }
+                    });
+
+                    const personaJson = JSON.parse(personaResponse.choices[0].message.content);
+
+                    const { error: personaError } = await supabase.from('contact_personas').upsert({
+                        client_id: clientId,
+                        remote_id: remoteId,
+                        persona_json: personaJson,
+                        updated_at: new Date().toISOString()
+                    }, { onConflict: 'client_id, remote_id' });
+
+                    if (personaError) {
+                        console.error(`❌ [Persona] Error guardando perfil para ${remoteId}:`, personaError.message);
+                    } else {
+                        console.log(`✅ [Persona] Perfil guardado para ${remoteId} (${personaJson.relacion_detectada})`);
+                    }
+                } catch (e) {
+                    console.warn(`⚠️ [Persona] Error extrayendo perfil para ${remoteId}:`, e.message);
+                }
+
+                // --- PARTE A.3: GRAPHRAG (Memoria Episódica Verdadera) ---
+                console.log(`🔍 [GraphRAG] Extrayendo hechos lógicos para: ${remoteId}`);
+                let triplets = [];
+                try {
+                    const contactIdentifier = isGroup ? `Grupo (${conv.lastSender.replace('[Grupo] ', '')})` : (conv.lastSender || remoteId);
+                    const graphResponse = await groq.chat.completions.create({
+                        model: 'llama-3.3-70b-versatile',
+                        response_format: { type: 'json_object' },
+                        messages: [
+                            {
+                                role: 'system',
+                                content: `Eres un analista de inteligencia construyendo un Grafo de Conocimiento (GraphRAG).
+Tu misión es extraer hechos fijos y permanentes de esta conversación.
+
+REGLAS CRÍTICAS DE ENTIDADES:
+- Si el hecho es sobre el dueño de la cuenta, el Sujeto debe ser SIEMPRE: "Usuario".
+- Si el hecho es sobre la persona con la que habla, el Sujeto debe ser ESTRICTAMENTE: "${contactIdentifier}".
+- No uses nombres genéricos como "Contacto", "El amigo", usa exactamente "${contactIdentifier}".
+
+OBJETIVOS DE EXTRACCIÓN:
+- Relaciones familiares (ej: hermano de, hijo de)
+- Posesiones importantes (ej: tiene mascota, tiene coche)
+- Eventos fijos (ej: se casó en 2020)
+- Nombres propios (ej: su perro se llama Toby)
+
+Formato JSON esperado:
+{
+  "triplets": [
+    {
+      "source": "Sujeto (Usuario o ${contactIdentifier})",
+      "source_type": "PERSONA",
+      "target": "Objeto (ej. Toby, Madrid, Fútbol)",
+      "target_type": "ENTITY|CONCEPT|LOCATION",
+      "relation": "TIENE_MASCOTA|RESIDE_EN|GUSTA_DE|PADRE_DE",
+      "context": "Detalle breve del hecho"
+    }
+  ]
+}`
+                            },
+                            { role: 'user', content: `CONVERSACIÓN:\n${conv.messages.join('\n')}` }
+                        ]
+                    });
+
+                    const graphData = JSON.parse(graphResponse.choices[0].message.content);
+                    triplets = graphData.triplets || [];
+                    console.log(`🕸️ [GraphRAG] Extraídos ${triplets.length} triplets para ${remoteId}.`);
+
+                    // 3. Inserción Automática del Grafo para este contacto
+                    for (const t of triplets) {
+                        await upsertKnowledgeNode(clientId, t.source, t.source_type, "Entidad extraída.");
+                        await upsertKnowledgeNode(clientId, t.target, t.target_type, t.context || "Entidad extraída.");
+                        await supabase.from('knowledge_edges').insert({
+                            client_id: clientId,
+                            source_node: t.source,
+                            relation_type: t.relation,
+                            target_node: t.target,
+                            context: t.context
+                        });
+                    }
+
+                } catch (e) {
+                    console.warn(`⚠️ [GraphRAG] Error o salto para ${remoteId}:`, e.message);
+                }
+
             } catch (e) {
                 console.warn(`⚠️ [Inbox] No se pudo generar el resumen para ${remoteId}:`, e.message);
             }
         }
 
-        // --- PARTE B: GRAPHRAG (TRIplets) ---
-        const rawContent = messages.map(m => `${m.sender_role}: ${m.content}`).join('\n');
-        console.log(`🔍 [GraphRAG] Extrayendo hechos lógicos...`);
+        // --- PARTE B (LEGACY GLOBAL GRAPHRAG REMOVED) ---
 
-        // 2. Extracción de Triplets Avanzada (GraphRAG + Emotional Context + Style Learning)
-        let triplets = [];
-        try {
-            const response = await groq.chat.completions.create({
-                model: 'llama-3.1-70b-versatile',
-                response_format: { type: 'json_object' },
-                messages: [
-                    {
-                        role: 'system',
-                        content: `Eres un analista de inteligencia y experto en perfiles psicológicos. 
-Tu misión es extraer el 100% del valor de una conversación para construir un "Gráfico del Alma" del usuario.
-Analiza tanto lo que recibe como lo que ENVÍA (sender_role: 'user_sent').
-
-OBJETIVOS DE EXTRACCIÓN:
-1. Hechos: (Triplets estándar Sujeto->Relación->Objeto).
-2. Perfil de Estilo: ¿Cómo habla el usuario con esta persona? (Ej. 'El usuario es bromista con X', 'El usuario es formal con Y').
-3. Jerga y Muletillas: Detecta palabras o expresiones que el usuario usa con frecuencia.
-4. Preferencias y Emociones: Lo que le gusta, le disgusta o siente.
-
-Formato JSON:
-{
-  "triplets": [
-    {
-      "source": "Sujeto",
-      "source_type": "PERSONA|ESTILO_COMUNICACION|PREFERENCIA|EMOCION",
-      "target": "Objeto",
-      "target_type": "ENTITY|STYLE|CONCEPT",
-      "relation": "GUSTA_DE|HABLA_CON_ESTILO|USA_JERGA|SIENTE_QUE",
-      "context": "Detalle profundo del hallazgo"
-    }
-  ]
-}`
-                    },
-                    { role: 'user', content: `CONVERSACIÓN:\n${rawContent}` }
-                ]
-            });
-
-            const graphData = JSON.parse(response.choices[0].message.content);
-            triplets = graphData.triplets || [];
-            console.log(`🕸️ [GraphRAG] Extraídos ${triplets.length} triplets.`);
-        } catch (e) {
-            console.warn(`⚠️ [GraphRAG] Saltando módulo RAG por error de API o LLM:`, e.message);
-        }
-
-        // 3. Inserción de Triplets
-        for (const t of triplets) {
-            await upsertKnowledgeNode(clientId, t.source, t.source_type, "Entidad extraída.");
-            await upsertKnowledgeNode(clientId, t.target, t.target_type, t.context || "Entidad extraída.");
-            await supabase.from('knowledge_edges').insert({
-                client_id: clientId,
-                source_node: t.source,
-                relation_type: t.relation,
-                target_node: t.target,
-                context: t.context
-            }).catch(() => { });
-        }
 
         // --- PARTE C: CHUNKING ADAPTATIVO + METADATA ENRIQUECIDA ---
         // Detect topic boundaries via cosine similarity between consecutive messages
@@ -445,7 +487,7 @@ async function main() {
         const { data: clients } = await supabase
             .from('raw_messages')
             .select('client_id')
-            .is('processed', false);
+            .eq('processed', false);
 
         const uniqueClients = [...new Set(clients?.map(c => c.client_id))];
         for (const clientId of uniqueClients) {
@@ -459,7 +501,7 @@ async function main() {
     async function consolidateMemories() {
         console.log('🧹 [Consolidation] Iniciando consolidación de memorias antiguas...');
         try {
-            const DAYS_THRESHOLD = 30;
+            const DAYS_THRESHOLD = 14; // ← Antes: 30 días. Ahora más agresivo.
             const cutoffDate = new Date(Date.now() - DAYS_THRESHOLD * 24 * 60 * 60 * 1000).toISOString();
 
             // Get all clients with old memories
@@ -561,13 +603,41 @@ Formato: Resumen narrativo en 2-3 párrafos. Mantén el idioma original. NO aña
         }
     }
 
-    // Run consolidation every 6 hours
-    setInterval(consolidateMemories, 6 * 60 * 60 * 1000);
+    // ═══════════════════════════════════════════════════════════
+    // 5. RAW MESSAGES CLEANUP — Purge processed msgs older than 7 days
+    // ═══════════════════════════════════════════════════════════
+    async function cleanupRawMessages() {
+        console.log('🗑️ [Cleanup] Purgando raw_messages procesados (+7 días)...');
+        try {
+            const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+            const { count, error } = await supabase
+                .from('raw_messages')
+                .delete({ count: 'exact' })
+                .eq('processed', true)
+                .lt('created_at', cutoff);
+
+            if (error) {
+                console.error('[Cleanup] Error:', error.message);
+            } else {
+                console.log(`✅ [Cleanup] ${count || 0} mensajes antiguos eliminados.`);
+            }
+        } catch (e) {
+            console.error('[Cleanup] Error general:', e.message);
+        }
+    }
+
+    // Run consolidation every 3 hours (antes: 6h)
+    setInterval(consolidateMemories, 3 * 60 * 60 * 1000);
+    // Run raw_messages cleanup every 6 hours
+    setInterval(cleanupRawMessages, 6 * 60 * 60 * 1000);
     // Run once at startup after 2 minutes
     setTimeout(consolidateMemories, 2 * 60 * 1000);
+    setTimeout(cleanupRawMessages, 3 * 60 * 1000);
 }
 
 main().catch(err => {
     console.error('💀 [Worker] Error fatal:', err.message);
     process.exit(1);
 });
+
+export { distillAndVectorize };

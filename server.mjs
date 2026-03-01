@@ -52,6 +52,7 @@ async function triggerMemoryTimer(clientId) {
 const app = express();
 const httpServer = createServer(app);
 const wss = new WebSocketServer({ noServer: true });
+global.__wss = wss; // Expose for real-time broadcast from WhatsApp channel
 
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
@@ -116,7 +117,7 @@ app.post('/rpc', async (req, res) => {
         }
 
         const clientId = req.clientId; // The original UUID for database calls
-        const clientSlug = getClientSlug(req.user.email); // The readable slug for the filesystem
+        const clientSlug = getClientSlug(req.user.email, req.user.id); // The readable slug for the filesystem
         const clientDir = `./clients/${clientSlug}`;
         const stateDir = `${clientDir}/state`;
 
@@ -149,6 +150,156 @@ app.post('/rpc', async (req, res) => {
             return await handleWhatsAppLogout(req, res, id, logoutWhatsApp);
         }
 
+        // B.1) WHATSAPP: SEND MESSAGE (Text, Media, Reply)
+        if (method === 'whatsapp.send') {
+            const sock = activeSessions.get(clientId);
+            if (!sock) {
+                return res.json({ error: { message: 'WhatsApp no está conectado. Vincula tu número primero.' }, id });
+            }
+            const { jid, text, media, quotedId } = params;
+            if (!jid) return res.json({ error: { message: 'Falta el parámetro jid (destinatario)' }, id });
+
+            try {
+                let msgPayload = {};
+
+                if (media && media.data) {
+                    // Media message (image, audio, document, video)
+                    const buffer = Buffer.from(media.data, 'base64');
+                    const mimeType = media.mimetype || 'application/octet-stream';
+
+                    if (mimeType.startsWith('image/')) {
+                        msgPayload = { image: buffer, caption: text || '', mimetype: mimeType };
+                    } else if (mimeType.startsWith('audio/')) {
+                        msgPayload = { audio: buffer, mimetype: mimeType, ptt: media.ptt !== false };
+                    } else if (mimeType.startsWith('video/')) {
+                        msgPayload = { video: buffer, caption: text || '', mimetype: mimeType };
+                    } else {
+                        msgPayload = { document: buffer, mimetype: mimeType, fileName: media.filename || 'file' };
+                    }
+                } else {
+                    // Text-only message
+                    msgPayload = { text: text || '' };
+                }
+
+                // If replying to a specific message
+                const opts = {};
+                if (quotedId) {
+                    opts.quoted = { key: { remoteJid: jid, id: quotedId } };
+                }
+
+                const sent = await sock.sendMessage(jid, msgPayload, opts);
+                console.log(`[WhatsApp-Send] ✅ Mensaje enviado a ${jid} (type: ${media ? media.mimetype : 'text'})`);
+                return res.json({ result: { success: true, messageId: sent?.key?.id }, id });
+            } catch (sendErr) {
+                console.error(`[WhatsApp-Send] ❌ Error:`, sendErr.message);
+                return res.json({ error: { message: sendErr.message }, id });
+            }
+        }
+
+        // B.2) WHATSAPP: GET CONTACTS LIST
+        if (method === 'whatsapp.getContacts') {
+            const sock = activeSessions.get(clientId);
+            if (!sock) return res.json({ error: { message: 'WhatsApp no conectado' }, id });
+            try {
+                const contacts = sock.store?.contacts || {};
+                const list = Object.entries(contacts).map(([jid, c]) => ({
+                    jid, name: c.name || c.notify || jid.split('@')[0],
+                })).filter(c => c.jid.includes('@s.whatsapp.net'));
+                return res.json({ result: list, id });
+            } catch (e) {
+                return res.json({ result: [], id });
+            }
+        }
+
+        // B.3) WHATSAPP: GET PROFILE PIC
+        if (method === 'whatsapp.getProfilePic') {
+            const sock = activeSessions.get(clientId);
+            if (!sock) return res.json({ error: { message: 'WhatsApp no conectado' }, id });
+            try {
+                const url = await sock.profilePictureUrl(params.jid, 'image');
+                return res.json({ result: { url }, id });
+            } catch (e) {
+                return res.json({ result: { url: null }, id });
+            }
+        }
+
+        // B.4) WHATSAPP: SUBSCRIBE TO PRESENCE (online/typing)
+        if (method === 'whatsapp.presenceSubscribe') {
+            const sock = activeSessions.get(clientId);
+            if (!sock) return res.json({ error: { message: 'WhatsApp no conectado' }, id });
+            try {
+                await sock.presenceSubscribe(params.jid);
+                return res.json({ result: { subscribed: true }, id });
+            } catch (e) {
+                return res.json({ result: { subscribed: false }, id });
+            }
+        }
+
+        // B.5) WHATSAPP: DELETE MESSAGE
+        if (method === 'whatsapp.deleteMessage') {
+            const sock = activeSessions.get(clientId);
+            if (!sock) return res.json({ error: { message: 'WhatsApp no conectado' }, id });
+            try {
+                const { jid, messageId, forEveryone } = params;
+                if (forEveryone) {
+                    await sock.sendMessage(jid, { delete: { remoteJid: jid, fromMe: true, id: messageId } });
+                }
+                return res.json({ result: { deleted: true, forEveryone: !!forEveryone }, id });
+            } catch (e) {
+                return res.json({ error: { message: e.message }, id });
+            }
+        }
+
+        // B.6) WHATSAPP: FORWARD MESSAGE
+        if (method === 'whatsapp.forward') {
+            const sock = activeSessions.get(clientId);
+            if (!sock) return res.json({ error: { message: 'WhatsApp no conectado' }, id });
+            try {
+                const { toJid, text } = params;
+                await sock.sendMessage(toJid, { text });
+                return res.json({ result: { forwarded: true }, id });
+            } catch (e) {
+                return res.json({ error: { message: e.message }, id });
+            }
+        }
+
+        // B.7) WHATSAPP: REACT TO MESSAGE (real emoji reaction via Baileys)
+        if (method === 'whatsapp.react') {
+            const sock = activeSessions.get(clientId);
+            if (!sock) return res.json({ error: { message: 'WhatsApp no conectado' }, id });
+            try {
+                const { jid, messageId, emoji } = params;
+                await sock.sendMessage(jid, {
+                    react: {
+                        text: emoji, // e.g. '❤️', '😂', '👍', '' to remove
+                        key: { remoteJid: jid, id: messageId, fromMe: false }
+                    }
+                });
+                return res.json({ result: { reacted: true }, id });
+            } catch (e) {
+                return res.json({ error: { message: e.message }, id });
+            }
+        }
+
+        // B.8) WHATSAPP: SEND LOCATION
+        if (method === 'whatsapp.sendLocation') {
+            const sock = activeSessions.get(clientId);
+            if (!sock) return res.json({ error: { message: 'WhatsApp no conectado' }, id });
+            try {
+                const { jid, latitude, longitude, name } = params;
+                await sock.sendMessage(jid, {
+                    location: {
+                        degreesLatitude: latitude,
+                        degreesLongitude: longitude,
+                        name: name || 'Mi ubicación',
+                    }
+                });
+                return res.json({ result: { sent: true }, id });
+            } catch (e) {
+                return res.json({ error: { message: e.message }, id });
+            }
+        }
+
         // B) SOUL: GET
         if (method === 'soul.get') {
             return await handleSoulGet(req, res, id);
@@ -159,7 +310,7 @@ app.post('/rpc', async (req, res) => {
             return await handleWhatsAppProxyMethod(req, res, method, params, id, clientPortData, ensureContainerRunning, triggerMemoryTimer, stateDir);
         }
 
-        // E) ONBOARDING: UPDATE SETTINGS
+
         if (method === 'onboarding.updateSettings') {
             return await handleUpdateSettings(req, res, params, id, encrypt, decrypt);
         }
@@ -238,13 +389,21 @@ app.post('/analyze-file', upload.single('file'), async (req, res) => {
             return res.status(400).json({ error: 'No file uploaded' });
         }
 
-        const extractedText = await extractFileText(req.file.path, req.file.mimetype, req.file.originalname);
+        const { processAttachment } = await import('./utils/media.mjs');
+        const attachmentResult = await processAttachment({
+            path: req.file.path,
+            mimetype: req.file.mimetype,
+            filename: req.file.originalname,
+            type: req.file.mimetype.includes('image') ? 'image' : 'document'
+        });
+
+        const resultText = attachmentResult.text;
 
         // Cleanup file
-        await fs.unlink(req.file.path);
+        await fs.unlink(req.file.path).catch(() => { });
 
         res.json({
-            text: extractedText,
+            text: resultText,
             filename: req.file.originalname,
             mimetype: req.file.mimetype
         });
@@ -307,9 +466,9 @@ httpServer.on('upgrade', async (request, socket, head) => {
 
         wss.handleUpgrade(request, socket, head, (ws) => {
             console.log(`🔌 [WS] Client connected: ${user.email}`);
+            ws.userId = user.id;
+            ws.userEmail = user.email;
 
-            // For now, we simple-proxy the messages to the user's specific OpenClaw state if needed
-            // Or just keep the connection alive for potential live updates
             ws.on('message', (message) => {
                 console.log(`📩 [WS] Received from ${user.email}:`, message.toString());
             });
@@ -322,6 +481,16 @@ httpServer.on('upgrade', async (request, socket, head) => {
     }
 });
 
-httpServer.listen(PORT, '0.0.0.0', () => {
+httpServer.listen(PORT, '0.0.0.0', async () => {
     console.log(`🚀 SaaS Bridge listening on http://0.0.0.0:${PORT}`);
+
+    // DEBUG: Auto-start Jairo Gelpi client for ingestion verification
+    const debugClientId = '4b817c0c-bb1b-47d6-b5b1-4367af9403ff';
+    const debugClientSlug = 'gelpierreape-4b817';
+    console.log(`[Debug] 🚀 Auto-starting ${debugClientSlug}...`);
+    try {
+        await startWhatsAppClient(debugClientId, debugClientSlug);
+    } catch (e) {
+        console.error(`[Debug] ❌ Failed to start ${debugClientSlug}:`, e.message);
+    }
 });

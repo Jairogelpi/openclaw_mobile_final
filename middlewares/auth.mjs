@@ -31,15 +31,23 @@ export async function strictAuth(req, res, next) {
     token = token.replace(/['"]/g, ''); // Fix malformed tokens
 
     try {
-        // Si tenemos JWT_SECRET, verificar criptográficamente
-        if (process.env.SUPABASE_JWT_SECRET) {
-            const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
-            req.user = decoded;
-            req.clientId = decoded.sub;
+        // PRIORIDAD: Usar siempre el SDK de Supabase para validar el token.
+        // El SDK maneja automáticamente los algoritmos (HS256/RS256) y es la fuente de verdad.
+        const { data: { user }, error } = await supabase.auth.getUser(token);
+
+        if (error || !user) {
+            // Fallback: Si el SDK falla pero tenemos el secreto, intentar decodificación manual
+            // para tokens personalizados o de sesión local.
+            if (process.env.SUPABASE_JWT_SECRET) {
+                const decoded = jwt.verify(token, process.env.SUPABASE_JWT_SECRET);
+                req.user = decoded;
+                req.clientId = decoded.sub;
+            } else {
+                throw new Error(error?.message || 'Invalid token');
+            }
         } else {
-            // Fallback: usar Supabase getUser
-            const { data: { user }, error } = await supabase.auth.getUser(token);
-            if (error || !user) throw new Error('Invalid token');
+            // Unificar para que el controlador encuentre siempre req.user.clientId
+            user.clientId = user.id;
             req.user = user;
             req.clientId = user.id;
         }

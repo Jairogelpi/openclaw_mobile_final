@@ -23,9 +23,17 @@ export async function authRegister(params, id) {
 
     if (loginError) throw loginError;
 
+    // --- Generate Onboarding Session ID ---
+    const onboardingSessionId = crypto.randomUUID();
+    if (redisClient) {
+        await redisClient.set(`onboarding_session:${sessionData.user.id}`, onboardingSessionId, { EX: 86400 }); // 24h
+    }
+
     return {
         token: sessionData.session?.access_token,
         user: sessionData.user,
+        is_onboarded: false, // New users are never onboarded yet
+        onboarding_session_id: onboardingSessionId,
         message: "Account created and auto-confirmed."
     };
 }
@@ -37,30 +45,6 @@ export async function authLogin(params, id) {
         const { data, error } = await supabase.auth.signInWithPassword({ email, password });
 
         if (error) {
-            // Self-healing: If email not confirmed, confirm it via Admin SDK (DEV only behavior)
-            if (error.message.includes('Email not confirmed')) {
-                console.log(`[Auth] Auto-confirming user: ${email}`);
-                const { data: userList } = await supabase.auth.admin.listUsers();
-                const user = userList.users.find(u => u.email === email);
-                if (user) {
-                    await supabase.auth.admin.updateUserById(user.id, { email_confirm: true });
-                    // Retry login
-                    const retry = await supabase.auth.signInWithPassword({ email, password });
-                    if (retry.error) throw retry.error;
-
-                    // --- Generate Onboarding Session ID (Retry Branch) ---
-                    const onboardingSessionId = crypto.randomUUID();
-                    if (redisClient) {
-                        await redisClient.set(`onboarding_session:${retry.data.user.id}`, onboardingSessionId, { EX: 86400 });
-                    }
-
-                    return {
-                        token: retry.data.session?.access_token,
-                        user: retry.data.user,
-                        onboarding_session_id: onboardingSessionId
-                    };
-                }
-            }
             throw error;
         }
 
@@ -70,9 +54,19 @@ export async function authLogin(params, id) {
             await redisClient.set(`onboarding_session:${data.user.id}`, onboardingSessionId, { EX: 86400 }); // 24h
         }
 
+        // Check if onboarding was fully completed (user_souls is the ultimate proof)
+        const { data: soulRecord } = await supabase
+            .from('user_souls')
+            .select('client_id')
+            .eq('client_id', data.user.id)
+            .maybeSingle();
+
+        const isOnboarded = !!soulRecord;
+
         return {
             token: data.session?.access_token,
             user: data.user,
+            is_onboarded: isOnboarded,
             onboarding_session_id: onboardingSessionId
         };
     } catch (err) {

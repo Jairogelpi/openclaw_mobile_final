@@ -11,17 +11,44 @@ import { encrypt } from '../security.mjs';
 // --- Soul Completeness Validator ---
 function soulIsComplete(soul) {
     const missing = [];
-    if (!soul.edad || soul.edad === '[Edad]' || soul.edad.includes('Edad')) missing.push('edad');
-    if (!soul.perfil?.ocupacion?.tipo || soul.perfil.ocupacion.tipo === '[profesión]') missing.push('ocupacion');
-    if (!soul.perfil?.ocupacion?.especialidad || soul.perfil.ocupacion.especialidad === '[tecnologías/áreas]') missing.push('especialidad');
-    // hobbies can be in hobbies_usuario (string) OR sustancia.intereses (array)
-    const hasHobbies = (soul.perfil?.hobbies_usuario && soul.perfil.hobbies_usuario !== '[detalle]') || (soul.perfil?.sustancia?.intereses?.length && soul.perfil.sustancia.intereses[0] !== 'int 1');
-    if (!hasHobbies) missing.push('hobbies_y_pasiones');
-    if (!soul.perfil?.disponibilidad?.horario_pico || soul.perfil.disponibilidad.horario_pico === '[mañana/tarde/noche]') missing.push('horario_de_trabajo_o_rutina');
-    if (!soul.perfil?.sustancia?.filosofia_vida || soul.perfil.sustancia.filosofia_vida === '[regla de vida]') missing.push('filosofia_de_vida');
-    if (!soul.perfil?.estilo_escritura?.estilo_que_odia || soul.perfil.estilo_escritura.estilo_que_odia === '[le irrita]') missing.push('estilo_de_comunicacion_que_odia');
+
+    const isPending = (val) => {
+        if (!val) return true;
+        const str = String(val);
+        return str.includes('[') || str.includes('Pendiente') || str.includes('detalle') || str.includes('resumen');
+    };
+
+    // A. Identidad Básica
+    if (isPending(soul.edad)) missing.push('edad');
+
+    // B. Ocupación y Por Qué (Mandatorio Detallado)
+    if (isPending(soul.perfil?.ocupacion?.situacion)) missing.push('situacion_estudio_o_trabajo');
+    if (isPending(soul.perfil?.ocupacion?.tipo)) missing.push('profesion_concreta');
+    if (isPending(soul.perfil?.ocupacion?.detalle)) missing.push('detalle_de_que_estudia_o_en_que_trabaja');
+    if (isPending(soul.perfil?.ocupacion?.especialidad)) missing.push('especialidad_tecnica');
+
+    // C. Hobbies y Propósito
+    if (isPending(soul.perfil?.hobbies_usuario)) missing.push('hobbies_y_pasiones');
+    if (isPending(soul.perfil?.proposito) || soul.perfil.proposito?.length < 10) missing.push('proposito_de_vida_o_meta');
+
+    // D. Sustancia y Valores
+    if (isPending(soul.perfil?.sustancia?.filosofia_vida) || soul.perfil.sustancia.filosofia_vida?.length < 15) missing.push('filosofia_de_vida');
+
+    // E. Estilo de Comunicación y Zonas Rojas
+    if (isPending(soul.perfil?.estilo_escritura?.estilo_que_odia)) missing.push('estilo_de_comunicacion_que_odia');
+    if (isPending(soul.perfil?.estilo_escritura?.vocabulario)) missing.push('tipo_de_vocabulario');
+    if (isPending(soul.perfil?.estilo_escritura?.uso_emojis)) missing.push('preferencia_de_emojis');
+
+    // F. Herramientas y Rutina
+    if (!soul.perfil?.herramientas || soul.perfil.herramientas.length === 0 || isPending(soul.perfil.herramientas[0])) missing.push('herramientas_clave');
+    if (isPending(soul.perfil?.disponibilidad?.horario_pico)) missing.push('horario_de_productividad');
+    if (isPending(soul.perfil?.rutina) || soul.perfil.rutina?.length < 20) missing.push('rutina_diaria_detallada');
+
+    // G. Resumen Narrativo (El nucleo del alma)
+    if (isPending(soul.resumen_narrativo) || soul.resumen_narrativo?.length < 100) missing.push('resumen_narrativo_denso');
+
     if (missing.length > 0) {
-        console.warn(`[Génesis] ⚠️ Soul incompleto. Faltan: ${missing.join(', ')}. Continuando entrevista...`);
+        console.warn(`[Génesis] ⚠️ Soul incompleto (${missing.length} vacíos): ${missing.join(', ')}`);
         return { complete: false, missing };
     }
     return { complete: true, missing: [] };
@@ -73,7 +100,7 @@ NO SEAS UN ASISTENTE GENÉRICO DE IA. Eres un actor interpretando este papel. Em
 DATO DE CONTEXTO: ${contextStr}
 
 REGLAS ESTRICTAS DE CONVERSACIÓN (¡CRÍTICO!):
-1. RITMO FLUIDO Y CONVERSACIONAL: Puedes agrupar inteligentemente hasta 2 temas relacionados por mensaje si la charla fluye (ej. Trabajo + Horarios productivos, o Hobbies + Filosofía de vida). Haz que suene casual, ¡no como un formulario!
+1. UNA SOLA PREGUNTA A LA VEZ (¡CRÍTICO!): JAMÁS hagas más de una pregunta en el mismo mensaje. No satures al usuario. Por ejemplo, NO preguntes por la edad y la ocupación al mismo tiempo. Haz una pregunta, espera la respuesta, y luego evalúa qué preguntar después.
 2. CONTEXTO TOTAL: Lee todo el historial. No preguntes lo que el usuario ya mencionó. Entrelaza de forma orgánica lo último que dijo.
 3. PROFUNDIDAD CONTROLADA: Cuando hablen de **Hobbies** o **Filosofía**, pregunta *por qué* les gusta. PERO avanza rápido, máximo profundiza 1 o 2 veces por tema.
 4. SÉ CONCISO Y POCO VERBOSO: Respuestas breves, directas, impactantes (máximo 2-3 líneas).
@@ -82,18 +109,26 @@ REGLAS ESTRICTAS DE CONVERSACIÓN (¡CRÍTICO!):
 7. ATENCIÓN INVISIBLE: Ve evaluando mentalmente la información, NO se la repitas al usuario ni generes JSON mientras hablas.
 8. PROHIBIDO INVENTAR DATOS: PREGUNTA ANTES DE ASUMIR su horario pico, el estilo que odia o su filosofía.
 
-PUNTOS A DESCUBRIR ORGÁNICAMENTE:
-A. Edad y Situación actual
-B. Trabajo/Estudios y su "Por qué"
-C. Hobbies y Pasiones (¿Por qué?)
-D. Filosofía de vida / Valores
-E. Temas a evitar / Zonas rojas
-F. Horario pico de productividad
-G. Estilo de comunicación que más odian recibir
+REGLAS DE FORMATO Y LEGIBILIDAD (¡CRÍTICO!):
+- JAMÁS escribas un "muro de texto".
+- Usa saltos de línea (párrafos nuevos) para separar ideas o separar la conversación de la pregunta final.
+- Respeta la gramática: SIEMPRE empieza con mayúscula después de un punto, un signo de exclamación (!) o de interrogación (?).
+- Si haces una pregunta y luego añades otra frase, la segunda frase DEBE empezar con mayúscula. Ejemplo incorrecto: "¿Cómo estás? me alegra verte". Ejemplo correcto: "¿Cómo estás? Me alegra verte".
 
-⚠️ REGLA DE ORO DE CIERRE ⚠️: ¡¡¡BAJO NINGÚN CONCEPTO!!! intentes cerrar la charla si te falta recoger o confirmar AL MENOS UNO de los 7 puntos (A-G). Quédate conversando hasta tenerlos todos. SIEMPRE PREGUNTA EL HORARIO Y EL ESTILO QUE ODIA.
+92: PUNTOS A DESCUBRIR ORGÁNICAMENTE:
+93: A. Edad y Situación actual.
+94: B. ¿Estudia o Trabaja? → OBLIGATORIO PREGUNTAR QUÉ ESTUDIA (carrera/grado/curso) o EN QUÉ TRABAJA (puesto/empresa/sector). NO AVANCES sin tener este dato concreto.
+95: C. Hobbies y Pasiones (¿Por qué les apasiona?).
+96: D. Propósito o Meta principal en la vida (¿Qué les mueve?).
+97: E. Filosofía de vida / Valores fundamentales.
+98: F. Temas a evitar / Zonas rojas (Lo que les molesta o irrita).
+99: G. Horario pico de productividad y Rutina diaria.
+100: H. Herramientas clave que usan a diario (software, hardware, apps).
+101: I. Estilo de comunicación (Uso de emojis, nivel de vocabulario, expresiones típicas).
 
-CIERRE (¡CRÍTICO! Cuando tengas TODOS los 7 puntos recabados al 100%):
+⚠️ REGLA DE ORO DE CIERRE ⚠️: ¡¡¡BAJO NINGÚN CONCEPTO!!! intentes cerrar la charla si te falta recoger ALGUNO de los puntos (A-I). Tu misión es que el archivo de identidad sea PERFECTO. SIEMPRE PREGUNTA EL HORARIO, LAS HERRAMIENTAS, LA RUTINA Y EL ESTILO DE ESCRITURA.
+
+CIERRE (¡CRÍTICO! Cuando tengas TODOS los puntos recabados al 100%):
 Tu último mensaje será tu gran despedida. Agradece su tiempo e incluye EXACTAMENTE esto al final de tu mensaje:
 <button>Crear mi identidad</button>
 [READY_TO_EXTRACT]
@@ -104,42 +139,27 @@ ESTÁ ESTRICTAMENTE PROHIBIDO GENERAR CÓDIGO JSON O RESÚMENES LARGOS. Solo des
     // 0. Handle Multimedia Silently (attachments)
     if (params.attachments && Array.isArray(params.attachments)) {
         console.log(`[Génesis] 📎 Recibidos ${params.attachments.length} archivos adjuntos`);
+        const { processAttachment } = await import('../utils/media.mjs');
+
         for (const attachment of params.attachments) {
             try {
-                let additionalContext = "";
-                if (attachment.type === 'audio' && attachment.data) {
-                    const tempId = crypto.randomUUID();
-                    const tempFile = `uploads/temp_audio_${tempId}`;
-                    await fs.writeFile(tempFile, Buffer.from(attachment.data, 'base64'));
-                    let text = await transcribeAudio(tempFile);
-
-                    // Hallucination check for Whisper (often hallucinates on silence)
-                    const cleanText = text.replace(/[.,!?;¿¡]/g, '').trim().toLowerCase();
-                    const hallucinations = [
-                        'gracias', 'thank you', 'gracias por ver', 'amén', 'amen',
-                        'subtítulos por la comunidad de amaraorg', 'subtítulos realizados por la comunidad de amaraorg',
-                        'suscríbete', 'suscribete al canal'
-                    ];
-
-                    if (cleanText.length < 2 || hallucinations.includes(cleanText)) {
-                        console.warn(`[Génesis] ⚠️ Ignorando posible alucinación de audio/silencio: "${text}"`);
-                    } else {
-                        additionalContext = `[Audio Transcrito Silenciosamente: "${text}"]`;
-                    }
-                } else if (attachment.type === 'image' && attachment.data) {
-                    console.log(`[Génesis] 🖼️ Procesando imagen adjunta...`);
-                    const tempId = crypto.randomUUID();
-                    const tempFile = `uploads/temp_img_${tempId}`;
-                    await fs.writeFile(tempFile, Buffer.from(attachment.data, 'base64'));
-                    const description = await analyzeImage(tempFile);
-                    await fs.unlink(tempFile);
-                    additionalContext = `[Imagen Analizada Silenciosamente: "${description}"]`;
-                } else if (attachment.text) {
-                    additionalContext = `[Contexto Adicional: "${attachment.text}"]`;
+                const attachmentResult = await processAttachment(attachment);
+                if (attachmentResult.text) {
+                    history.push({ role: 'system', content: `[USUARIO ENVIÓ ARCHIVO]: ${attachmentResult.text}` });
                 }
 
-                if (additionalContext) {
-                    history.push({ role: 'system', content: additionalContext });
+                // RAG V5: Guardar chunks en memoria permanente para el alma del usuario
+                if (attachmentResult.chunks && attachmentResult.chunks.length > 0) {
+                    const supabase = (await import('../config/supabase.mjs')).default;
+                    for (const chunk of attachmentResult.chunks) {
+                        await supabase.from('raw_messages').insert([{
+                            client_id: clientId,
+                            sender_role: 'user_onboarding',
+                            content: chunk.contextualized,
+                            remote_id: clientId.toString(),
+                            metadata: { ...attachment, is_chunk: true, chunk_index: chunk.index, source: 'onboarding' }
+                        }]);
+                    }
                 }
             } catch (err) {
                 console.error("[Génesis] ❌ Error processing attachment:", err.message);
@@ -182,27 +202,34 @@ ESTÁ ESTRICTAMENTE PROHIBIDO GENERAR CÓDIGO JSON O RESÚMENES LARGOS. Solo des
     if (fullReply.includes('[READY_TO_EXTRACT]') || fullReply.includes('CREATE_IDENTITY')) {
         console.log(`[Génesis] 🧠 Iniciando extracción paralela de JSON (Decoupled)...`);
 
-        const EXTRACTION_PROMPT = `Eres un extractor de datos JSON analítico. Analiza el siguiente historial de conversación de Onboarding y extrae la identidad del usuario en el formato JSON estricto indicado. No inventes datos; si algo no se ha mencionado orgánicamente, usa valores por defecto o infiérelos sutilmente.
+        try {
+            const EXTRACTION_PROMPT = `Eres un extractor de datos JSON analítico y perspicaz. Analiza el historial de Onboarding y extrae la identidad del usuario.
+
+REGLAS DE ORO DE EXTRACCIÓN:
+1. NO INVENTES DATOS: Si algo no está explícito, usa "[Pendiente]".
+2. INFERENCIA DE ESTILO: Analiza el historial para determinar el vocabulario (técnico, coloquial), uso de emojis (frecuente, nulo) y quirks (tics lingüísticos). NO dejes esto en pendiente si hay mensajes del usuario.
+3. RESUMEN NARRATIVO: Debe ser un bloque DENSO de 3-4 párrafos en segunda persona. Debe sonar como la biografía de una persona real, no una lista de puntos. Úsalo como el manual de instrucciones para que la futura IA sepa exactamente quién es este usuario.
 
 Formato requerido estricto:
 {
-    "nombre": "\${userName || 'Usuario'}",
-    "edad": "string",
-    "tono": "\${preferredTone || 'Cercano y empático'}",
+    "nombre": "${userName || 'Usuario'}",
+    "edad": "[Pendiente]",
+    "tono": "${preferredTone || 'Cercano y empático'}",
     "perfil": {
-        "ocupacion": { "situacion": "estudia/trabaja/etc", "tipo": "profesión", "detalle": "resumen", "especialidad": "área", "contexto": "remoto/oficina/etc" },
-        "hobbies_usuario": "string",
-        "proposito": "string",
-        "sustancia": { "intereses": ["string"], "filosofia_vida": "string", "dolores_actuales": "string", "fuentes_alegria": "string", "temas_prohibidos": ["string"] },
-        "estilo_escritura": { "longitud_media": "breve/extensa", "formalidad": 5, "uso_emojis": "sí/no", "quirks": ["expresiones"], "vocabulario": "técnico/coloquial", "estilo_que_odia": "string" },
-        "herramientas": ["string"],
-        "disponibilidad": { "horario_pico": "mañana/tarde/noche", "modo_trabajo": "solo/equipo" },
-        "directrices": ["string"]
+        "ocupacion": { "situacion": "[Pendiente]", "tipo": "[Pendiente]", "detalle": "[Pendiente]", "especialidad": "[Pendiente]", "contexto": "[Pendiente]" },
+        "hobbies_usuario": "[Pendiente]",
+        "proposito": "[Pendiente]",
+        "expertise": ["[Pendiente]"],
+        "sustancia": { "intereses": ["[Pendiente]"], "filosofia_vida": "[Pendiente]", "dolores_actuales": "[Pendiente]", "fuentes_alegria": "[Pendiente]", "temas_prohibidos": ["[Pendiente]"] },
+        "estilo_escritura": { "longitud_media": "[Pendiente]", "formalidad": 5, "uso_emojis": "[Pendiente]", "quirks": ["[Pendiente]"], "vocabulario": "[Pendiente]", "estilo_que_odia": "[Pendiente]" },
+        "herramientas": ["[Pendiente]"],
+        "disponibilidad": { "horario_pico": "[Pendiente]", "modo_trabajo": "[Pendiente]" },
+        "directrices": ["[Pendiente]"],
+        "rutina": "[Pendiente]"
     },
-    "resumen_narrativo": "Resumen denso de 3 párrafos en segunda persona para la IA receptora del Soul."
+    "resumen_narrativo": "[Pendiente]"
 }`;
 
-        try {
             const extraction = await groq.chat.completions.create({
                 model: 'llama-3.3-70b-versatile',
                 messages: [
@@ -215,6 +242,7 @@ Formato requerido estricto:
             });
 
             soulJson = JSON.parse(extraction.choices[0].message.content);
+            console.log(`[Génesis] 🧠 Soul Extraído para ${clientSlug}:`, JSON.stringify(soulJson, null, 2));
 
             // --- AUTO-VERIFICATION: Ensure soul has all 9 fields before creating ---
             const { complete, missing } = soulIsComplete(soulJson);
@@ -244,7 +272,8 @@ Ignora tu intento de despedida. Actúa con tu personalidad elegida y haz una sol
 
                 // 1.5 Auto-heal public.users to prevent FK violations
                 const { error: healErr } = await supabase.from('users').upsert({ id: clientId, email: req.user.email, password_hash: 'managed_by_auth' });
-                if (healErr) console.warn('[Bridge] Warning inserting users during baptism:', healErr.message);
+                if (healErr) console.warn('[Baptism] ⚠️ Warning auto-healing users table:', healErr.message);
+                else console.log('[Baptism] ✅ User table auto-healed.');
 
                 // 2. Guardar el negocio en la BD
                 const { error: clientErr } = await supabase
@@ -254,7 +283,8 @@ Ignora tu intento de despedida. Actúa con tu personalidad elegida y haz una sol
                         name: userName || soulJson.nombre || 'Nuevo Cliente',
                         whatsapp_number: params.phoneNumber || ''
                     }, { onConflict: 'user_id' });
-                if (clientErr) throw new Error(`[Bridge] clients upsert failed: ${clientErr.message}`);
+                if (clientErr) throw new Error(`[Baptism] clients upsert failed: ${clientErr.message}`);
+                console.log('[Baptism] ✅ Clients record upserted.');
 
                 // 3. Guardar el cerebro (Soul) en la BD
                 const { error: soulErr } = await supabase
@@ -266,7 +296,8 @@ Ignora tu intento de despedida. Actúa con tu personalidad elegida y haz una sol
                         slug: clientSlug,
                         last_updated: new Date()
                     });
-                if (soulErr) throw new Error(`[Bridge] user_souls upsert failed: ${soulErr.message}`);
+                if (soulErr) throw new Error(`[Baptism] user_souls upsert failed: ${soulErr.message}`);
+                console.log('[Baptism] ✅ User soul record upserted.');
 
                 // === CREAR ARCHIVOS FÍSICOS ===
                 console.log(`🛠️[Provisioning] Iniciando para ${clientSlug}...`);
@@ -287,8 +318,10 @@ Ignora tu intento de despedida. Actúa con tu personalidad elegida y haz una sol
                     agents: { defaults: { model: { primary: "openrouter/deepseek/deepseek-chat" } } }
                 };
                 await fs.writeFile(`${clientDir}/gateway.json5`, encrypt(JSON.stringify(gatewayConfig, null, 2)));
+                console.log('[Baptism] ✅ All physical files and gateway config written.');
 
                 completed = true;
+                console.log(`[Baptism] 🚀 Provisioning completed for ${clientSlug}!`);
             }
         } catch (e) {
             console.error(`[Genesis] ❌ Error crítico procesando la extracción para ${clientSlug}: `, e.message);

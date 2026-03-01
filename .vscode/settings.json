@@ -1,0 +1,29 @@
+{
+  // Evita que el TS server se coma la máquina
+  "typescript.disableAutomaticTypeAcquisition": true,
+  "typescript.tsserver.maxTsServerMemory": 768,
+  "typescript.tsserver.experimental.enableProjectDiagnostics": false,
+
+  // Mata el 90% del coste: watchers y búsqueda en carpetas gigantes
+  "files.watcherExclude": {
+    "**/.git/**": true,
+    "**/node_modules/**": true,
+    "**/dist/**": true,
+    "**/build/**": true,
+    "**/.next/**": true,
+    "**/.cache/**": true,
+    "**/coverage/**": true,
+    "**/.venv/**": true
+  },
+  "search.exclude": {
+    "**/node_modules": true,
+    "**/dist": true,
+    "**/build": true,
+    "**/.next": true,
+    "**/.cache": true,
+    "**/coverage": true
+  },
+
+  // Menos I/O constante
+  "git.autofetch": false
+}

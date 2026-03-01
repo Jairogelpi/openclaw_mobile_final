@@ -7,7 +7,7 @@ const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || '';
 
 export async function handleAccountDelete(req, res, id) {
     const clientId = req.clientId;
-    const clientSlug = getClientSlug(req.user.email);
+    const clientSlug = getClientSlug(req.user.email, req.user.id);
     const clientDir = `./clients/${clientSlug}`;
     const stateDir = `${clientDir}/state`;
 

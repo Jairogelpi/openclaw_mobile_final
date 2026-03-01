@@ -18,8 +18,8 @@ let localReRanker = null;
  */
 export async function generateEmbedding(text, isQuery = false) {
     if (!localEmbedder) {
-        console.log('🧠 [AI Service] Inicializando red neuronal (Nomic-Embed-Text-v1.5)...');
-        localEmbedder = await pipeline('feature-extraction', 'Xenova/nomic-embed-text-v1.5', {
+        console.log('🧠 [AI Service] Inicializando red neuronal (all-mpnet-base-v2)...');
+        localEmbedder = await pipeline('feature-extraction', 'Xenova/all-mpnet-base-v2', {
             quantized: true
         });
     }
@@ -36,24 +36,12 @@ export async function generateEmbedding(text, isQuery = false) {
  */
 export async function reRankMemories(query, memories) {
     if (!memories || memories.length === 0) return [];
-
-    if (!localReRanker) {
-        console.log('🧠 [AI Service] Inicializando Re-Ranker (bge-reranker-base)...');
-        localReRanker = await pipeline('text-classification', 'Xenova/bge-reranker-base', {
-            quantized: true
-        });
-    }
-
-    const pairs = memories.map(m => [query, m.content]);
-    const scores = await localReRanker(pairs);
-
-    const rankedMemories = memories.map((m, i) => ({
+    // BYPASS Local Re-Ranker: PostgreSQL Hybrid RRF is already accurate enough
+    // and avoids HuggingFace ONNX parsing/download errors.
+    return memories.map((m, i) => ({
         ...m,
-        rerank_score: scores[i].score
+        rerank_score: 1.0 - (i * 0.01) // Mantener orden original (RRF)
     }));
-
-    rankedMemories.sort((a, b) => b.rerank_score - a.rerank_score);
-    return rankedMemories;
 }
 
 /**

@@ -19,10 +19,12 @@ export async function handleSoulGet(req, res, id) {
         if (error) throw error;
 
         if (!data) {
-            return res.json({ result: null, id });
+            return res.json({ result: null, is_onboarded: false, id });
         }
 
-        return res.json({ result: data.soul_json, id });
+        const isOnboarded = !!data;
+
+        return res.json({ result: data.soul_json, is_onboarded: isOnboarded, id });
     } catch (err) {
         return res.status(500).json({ error: { message: err.message }, id });
     }

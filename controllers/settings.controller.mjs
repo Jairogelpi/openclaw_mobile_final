@@ -6,7 +6,7 @@ import { getClientSlug } from '../utils/helpers.mjs';
 // These must be passed from server.mjs since they use security.mjs module-level functions
 export async function handleUpdateSettings(req, res, params, id, encrypt, decrypt) {
     const clientId = req.clientId;
-    const clientSlug = getClientSlug(req.user.email);
+    const clientSlug = getClientSlug(req.user.email, req.user.id);
     const clientDir = `./clients/${clientSlug}`;
     const { soulUpdates, preferences } = params;
 

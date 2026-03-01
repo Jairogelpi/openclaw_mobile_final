@@ -134,6 +134,7 @@ export async function adminDeleteClient(req, res, activeSessions) {
     try {
         const { data: soul } = await supabase.from('user_souls').select('client_id').eq('slug', slug).single();
 
+        // 1. Desconectar sesión activa de WhatsApp
         if (soul?.client_id && activeSessions.has(soul.client_id)) {
             const sessionData = activeSessions.get(soul.client_id);
             if (sessionData && sessionData.sock && typeof sessionData.sock.logout === 'function') {
@@ -143,6 +144,7 @@ export async function adminDeleteClient(req, res, activeSessions) {
             console.log(`🛑 [Delete] Sesión activa de WhatsApp terminada para ${slug}`);
         }
 
+        // 2. Eliminar archivos locales (SOUL.md, USER.md, baileys_auth, etc.)
         const clientDir = `./clients/${slug}`;
         try {
             await fs.rm(clientDir, { recursive: true, force: true });
@@ -151,6 +153,7 @@ export async function adminDeleteClient(req, res, activeSessions) {
             console.warn(`[Delete] Nota: Carpeta de ${slug} no encontrada o ya borrada.`);
         }
 
+        // 3. PURGA NUCLEAR EN CASCADA — Eliminar TODOS los datos huérfanos
         let userIdToKill = soul?.client_id;
         if (!userIdToKill) {
             const { data: clientData } = await supabase.from('clients').select('user_id').eq('name', slug).single();
@@ -158,14 +161,45 @@ export async function adminDeleteClient(req, res, activeSessions) {
         }
 
         if (userIdToKill) {
+            console.log(`🧨 [Delete] Iniciando purga nuclear para ${slug} (${userIdToKill})...`);
+
+            // Orden importa: primero las tablas dependientes, luego las principales
+            const tablesToPurge = [
+                'knowledge_edges',    // Relaciones del grafo
+                'knowledge_nodes',    // Nodos del grafo
+                'user_memories',      // Memorias vectoriales
+                'raw_messages',       // Mensajes sin procesar
+                'inbox_summaries',    // Resúmenes del inbox
+                'contact_personas',   // Perfiles de contactos
+                'system_logs',        // Logs del sistema
+            ];
+
+            for (const table of tablesToPurge) {
+                try {
+                    const { count, error } = await supabase
+                        .from(table)
+                        .delete({ count: 'exact' })
+                        .eq('client_id', userIdToKill);
+
+                    if (error) {
+                        console.warn(`  ⚠️ [${table}] Error: ${error.message}`);
+                    } else {
+                        console.log(`  🗑️ [${table}] ${count || 0} filas eliminadas.`);
+                    }
+                } catch (e) {
+                    console.warn(`  ⚠️ [${table}] Tabla no encontrada o error: ${e.message}`);
+                }
+            }
+
+            // Finalmente, eliminar la cuenta principal
             await supabase.from('user_souls').delete().eq('client_id', userIdToKill);
             await supabase.from('clients').delete().eq('user_id', userIdToKill);
-            console.log(`🧨 [Delete] Cuentas en DB borradas para ${slug}`);
+            console.log(`✅ [Delete] Cuenta ${slug} y TODOS sus datos eliminados completamente.`);
         }
 
         await supabase.from('system_logs').insert({
             level: 'info',
-            message: `Cliente ${slug} eliminado completamente y purgado en cascada.`
+            message: `Cliente ${slug} eliminado completamente con purga nuclear en cascada.`
         });
 
         res.redirect(`/admin/health?token=${req.query.token}`);
@@ -174,6 +208,7 @@ export async function adminDeleteClient(req, res, activeSessions) {
         res.status(500).send(`Error eliminando ${slug}: ${err.message}`);
     }
 }
+
 
 export async function adminViewLogs(req, res) {
     if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).send('No autorizado');

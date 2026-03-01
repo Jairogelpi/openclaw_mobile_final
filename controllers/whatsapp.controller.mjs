@@ -5,7 +5,7 @@ const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || '';
 
 export async function handleWhatsAppPair(req, res, params, id, startWhatsAppClient, qrCodes) {
     const clientId = req.clientId;
-    const clientSlug = getClientSlug(req.user.email);
+    const clientSlug = getClientSlug(req.user.email, req.user.id);
     const phoneNumber = params?.phoneNumber;
 
     try {
@@ -40,7 +40,7 @@ export async function handleWhatsAppStatus(req, res, id, getWhatsAppStatus) {
 
 export async function handleWhatsAppLogout(req, res, id, logoutWhatsApp) {
     const clientId = req.clientId;
-    const clientSlug = getClientSlug(req.user.email);
+    const clientSlug = getClientSlug(req.user.email, req.user.id);
     try {
         const result = await logoutWhatsApp(clientId, clientSlug);
         return res.json({ result, id });
@@ -51,7 +51,7 @@ export async function handleWhatsAppLogout(req, res, id, logoutWhatsApp) {
 
 export async function handleWhatsAppProxyMethod(req, res, method, params, id, clientPortData, ensureContainerRunning, triggerMemoryTimer, stateDir) {
     const clientId = req.clientId;
-    const clientSlug = getClientSlug(req.user.email);
+    const clientSlug = getClientSlug(req.user.email, req.user.id);
     const clientPort = clientPortData?.port;
 
     try {

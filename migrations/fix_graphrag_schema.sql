@@ -13,9 +13,9 @@ ALTER TABLE public.knowledge_edges DROP CONSTRAINT IF EXISTS fk_edges_target;
 ALTER TABLE public.knowledge_edges DROP CONSTRAINT IF EXISTS fk_edges_source;
 ALTER TABLE public.knowledge_edges DROP CONSTRAINT IF EXISTS fk_edges_client;
 
--- Recrear FK limpio: solo al cliente
+-- Recrear FK limpio: solo al cliente (apuntando al Auth ID en user_souls)
 ALTER TABLE public.knowledge_edges 
-ADD CONSTRAINT fk_edges_client FOREIGN KEY (client_id) REFERENCES public.clients(id);
+ADD CONSTRAINT fk_edges_client FOREIGN KEY (client_id) REFERENCES public.user_souls(client_id) ON DELETE CASCADE;
 
 -- Añadir UNIQUE para evitar relaciones duplicadas
 ALTER TABLE public.knowledge_edges 
@@ -223,7 +223,7 @@ BEGIN
     SELECT (h2.source_node || ' —[' || h2.relation_type || ']→ ' || h2.target_node || COALESCE(' (' || h2.context || ')', ''))::text,
            h2.source_node::text, 'RELACIÓN_EXPANDIDA'::text, h2.relation_type::text, 2
     FROM hop2_edges h2
-    ORDER BY hop ASC;
+    ORDER BY 5 ASC;
 END;
 $$;
 

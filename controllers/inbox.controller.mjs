@@ -80,7 +80,7 @@ export async function generateSmartReply(req, res) {
         let localEmbedder = global.__smartReplyEmbedder;
         if (!localEmbedder) {
             console.log('🧠 [Smart Reply] Inicializando embedder...');
-            localEmbedder = await transformersPipeline('feature-extraction', 'Xenova/nomic-embed-text-v1.5', { quantized: true });
+            localEmbedder = await transformersPipeline('feature-extraction', 'Xenova/all-mpnet-base-v2', { quantized: true });
             global.__smartReplyEmbedder = localEmbedder;
         }
         const embedQuery = async (text) => {
@@ -186,54 +186,25 @@ REGLAS:
         console.log(`💬 [Context] ${conversationHistory.length} mensajes de historial`);
 
         // ══════════════════════════════════════════════
-        // 1b. PERSONA PER CONTACT: Auto-detect style
+        // 1b. PERSONA PER CONTACT: Fetch Permanent Profile
         // ══════════════════════════════════════════════
-        const personaKey = `${clientId}:${remoteId}`;
-        let contactPersona = contactPersonaCache.get(personaKey) || null;
+        let contactPersona = null;
+        try {
+            const { data: personaData } = await supabase
+                .from('contact_personas')
+                .select('persona_json')
+                .eq('client_id', clientId)
+                .eq('remote_id', remoteId)
+                .single();
 
-        if (!contactPersona && conversationHistory.length >= 3) {
-            // Extract only user-sent messages to analyze THEIR style
-            const userMsgs = conversationHistory
-                .filter(m => m.sender === 'user' || m.sender === 'me' || m.sender === 'Mí mismo')
-                .map(m => m.content)
-                .slice(0, 15);
-
-            if (userMsgs.length >= 3) {
-                try {
-                    const styleResp = await groq.chat.completions.create({
-                        model: 'llama-3.1-8b-instant',
-                        messages: [{
-                            role: 'system',
-                            content: `Analiza el estilo de escritura de esta persona en WhatsApp con este contacto específico.
-
-Devuelve SOLO un JSON con estos campos:
-{
-  "formalidad": "muy_formal | formal | neutro | informal | muy_informal",
-  "tono": "serio | profesional | amigable | bromista | cariñoso | seco",
-  "largo_mensajes": "muy_corto | corto | medio | largo",
-  "emojis": "nunca | raro | a_veces | frecuente | excesivo",
-  "saludo_tipico": "ejemplo de cómo saluda",
-  "muletillas": ["palabras o frases que repite"],
-  "resumen": "una frase describiendo el estilo general"
-}`
-                        }, {
-                            role: 'user',
-                            content: `Mensajes del usuario con este contacto:\n${userMsgs.join('\n')}`
-                        }],
-                        response_format: { type: 'json_object' },
-                        temperature: 0.1,
-                        max_tokens: 250,
-                    });
-
-                    contactPersona = JSON.parse(styleResp.choices[0].message.content);
-                    contactPersonaCache.set(personaKey, contactPersona);
-                    console.log(`🎭 [Persona] ${remoteId.slice(0, 12)}...: ${contactPersona.resumen || contactPersona.tono}`);
-                } catch (e) {
-                    console.warn('[Persona] Fallback:', e.message);
-                }
+            if (personaData && personaData.persona_json) {
+                contactPersona = personaData.persona_json;
+                console.log(`🎭 [Persona DB] Cargado perfil para ${remoteId.slice(0, 12)}... (${contactPersona.relacion_detectada || 'Desconocida'})`);
+            } else {
+                console.log(`🎭 [Persona DB] Sin perfil guardado para ${remoteId.slice(0, 12)}...`);
             }
-        } else if (contactPersona) {
-            console.log(`🎭 [Persona Cache] ${remoteId.slice(0, 12)}...: ${contactPersona.resumen || 'cached'}`);
+        } catch (e) {
+            console.warn(`⚠️ [Persona DB] Error consultando perfil:`, e.message);
         }
 
         let searchQueries = [lastMessage];
@@ -503,7 +474,7 @@ Devuelve SOLO un JSON con estos campos:
 
         console.log(`✨ [Self-Refine] Etapa 2: Refinado y streaming (70b)...`);
         const stream = await groq.chat.completions.create({
-            model: 'llama-3.1-70b-versatile',
+            model: 'llama-3.3-70b-versatile',
             messages: [{ role: 'system', content: refinementPrompt }],
             temperature: 0.5, // Lower temperature for more consistent refinement
             max_tokens: 400,

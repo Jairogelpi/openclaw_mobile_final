@@ -1,4 +1,5 @@
 import supabase from '../config/supabase.mjs';
+import { generateEmbedding } from './local_ai.mjs';
 
 /**
  * Ejecuta un recorrido del grafo de conocimiento (GraphRAG).
@@ -29,30 +30,48 @@ export async function traverseGraph(clientId, queryText, queryVector, matchCount
  * Guarda o actualiza un nodo de conocimiento.
  */
 export async function upsertKnowledgeNode(clientId, entityName, entityType, description) {
-    const { data, error } = await supabase.rpc('upsert_knowledge_node', {
-        p_client_id: clientId,
-        p_name: entityName,
-        p_type: entityType,
-        p_description: description
-    });
+    // 1. Buscar si ya existe
+    const { data: existing } = await supabase
+        .from('knowledge_nodes')
+        .select('id')
+        .eq('client_id', clientId)
+        .eq('entity_name', entityName)
+        .single();
+
+    if (existing) return existing.id;
+
+    // 2. Generar embedding si no existe
+    const embedding = await generateEmbedding(`${entityName} ${description || ''}`);
+
+    // 3. Insertar
+    const { data: inserted, error } = await supabase.from('knowledge_nodes').insert({
+        client_id: clientId,
+        entity_name: entityName,
+        entity_type: entityType,
+        description: description,
+        embedding: embedding
+    }).select('id').single();
 
     if (error) {
         console.error('[Graph Service] Error upserting node:', error.message);
         throw error;
     }
-    return data; // Retorna el ID del nodo
+    return inserted.id;
 }
 
 /**
  * Crea o actualiza una relación (edge) entre dos nodos.
  */
-export async function upsertKnowledgeEdge(clientId, sourceId, targetId, relationType) {
+/**
+ * Crea o actualiza una relación (edge) entre dos nombres de entidad.
+ */
+export async function upsertKnowledgeEdge(clientId, sourceName, targetName, relationType) {
     const { error } = await supabase.from('knowledge_edges').upsert({
         client_id: clientId,
-        source_id: sourceId,
-        target_id: targetId,
+        source_node: sourceName,
+        target_node: targetName,
         relation_type: relationType
-    }, { onConflict: 'client_id, source_id, target_id, relation_type' });
+    }, { onConflict: 'client_id, source_node, relation_type, target_node' });
 
     if (error) {
         console.error('[Graph Service] Error upserting edge:', error.message);
