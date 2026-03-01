@@ -165,6 +165,17 @@ async function distillAndVectorize(clientId) {
 
     console.log(`\n🧠 [Memory Worker] Procesando memoria e inbox para: ${clientSlug}`);
 
+    // 0. ADQUIRIR CANDADO ATÓMICO (Evita condiciones de carrera e hiperescalado de costes)
+    const { data: lockAcquired, error: lockError } = await supabase.rpc('acquire_worker_lock', {
+        p_client_id: clientId,
+        p_expiry_minutes: 10
+    });
+
+    if (lockError || !lockAcquired) {
+        console.log(`🔒 [Lock] Cliente ${clientSlug} ya está siendo procesado por otra instancia. Saltando.`);
+        return;
+    }
+
     try {
         // 1. Obtener mensajes sin procesar
         const { data: messages } = await supabase
@@ -203,7 +214,7 @@ async function distillAndVectorize(clientId) {
 
             try {
                 const summaryResponse = await groq.chat.completions.create({
-                    model: 'llama-3.3-70b-versatile',
+                    model: 'llama-3.1-8b-instant', // OPTIMIZACIÓN DE COSTES: 8B para resúmenes
                     messages: [
                         {
                             role: 'system',
@@ -242,7 +253,7 @@ Ve directo al grano con elegancia.`
                 console.log(`🎭 [Persona] Extrayendo perfil de relación para: ${remoteId}`);
                 try {
                     const personaResponse = await groq.chat.completions.create({
-                        model: 'llama-3.3-70b-versatile',
+                        model: 'llama-3.1-8b-instant', // OPTIMIZACIÓN DE COSTES: 8B para personas
                         messages: [
                             {
                                 role: 'system',
@@ -487,6 +498,9 @@ Formato JSON esperado:
         console.log(`✅ [Memory Worker] Procesamiento completo para ${clientSlug}.`);
     } catch (err) {
         console.error(`❌ Error general procesando cliente ${clientId}:`, err.message);
+    } finally {
+        // LIBERAR CANDADO
+        await supabase.rpc('release_worker_lock', { p_client_id: clientId });
     }
 }
 
