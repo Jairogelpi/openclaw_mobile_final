@@ -562,7 +562,37 @@ async function main() {
         await cleanupRawMessages();
     });
 
-    console.log('📅 [Scheduler] Tareas programadas: Fallback (30m), Consolidación (3h), Purga (6h).');
+    // 4. LIMPIEZA DE UPLOADS (Diario a las 04:00 AM)
+    cron.schedule('0 4 * * *', async () => {
+        console.log('🧹 [Cleanup] Iniciando limpieza de archivos temporales en uploads/...');
+        try {
+            const uploadsDir = './uploads';
+            const files = await fs.readdir(uploadsDir);
+            const now = Date.now();
+            const MAX_AGE = 24 * 60 * 60 * 1000; // 24 horas
+
+            for (const file of files) {
+                if (file === '.placeholder') continue;
+                const filePath = path.join(uploadsDir, file);
+                const stats = await fs.stat(filePath);
+                if (now - stats.mtimeMs > MAX_AGE) {
+                    await fs.unlink(filePath);
+                    console.log(`- Eliminado: ${file}`);
+                }
+            }
+            console.log('✅ [Cleanup] Limpieza completada.');
+        } catch (err) {
+            console.error('❌ [Cleanup] Error en limpieza:', err.message);
+        }
+    });
+
+    // 5. HEALTH CHECK (Cada 1 hora)
+    cron.schedule('0 * * * *', () => {
+        const mem = process.memoryUsage();
+        console.log(`💓 [Health] Worker vivo. Memoria: ${Math.round(mem.heapUsed / 1024 / 1024)}MB / ${Math.round(mem.rss / 1024 / 1024)}MB RSS`);
+    });
+
+    console.log('📅 [Scheduler] Tareas programadas: Fallback (30m), Consolidación (3h), Purga (6h), Limpieza (4am), Health (1h).');
 }
 
 // ══════════════════════════════════════════════════════════
