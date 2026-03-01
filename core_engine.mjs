@@ -1,8 +1,19 @@
 import 'dotenv/config';
 import fs from 'fs/promises';
 import supabase from './config/supabase.mjs';
+import logger from './utils/logger.mjs';
 import groq from './services/groq.mjs';
 import { generateEmbedding } from './services/local_ai.mjs';
+
+const parseLLMJson = (text) => {
+    try {
+        const cleaned = text.replace(/```json | ```/g, '').trim();
+        return JSON.parse(cleaned);
+    } catch (e) {
+        console.warn('⚠️ [LLM-JSON] Fallback parsing failed for:', text.slice(0, 100));
+        throw e;
+    }
+};
 import { searchWeb } from './services/tavily.mjs';
 import { decrypt } from './security.mjs';
 import {
@@ -58,7 +69,7 @@ async function getRelevantContext(clientId, userQuery, queryVector) {
             return true;
         });
 
-        console.log(`🧠 [RAG] Candidatos: ${hybridMemories.length} híbridos + ${graphKnowledge.length} grafo = ${uniqueCandidates.length} únicos`);
+        console.log(`🧠[RAG] Candidatos: ${hybridMemories.length} híbridos + ${graphKnowledge.length} grafo = ${uniqueCandidates.length} únicos`);
 
         // 4. Re-Ranking local
         const rankedKnowledge = await reRankMemories(userQuery, uniqueCandidates);
@@ -70,10 +81,10 @@ async function getRelevantContext(clientId, userQuery, queryVector) {
 
         const contextBlock = top7.map(k => {
             const prefix = k.source === 'GRAPH' ? `🕸️ GRAFO[Hop ${k.hop}]` : `📝 MEMORIA[Score: ${k.similarity?.toFixed(2) || '?'}]`;
-            return `- ${prefix}: ${k.content}`;
+            return `- ${prefix}: ${k.content} `;
         }).join('\n');
 
-        return `[CONFIANZA_CONTEXTO: ${confidenceLevel}]\n${contextBlock}`;
+        return `[CONFIANZA_CONTEXTO: ${confidenceLevel}]\n${contextBlock} `;
     } catch (e) {
         console.error("[RAG] Error en pipeline Híbrido+GraphRAG:", e.message);
         return "[CONFIANZA_CONTEXTO: NONE]\nNo se pudieron recuperar recuerdos.";
@@ -85,19 +96,19 @@ async function getRelevantContext(clientId, userQuery, queryVector) {
  */
 export async function processMessage(incomingEvent) {
     const { clientId, clientSlug, channel, senderId, text, isSentByMe } = incomingEvent;
-    console.log(`🧠 [Core Engine] Recibido de ${channel}: "${text.substring(0, 30)}..." (clientId: ${clientId})`);
+    console.log(`🧠[Core Engine] Recibido de ${channel}: "${text.substring(0, 30)}..."(clientId: ${clientId})`);
 
     try {
         if (isSentByMe) {
-            console.log(`✍️ [Core Engine] Analizando estilo de mensaje enviado.`);
+            console.log(`✍️[Core Engine] Analizando estilo de mensaje enviado.`);
             return null;
         }
 
         const senderLabel = incomingEvent.metadata?.isGroup
-            ? `[Grupo] ${incomingEvent.metadata.pushName}`
+            ? `[Grupo] ${incomingEvent.metadata.pushName} `
             : incomingEvent.metadata?.pushName || senderId;
 
-        console.log(`🧠 [Core Engine] Procesando mensaje de ${senderLabel}...`);
+        console.log(`🧠[Core Engine] Procesando mensaje de ${senderLabel}...`);
 
         // 0. EMBEDDING LOCAL
         const queryVector = await generateEmbedding(text, true);
@@ -105,12 +116,12 @@ export async function processMessage(incomingEvent) {
         // 1. CACHÉ SEMÁNTICA
         const cachedReply = checkSemanticCache(clientId, queryVector);
         if (cachedReply) {
-            console.log(`⚡ [Cache Semántica] ¡Acierto!`);
+            console.log(`⚡[Cache Semántica] ¡Acierto!`);
             return cachedReply;
         }
 
         // 2. Recuperar la Identidad
-        const clientDir = `./clients/${clientSlug}`;
+        const clientDir = `./ clients / ${clientSlug} `;
         let soul = "", userProfile = "", memory = "";
 
         try {
@@ -310,7 +321,7 @@ REGLAS DE ORO:
                     { role: 'system', content: critiquePrompt }
                 ], { temperature: 0.1, response_format: { type: 'json_object' } });
 
-                const audit = JSON.parse(auditRaw);
+                const audit = parseLLMJson(auditRaw);
 
                 if (audit.approved) {
                     console.log(`✅ [Reflection] Auditoría aprobada.`);

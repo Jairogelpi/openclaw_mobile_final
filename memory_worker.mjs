@@ -15,6 +15,16 @@ import redisClient from './config/redis.mjs';
 import { upsertKnowledgeNode, upsertKnowledgeEdge } from './services/graph.service.mjs';
 import cron from 'node-cron';
 
+const parseLLMJson = (text) => {
+    try {
+        const cleaned = text.replace(/```json|```/g, '').trim();
+        return JSON.parse(cleaned);
+    } catch (e) {
+        console.warn('⚠️ [LLM-JSON] Fallback parsing failed for:', text.slice(0, 100));
+        throw e;
+    }
+};
+
 /**
  * Resetea el temporizador de inactividad para un cliente.
  */
@@ -92,7 +102,7 @@ async function autonomousDistillation(clientId, clientSlug, messages) {
             temperature: 0.1
         });
 
-        const result = JSON.parse(response.choices[0].message.content);
+        const result = parseLLMJson(response.choices[0].message.content);
 
         // 3. Aplicar Parche al SOUL e Identidad
         if ((result.soul_patch && Object.keys(result.soul_patch).length > 0) || result.style_profile) {
@@ -243,7 +253,7 @@ Devuelve SOLO EL JSON y nada más.`
                         response_format: { type: 'json_object' }
                     });
 
-                    const personaJson = JSON.parse(personaResponse.choices[0].message.content);
+                    const personaJson = parseLLMJson(personaResponse.choices[0].message.content);
 
                     const { error: personaError } = await supabase.from('contact_personas').upsert({
                         client_id: clientId,
@@ -304,7 +314,7 @@ Formato JSON esperado:
                         ]
                     });
 
-                    const graphData = JSON.parse(graphResponse.choices[0].message.content);
+                    const graphData = parseLLMJson(graphResponse.choices[0].message.content);
                     triplets = graphData.triplets || [];
                     console.log(`🕸️ [GraphRAG] Extraídos ${triplets.length} triplets para ${remoteId}.`);
 
