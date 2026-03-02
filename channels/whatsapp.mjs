@@ -1,7 +1,8 @@
 import { makeWASocket, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import { useSupabaseAuthState } from '../utils/whatsapp_db_auth.mjs';
 import pino from 'pino';
-import { processMessage } from '../core_engine.mjs';
+import { Worker } from 'bullmq';
+import { incomingQueue, outgoingQueue, mediaQueue } from '../config/queues.mjs';
 import redisClient from '../config/redis.mjs';
 import groq from '../services/groq.mjs';
 import supabase from '../config/supabase.mjs';
@@ -20,10 +21,38 @@ async function triggerMemoryTimer(clientId) {
 }
 
 export const activeSessions = new Map();
+export const lastActivity = new Map(); // Novedad: Registro de última actividad
 console.log("🚀🚀🚀 WHATSAPP.MJS LOADED AT " + new Date().toISOString());
 export const qrCodes = new Map();
 const startingSessions = new Set();
+const reconnectAttempts = new Map(); // Track reconnect attempts for exponential backoff
 
+// Cache para evitar pedir la foto de perfil en cada mensaje (válida por 1 hora)
+const profilePicCache = new Map();
+
+// --- HIBERNACIÓN DE SESIONES (WAKE/SLEEP) ---
+const MAX_IDLE_TIME_MS = 48 * 60 * 60 * 1000; // 48 horas de inactividad
+
+setInterval(async () => {
+    const now = Date.now();
+    for (const [sessionKey, sock] of activeSessions.entries()) {
+        const lastAct = lastActivity.get(sessionKey) || 0;
+
+        // Si han pasado más de 48h desde el último mensaje y el socket sigue abierto
+        if (now - lastAct > MAX_IDLE_TIME_MS && sock) {
+            console.log(`💤 [Hibernación] ${sessionKey} inactivo por 48h. Cerrando socket para liberar RAM.`);
+            try {
+                // End the socket cleanly but don't delete auth data (NOT a logout)
+                sock.end(undefined);
+            } catch (e) {
+                console.warn(`[Hibernación] Error cerrando socket de ${sessionKey}:`, e.message);
+            }
+            activeSessions.delete(sessionKey);
+            lastActivity.delete(sessionKey);
+        }
+    }
+}, 60 * 60 * 1000); // Check every hour
+// ---------------------------------------------
 // Helper robusto para extraer contenido de mensajes anidados (ephemeral, viewOnce, etc)
 const extractMessageContent = (m) => {
     if (!m) return '';
@@ -47,10 +76,34 @@ const extractMessageContent = (m) => {
 
     return '';
 };
-const reconnectAttempts = new Map(); // Track reconnect attempts for exponential backoff
 
-// Cache para evitar pedir la foto de perfil en cada mensaje (válida por 1 hora)
-const profilePicCache = new Map();
+/**
+ * Escudo Anti-Spam (Rate Limiting)
+ * Permite un máximo de 15 mensajes por minuto por usuario.
+ */
+async function checkRateLimit(clientId, senderId) {
+    if (!redisClient) return false;
+    const limit = 15;
+    const ttl = 60; // 60 segundos
+
+    try {
+        const key = `ratelimit:${clientId}:${senderId}`;
+        const currentCount = await redisClient.incr(key);
+
+        if (currentCount === 1) {
+            await redisClient.expire(key, ttl);
+        }
+
+        if (currentCount > limit) {
+            console.warn(`🛡️ [Anti-Spam] Bloqueando a ${senderId}. Límite excedido (${currentCount}/${limit} msgs/min).`);
+            return true; // Es spam
+        }
+        return false;
+    } catch (e) {
+        console.warn('⚠️ [Rate Limiter] Error en Redis:', e.message);
+        return false; // Ante la duda, dejamos pasar para no romper el servicio
+    }
+}
 
 /**
  * Inicia una sesión WebSocket pura para WhatsApp (Consumo: ~10MB RAM)
@@ -256,26 +309,55 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
             const hasVideo = !!msgContent.videoMessage;
             const hasSticker = !!msgContent.stickerMessage;
 
+            // 🛡️ [ANTI-SPAM] Verificar Rate Limit
+            if (await checkRateLimit(clientId, senderId)) {
+                return; // Ignorar el mensaje silenciosamente (ahorra IA y DB)
+            }
+
+            // Novedad: Actualizar registro de actividad
+            lastActivity.set(sessionKey, Date.now());
+
             let text = extractMessageContent(msgContent);
             let mediaDescription = '';
 
-            // Procesar Media
+            // Procesar Media (DELEGADO AL MEDIA WORKER)
             if (hasImage || hasAudio || hasDocument) {
                 try {
                     const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
-                    const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                    const { processAttachment } = await import('../utils/media.mjs');
+                    const crypto = await import('crypto');
+                    const fs = await import('fs/promises');
 
-                    const attachmentResult = await processAttachment({
-                        type: hasImage ? 'image' : hasAudio ? 'audio' : 'document',
+                    const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                    const type = hasImage ? 'image' : hasAudio ? 'audio' : 'document';
+
+                    const ext = hasImage ? '.jpg' : hasAudio ? '.ogg' : '.ext';
+                    const tempFileName = `${clientId}_${crypto.randomBytes(4).toString('hex')}${ext}`;
+                    const tempFilePath = `./uploads/${tempFileName}`;
+
+                    await fs.writeFile(tempFilePath, buffer);
+
+                    console.log(`[Queue] 📸 Encolando media (${type}) a mediaProcessingQueue para ${clientSlug}...`);
+                    await mediaQueue.add('process_media', {
+                        clientId,
+                        clientSlug,
+                        senderId,
+                        isSentByMe,
+                        pushName,
+                        isGroup,
+                        text: text || '',
+                        type,
+                        tempFilePath,
                         mimetype: msgContent.imageMessage?.mimetype || msgContent.audioMessage?.mimetype || msgContent.documentMessage?.mimetype,
-                        filename: msgContent.documentMessage?.fileName || (hasImage ? 'image.jpg' : hasAudio ? 'audio.ogg' : 'file'),
-                        data: buffer.toString('base64')
-                    });
-                    mediaDescription = attachmentResult.text;
+                        filename: msgContent.documentMessage?.fileName || tempFileName
+                    }, { removeOnComplete: true });
+
+                    // El flujo de mensaje se detiene aquí para esta interacción.
+                    // El media_worker retomará la conversión a texto pura e impulsará a incomingQueue.
+                    return;
+
                 } catch (e) {
-                    console.warn(`[${clientSlug}] ⚠️ Media Error:`, e.message);
-                    mediaDescription = '[Error procesando adjunto]';
+                    console.warn(`[${clientSlug}] ⚠️ Media Download Error:`, e.message);
+                    mediaDescription = '[Error descargando adjunto]';
                 }
             }
 
@@ -319,7 +401,23 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
             }
 
             if (!isSentByMe) {
+                // Notificar al worker de memoria (Amnesia Consolidator)
                 await triggerMemoryTimer(clientId);
+
+                // Enviar el mensaje al Cortex (Cerebro) a través de la Cola de BullMQ
+                console.log(`[Queue] 📬 Encolando mensaje a incomingMessagesQueue para ${clientSlug}...`);
+                await incomingQueue.add('process_message', {
+                    clientId,
+                    clientSlug,
+                    channel: 'whatsapp',
+                    senderId,
+                    text: finalText,
+                    isSentByMe,
+                    metadata: { pushName, isGroup }
+                }, {
+                    removeOnComplete: true,
+                    removeOnFail: 50 // Guardar los últimos 50 fallidos para debug
+                });
             }
 
         } catch (handlerErr) {
@@ -496,3 +594,32 @@ export async function logoutWhatsApp(clientId, clientSlug) {
 
     return { success: true };
 }
+
+// ------------------------------------------------------------------
+// EL BOCA-OREJA: WORKER DE SALIDA (OUTGOING)
+// ------------------------------------------------------------------
+// Este worker vive en el proceso del "Cuerpo". Su único trabajo es
+// escuchar lo que el "Cerebro" manda y "escupirlo" por WhatsApp simulando
+// ser un humano (Typing delay).
+
+const outgoingWorker = new Worker('outgoingMessagesQueue', async (job) => {
+    const { clientId, clientSlug, senderId, text } = job.data;
+    console.log(`[Queue] 📥 Recibida respuesta generada por IA para ${clientSlug}...`);
+
+    try {
+        await sendHumanLikeMessage(clientId, senderId, text);
+        console.log(`[Queue-WhatsApp] ✅ Mensaje enviado a ${senderId} correctamente.`);
+    } catch (err) {
+        console.error(`[Queue-WhatsApp] ❌ Error enviando el mensaje: ${err.message}`);
+        throw err; // Reintenta según políticas de BullMQ
+    }
+}, {
+    connection: (await import('../config/redis.mjs')).default, // Reusa la conexión habitual
+    concurrency: 10 // Puede enviar hasta 10 mensajes en paralelo para evitar embudos
+});
+
+outgoingWorker.on('failed', (job, err) => {
+    console.error(`[BullMQ-Worker Outgoing] ⚠️ Job ID ${job.id} falló:`, err.message);
+});
+
+console.log('👷 [Workers] Worker de salida de WhatsApp inicializado (Escuchando outgoingMessagesQueue).');

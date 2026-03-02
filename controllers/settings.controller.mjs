@@ -27,70 +27,72 @@ export async function handleUpdateSettings(req, res, params, id, encrypt, decryp
             console.warn(`[Bridge] Warning: could not upsert client row for ${clientSlug}:`, clientUpsertError.message);
         }
 
-        // 1. Get existing soul (if any)
+        // 1. Get existing soul and gateway config (if any)
         const { data: soulData, error: soulError } = await supabase
             .from('user_souls')
-            .select('soul_json')
+            .select('soul_json, gateway_config')
             .eq('client_id', clientId)
             .maybeSingle();
 
         let soulJson = {};
+        let gateway = {};
         if (!soulError && soulData) {
-            soulJson = soulData.soul_json;
+            soulJson = soulData.soul_json || {};
+            gateway = soulData.gateway_config || {};
         }
 
-        // Merge updates (name, tone, etc)
+        // Si es la primera vez y el gateway está vacío, rellenamos defaults críticos
+        if (Object.keys(gateway).length === 0) {
+            try {
+                const template = await fs.readFile('./gateway.json5', 'utf8');
+                gateway = JSON5.parse(template);
+                gateway.client_id = clientId;
+                gateway.slug = clientSlug;
+                gateway.models = { providers: { openrouter: { apiKey: process.env.OPENROUTER_API_KEY } } };
+                gateway.agents = { defaults: { model: { primary: "openrouter/deepseek/deepseek-chat" } } };
+            } catch (e) {
+                console.warn(`[Bridge] Warning parsing base gateway.json5 template:`, e.message);
+            }
+        }
+
+        // Merge soul updates (name, tone, etc)
         soulJson = { ...soulJson, ...soulUpdates };
+
+        // Map UI preferences to gateway_config structure
+        if (!gateway.channels) gateway.channels = {};
+        if (!gateway.channels.whatsapp) gateway.channels.whatsapp = {};
+
+        if (preferences.autoReply !== undefined) {
+            gateway.channels.whatsapp.replyToMode = preferences.autoReply ? "auto" : "off";
+        }
+        if (preferences.readGroups !== undefined) {
+            gateway.channels.whatsapp.groupPolicy = preferences.readGroups ? "open" : "off";
+        }
+
+        if (preferences.summarizeSkill !== undefined) {
+            if (!gateway.plugins) gateway.plugins = { entries: {} };
+            if (!gateway.plugins.entries) gateway.plugins.entries = {};
+            if (!gateway.plugins.entries.summarize) {
+                gateway.plugins.entries.summarize = {
+                    enabled: true,
+                    path: "./core/skills/summarize/index.mjs"
+                };
+            }
+            gateway.plugins.entries.summarize.enabled = preferences.summarizeSkill;
+        }
 
         const { error: updateError } = await supabase
             .from('user_souls')
-            .upsert({ client_id: clientId, soul_json: soulJson, last_updated: new Date() });
+            .upsert({
+                client_id: clientId,
+                soul_json: soulJson,
+                gateway_config: gateway,
+                last_updated: new Date()
+            });
 
         if (updateError) {
-            console.error(`[Bridge] ❌ Error upserting soul for ${clientSlug}:`, updateError.message, updateError.details);
+            console.error(`[Bridge] ❌ Error upserting soul and gateway for ${clientSlug}:`, updateError.message, updateError.details);
             throw updateError;
-        }
-
-        try {
-            const gatewayPath = `${clientDir}/gateway.json5`;
-            let gateway = {};
-            try {
-                const rawContent = await fs.readFile(gatewayPath, 'utf8');
-                const content = decrypt(rawContent);
-                gateway = JSON5.parse(content);
-            } catch (e) {
-                const template = await fs.readFile('./gateway.json5', 'utf8');
-                gateway = JSON5.parse(template);
-            }
-
-            if (!gateway.channels) gateway.channels = {};
-            if (!gateway.channels.whatsapp) gateway.channels.whatsapp = {};
-
-            if (preferences.autoReply !== undefined) {
-                gateway.channels.whatsapp.replyToMode = preferences.autoReply ? "auto" : "off";
-            }
-            if (preferences.readGroups !== undefined) {
-                gateway.channels.whatsapp.groupPolicy = preferences.readGroups ? "open" : "off";
-            }
-
-            if (preferences.summarizeSkill !== undefined) {
-                if (!gateway.plugins) gateway.plugins = { entries: {} };
-                if (!gateway.plugins.entries) gateway.plugins.entries = {};
-                if (!gateway.plugins.entries.summarize) {
-                    gateway.plugins.entries.summarize = {
-                        enabled: true,
-                        path: "./core/skills/summarize/index.mjs"
-                    };
-                }
-                gateway.plugins.entries.summarize.enabled = preferences.summarizeSkill;
-            }
-
-            // Ensure directory exists
-            await fs.mkdir(clientDir, { recursive: true });
-            await fs.writeFile(gatewayPath, encrypt(JSON.stringify(gateway, null, 2)));
-
-        } catch (err) {
-            console.error(`[Bridge] Error updating gateway config for ${clientSlug}:`, err.message);
         }
 
         return res.json({ result: { success: true }, id });

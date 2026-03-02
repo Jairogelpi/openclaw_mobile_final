@@ -127,9 +127,9 @@ export async function processMessage(incomingEvent) {
         const queryVector = await generateEmbedding(safeText, true);
 
         // 1. CACHÉ SEMÁNTICA
-        const cachedReply = checkSemanticCache(clientId, queryVector);
+        const cachedReply = await checkSemanticCache(clientId, queryVector);
         if (cachedReply) {
-            console.log(`⚡[Cache Semántica] ¡Acierto!`);
+            console.log(`⚡[Cache Semántica] ¡Acierto en Redis!`);
             return cachedReply;
         }
 
@@ -383,7 +383,7 @@ REGLAS DE ORO:
             aiReply = "Lo siento, no pude generar una respuesta coherente en este momento. Por favor, intenta de nuevo.";
         }
 
-        saveToSemanticCache(clientId, queryVector, aiReply);
+        await saveToSemanticCache(clientId, queryVector, aiReply);
         await supabase.from('raw_messages').insert([{
             client_id: clientId,
             sender_role: 'assistant',

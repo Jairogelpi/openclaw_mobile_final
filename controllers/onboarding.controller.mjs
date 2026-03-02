@@ -286,12 +286,21 @@ Ignora tu intento de despedida. Actúa con tu personalidad elegida y haz una sol
                 if (clientErr) throw new Error(`[Baptism] clients upsert failed: ${clientErr.message}`);
                 console.log('[Baptism] ✅ Clients record upserted.');
 
-                // 3. Guardar el cerebro (Soul) en la BD
+                // 4. Provisioning config file for the portal (gateway_config)
+                const gatewayConfig = {
+                    client_id: clientId,
+                    slug: clientSlug,
+                    models: { providers: { openrouter: { apiKey: process.env.OPENROUTER_API_KEY } } },
+                    agents: { defaults: { model: { primary: "openrouter/deepseek/deepseek-chat" } } }
+                };
+
+                // 3. Guardar el cerebro (Soul) y el Gateway en la BD
                 const { error: soulErr } = await supabase
                     .from('user_souls')
                     .upsert({
                         client_id: clientId,
                         soul_json: soulJson,
+                        gateway_config: gatewayConfig,
                         port: nextPort,
                         slug: clientSlug,
                         last_updated: new Date()
@@ -310,15 +319,7 @@ Ignora tu intento de despedida. Actúa con tu personalidad elegida y haz una sol
                 const contextMd = `# Contexto Actual\n - Fecha de creación: ${new Date().toLocaleDateString()}\n - Plataforma: OpenClaw SaaS App\n - Estado inicial: Configurado vía Génesis Onboarding.`;
                 await fs.writeFile(`${clientDir}/CONTEXT.md`, encrypt(contextMd));
 
-                // 4. Provisioning config file for the portal (gateway.json5)
-                const gatewayConfig = {
-                    client_id: clientId,
-                    slug: clientSlug,
-                    models: { providers: { openrouter: { apiKey: process.env.OPENROUTER_API_KEY } } },
-                    agents: { defaults: { model: { primary: "openrouter/deepseek/deepseek-chat" } } }
-                };
-                await fs.writeFile(`${clientDir}/gateway.json5`, encrypt(JSON.stringify(gatewayConfig, null, 2)));
-                console.log('[Baptism] ✅ All physical files and gateway config written.');
+                console.log('[Baptism] ✅ All physical files (except gateway which is DB) written.');
 
                 completed = true;
                 console.log(`[Baptism] 🚀 Provisioning completed for ${clientSlug}!`);

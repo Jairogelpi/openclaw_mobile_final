@@ -1,14 +1,28 @@
 import { pipeline } from '@huggingface/transformers';
-import { LRUCache } from 'lru-cache';
-
-// === CACHÉ SEMÁNTICA ===
-const semanticCache = new LRUCache({
-    max: 500,
-    ttl: 1000 * 60 * 60 * 24 // 24 hours
-});
+import redisClient from '../config/redis.mjs';
 
 let localEmbedder = null;
 let localReRanker = null;
+
+let embedderTimeout = null;
+const EMBEDDER_TTL_MS = 10 * 60 * 1000; // 10 minutos de inactividad
+
+// Función para liberar la RAM
+function unloadEmbedder() {
+    if (localEmbedder) {
+        console.log('💤 [AI Service] Descargando modelo de embeddings de la RAM por inactividad (Lazy Unload)...');
+        if (typeof localEmbedder.dispose === 'function') {
+            try { localEmbedder.dispose(); } catch (e) { }
+        }
+        localEmbedder = null; // Liberamos la referencia para el Garbage Collector
+    }
+}
+
+// Resetea el reloj de arena cada vez que alguien necesita pensar
+function resetEmbedderTimer() {
+    if (embedderTimeout) clearTimeout(embedderTimeout);
+    embedderTimeout = setTimeout(unloadEmbedder, EMBEDDER_TTL_MS);
+}
 
 /**
  * Genera un embedding vectorial de un texto usando MiniLM localmente.
@@ -23,6 +37,9 @@ export async function generateEmbedding(text, isQuery = false) {
             quantized: true
         });
     }
+
+    resetEmbedderTimer(); // Reiniciar temporizador en cada uso
+
     const prefix = isQuery ? 'search_query: ' : 'search_document: ';
     const output = await localEmbedder(prefix + text, { pooling: 'mean', normalize: true });
     return Array.from(output.data);
@@ -49,22 +66,32 @@ export async function reRankMemories(query, memories) {
  * @param {string} clientId 
  * @param {number[]} queryVector 
  * @param {number} threshold 
- * @returns {string|null}
+ * @returns {Promise<string|null>}
  */
-export function checkSemanticCache(clientId, queryVector, threshold = 0.95) {
-    const cacheKeyPrefix = `${clientId}_`;
+export async function checkSemanticCache(clientId, queryVector, threshold = 0.95) {
+    if (!redisClient) return null;
+
     let bestMatch = null;
     let highestSimilarity = 0;
 
-    for (const [key, cacheItem] of semanticCache.entries()) {
-        if (key.startsWith(cacheKeyPrefix)) {
-            const similarity = cosineSimilarity(queryVector, cacheItem.vector);
-            if (similarity > threshold && similarity > highestSimilarity) {
-                highestSimilarity = similarity;
-                bestMatch = cacheItem.reply;
+    try {
+        const cacheKey = `semcache:${clientId}`;
+        const rawCache = await redisClient.get(cacheKey);
+
+        if (rawCache) {
+            const cacheEntries = JSON.parse(rawCache);
+            for (const cacheItem of cacheEntries) {
+                const similarity = cosineSimilarity(queryVector, cacheItem.vector);
+                if (similarity > threshold && similarity > highestSimilarity) {
+                    highestSimilarity = similarity;
+                    bestMatch = cacheItem.reply;
+                }
             }
         }
+    } catch (e) {
+        console.warn('⚠️ [Semantic Cache] Error leyendo Redis:', e.message);
     }
+
     return bestMatch;
 }
 
@@ -74,9 +101,27 @@ export function checkSemanticCache(clientId, queryVector, threshold = 0.95) {
  * @param {number[]} vector 
  * @param {string} reply 
  */
-export function saveToSemanticCache(clientId, vector, reply) {
-    const key = `${clientId}_${Date.now()}`;
-    semanticCache.set(key, { vector, reply });
+export async function saveToSemanticCache(clientId, vector, reply) {
+    if (!redisClient) return;
+
+    try {
+        const cacheKey = `semcache:${clientId}`;
+        const rawCache = await redisClient.get(cacheKey);
+        let cacheEntries = rawCache ? JSON.parse(rawCache) : [];
+
+        // Añadir nuevo ítem al principio para búsqueda LIFO
+        cacheEntries.unshift({ vector, reply, timestamp: Date.now() });
+
+        // Limitar a los 500 últimos
+        if (cacheEntries.length > 500) {
+            cacheEntries = cacheEntries.slice(0, 500);
+        }
+
+        // Guardar con TTL de 24 horas (86400 segundos)
+        await redisClient.set(cacheKey, JSON.stringify(cacheEntries), { EX: 86400 });
+    } catch (e) {
+        console.warn('⚠️ [Semantic Cache] Error guardando en Redis:', e.message);
+    }
 }
 
 /**

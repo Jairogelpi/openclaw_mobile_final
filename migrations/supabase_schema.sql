@@ -44,6 +44,7 @@ CREATE TABLE IF NOT EXISTS public.user_souls (
 ALTER TABLE public.user_souls ADD COLUMN IF NOT EXISTS port integer UNIQUE;
 ALTER TABLE public.user_souls ADD COLUMN IF NOT EXISTS slug text UNIQUE;
 ALTER TABLE public.user_souls ADD COLUMN IF NOT EXISTS last_active timestamp with time zone DEFAULT now();
+ALTER TABLE public.user_souls ADD COLUMN IF NOT EXISTS gateway_config jsonb DEFAULT '{}'::jsonb;
 
 -- 4. Vector Memory (RAG) Infrastructure
 -- Habilitar la extensión de vectores
