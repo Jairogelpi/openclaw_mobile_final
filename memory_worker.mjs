@@ -25,6 +25,14 @@ const parseLLMJson = (text) => {
     }
 };
 
+const sanitizeInput = (text, maxLength = 2000) => {
+    if (typeof text !== 'string') return '';
+    return text
+        .replace(/[<>{}\[\]\\^\`]/g, '')
+        .substring(0, maxLength)
+        .trim();
+};
+
 /**
  * Resetea el temporizador de inactividad para un cliente.
  */
@@ -166,28 +174,34 @@ async function distillAndVectorize(clientId) {
     console.log(`\n🧠 [Memory Worker] Procesando memoria e inbox para: ${clientSlug}`);
 
     // 0. ADQUIRIR CANDADO ATÓMICO (Evita condiciones de carrera e hiperescalado de costes)
-    const { data: lockAcquired, error: lockError } = await supabase.rpc('acquire_worker_lock', {
-        p_client_id: clientId,
-        p_expiry_minutes: 10
-    });
+    // 0. BLOQUEO ATÓMICO (Phase 11: Idempotency)
+    // Usamos RPC de Supabase para evitar que varios workers procesen al mismo cliente simultáneamente
+    const { data: lockAcquired, error: lockErr } = await supabase.rpc('acquire_worker_lock', { target_client_id: clientId });
 
-    if (lockError || !lockAcquired) {
-        console.log(`🔒 [Lock] Cliente ${clientSlug} ya está siendo procesado por otra instancia. Saltando.`);
+    if (lockErr || !lockAcquired) {
+        console.log(`[Worker] 🔒 Cliente ${clientId} bloqueado por otro proceso. Saltando.`);
         return;
     }
 
     try {
+        const clientSlug = await getClientSlugFromDB(clientId);
+        console.log(`🧠 [Process] Despertando proceso para ${clientSlug}...`);
+
         // 1. Obtener mensajes sin procesar
         const { data: messages } = await supabase
             .from('raw_messages')
-            .select('*') // Necesitamos remote_id y sender_role ahora
+            .select('*')
             .eq('client_id', clientId)
+            .eq('processed', false)
             .order('created_at', { ascending: true });
 
         if (!messages?.length) {
             console.log(`🏝️ Sin mensajes pendientes para ${clientId}.`);
             return;
         }
+
+        // SANTIZACIÓN (Phase 11)
+        messages.forEach(m => m.content = sanitizeInput(m.content));
 
         // --- PARTE A: RESÚMENES PARA EL INBOX ---
         // Agrupamos por conversación (remote_id)
@@ -492,15 +506,15 @@ Formato JSON esperado:
             .update({ processed: true })
             .in('id', messages.map(m => m.id));
 
-        // 5. AUTO-SOUL: Destilar conocimiento fijos y relaciones
+        // 3. Destilación de Conocimiento e Identidad (Auto-Soul)
         await autonomousDistillation(clientId, clientSlug, messages);
 
         console.log(`✅ [Memory Worker] Procesamiento completo para ${clientSlug}.`);
     } catch (err) {
-        console.error(`❌ Error general procesando cliente ${clientId}:`, err.message);
+        console.error(`❌ [Process] Error para ${clientId}:`, err.message);
     } finally {
-        // LIBERAR CANDADO
-        await supabase.rpc('release_worker_lock', { p_client_id: clientId });
+        // LIBERAR BLOQUEO
+        await supabase.rpc('release_worker_lock', { target_client_id: clientId }).catch(() => { });
     }
 }
 

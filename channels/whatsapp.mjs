@@ -430,6 +430,44 @@ export async function getWhatsAppStatus(clientId) {
  * Cierra la sesión y opcionalmente borra los archivos si se desvincula por completo
  */
 import fs from 'fs/promises';
+/**
+ * Envía un mensaje simulando comportamiento humano (Typing... + Delay aleatorio)
+ * para reducir el riesgo de baneos de WhatsApp.
+ */
+export async function sendHumanLikeMessage(clientId, jid, content, opts = {}) {
+    const sock = activeSessions.get(String(clientId));
+    if (!sock) throw new Error('WhatsApp no conectado');
+
+    const text = typeof content === 'string' ? content : (content.text || '');
+
+    try {
+        // 1. Simular "Escribiendo..."
+        await sock.presenceSubscribe(jid);
+        await new Promise(r => setTimeout(r, 500));
+        await sock.sendPresenceUpdate('composing', jid);
+
+        // 2. Calcular delay basado en longitud (p.ej. 50ms por caracter, min 2s, max 8s) + jitter
+        const baseDelay = Math.min(Math.max(text.length * 40, 2000), 8000);
+        const jitter = Math.random() * 2000;
+        const finalDelay = baseDelay + jitter;
+
+        console.log(`[Anti-Ban] ⏳ Simulando escritura para ${jid} (${Math.round(finalDelay)}ms)...`);
+        await new Promise(r => setTimeout(r, finalDelay));
+
+        // 3. Enviar mensaje
+        const sent = await sock.sendMessage(jid, content, opts);
+
+        // 4. Detener "Escribiendo..."
+        await sock.sendPresenceUpdate('paused', jid);
+
+        return sent;
+    } catch (e) {
+        console.error(`[Anti-Ban] ❌ Error enviando mensaje humanizado:`, e.message);
+        // Fallback: intentar enviar normal si la simulación falla
+        return await sock.sendMessage(jid, content, opts);
+    }
+}
+
 export async function logoutWhatsApp(clientId, clientSlug) {
     const sessionKey = String(clientId);
     const sock = activeSessions.get(sessionKey);

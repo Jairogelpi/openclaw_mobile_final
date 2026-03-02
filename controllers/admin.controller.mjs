@@ -3,6 +3,8 @@ import { exec } from 'child_process';
 import util from 'util';
 import path from 'path';
 import supabase from '../config/supabase.mjs';
+import { decrypt } from '../security.mjs';
+import { processMessage } from '../core_engine.mjs';
 
 const execPromise = util.promisify(exec);
 
@@ -127,6 +129,37 @@ export async function adminRestartClient(req, res, activeSessions, startWhatsApp
     }
 }
 
+export async function adminLogoutWhatsApp(req, res, activeSessions) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { slug } = req.params;
+
+    try {
+        const { data: soul } = await supabase.from('user_souls').select('client_id').eq('slug', slug).single();
+        if (!soul?.client_id) throw new Error("Cliente no encontrado en DB");
+
+        console.log(`🔌 [Admin] Cerrando sesión (Logout) para ${slug}...`);
+
+        if (activeSessions.has(soul.client_id)) {
+            const sock = activeSessions.get(soul.client_id);
+            if (sock && typeof sock.logout === 'function') {
+                await sock.logout().catch(() => { });
+            }
+            activeSessions.delete(soul.client_id);
+        }
+
+        // También borramos los archivos locales de sesión de Baileys
+        const sessionDir = `./clients_sessions/${slug}`;
+        await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => { });
+
+        // El directorio del cliente (config) por si acaso guardara algo ahí
+        await fs.rm(`./clients/${slug}/baileys_auth_info`, { recursive: true, force: true }).catch(() => { });
+
+        res.json({ success: true, message: `Sesión de ${slug} cerrada correctamente.` });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
 export async function adminDeleteClient(req, res, activeSessions) {
     if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).send('No autorizado');
     const { slug } = req.params;
@@ -209,51 +242,258 @@ export async function adminDeleteClient(req, res, activeSessions) {
     }
 }
 
+/**
+ * API: Eliminar cliente completo (Purga Nuclear) via JSON
+ */
+export async function adminApiDeleteClient(req, res, activeSessions) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { slug } = req.params;
+
+    try {
+        console.log(`🧨 [Admin API] Iniciando purga nuclear para ${slug}...`);
+        const { data: soul } = await supabase.from('user_souls').select('client_id').eq('slug', slug).single();
+
+        // 1. Desconectar sesión activa de WhatsApp
+        if (soul?.client_id && activeSessions.has(soul.client_id)) {
+            const sessionData = activeSessions.get(soul.client_id);
+            if (sessionData && sessionData.sock && typeof sessionData.sock.logout === 'function') {
+                try { await sessionData.sock.logout(); } catch (e) { }
+            }
+            activeSessions.delete(soul.client_id);
+        }
+
+        // 2. Eliminar archivos locales
+        const clientDir = `./clients/${slug}`;
+        const sessionDir = `./clients_sessions/${slug}`;
+        await fs.rm(clientDir, { recursive: true, force: true }).catch(() => { });
+        await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => { });
+
+        // 3. Purga en base de datos
+        let userIdToKill = soul?.client_id;
+        if (!userIdToKill) {
+            const { data: clientData } = await supabase.from('clients').select('user_id').eq('name', slug).single();
+            if (clientData) userIdToKill = clientData.user_id;
+        }
+
+        if (userIdToKill) {
+            const tablesToPurge = [
+                'knowledge_edges', 'knowledge_nodes', 'user_memories',
+                'raw_messages', 'inbox_summaries', 'contact_personas', 'system_logs'
+            ];
+
+            for (const table of tablesToPurge) {
+                await supabase.from(table).delete().eq('client_id', userIdToKill).catch(() => { });
+            }
+
+            await supabase.from('user_souls').delete().eq('client_id', userIdToKill);
+            await supabase.from('clients').delete().eq('user_id', userIdToKill);
+        }
+
+        await supabase.from('system_logs').insert({
+            level: 'info',
+            message: `Cliente ${slug} ELIMINADO permanentemente desde el Dashboard.`
+        });
+
+        res.json({ success: true, message: `Cliente ${slug} y todos sus datos han sido eliminados.` });
+    } catch (err) {
+        console.error(`[Admin API] Fallo al borrar ${slug}:`, err);
+        res.status(500).json({ error: err.message });
+    }
+}
 
 export async function adminViewLogs(req, res) {
     if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).send('No autorizado');
     const { slug } = req.params;
 
     try {
-        const clientDir = path.resolve(`./clients/${slug}`);
-        const tempLogsFile = path.join(clientDir, 'gateway.log'); // Por si loggeamos cosas por cliente aquí
+        const { data: logs } = await supabase
+            .from('system_logs')
+            .select('*')
+            .filter('message', 'ilike', `%${slug}%`)
+            .order('created_at', { ascending: false })
+            .limit(100);
 
-        let logOutput = '';
+        let logOutput = logs?.map(l => `[${new Date(l.created_at).toISOString()}] [${l.level.toUpperCase()}] ${l.message}`).join('\n') || 'Sin logs.';
 
-        try {
-            // Check if file exists in the filesystem directly
-            logOutput = await fs.readFile(tempLogsFile, 'utf8');
-        } catch (fsErr) {
-            // Intento secundario: buscar en system_logs global por nombre del slug
-            const { data: logs } = await supabase
-                .from('system_logs')
-                .select('*')
-                .filter('message', 'ilike', `%${slug}%`)
-                .order('created_at', { ascending: false })
-                .limit(50);
-
-            if (logs && logs.length > 0) {
-                logOutput = logs.map(l => `[${new Date(l.created_at).toISOString()}] [${l.level.toUpperCase()}] ${l.message}`).join('\n');
-            } else {
-                logOutput = `No se encontraron logs locales ni en la DB para ${slug}.\n(El archivo físico podría no existir tras reiniciar el servidor).\n\nPara logs globales usa PM2 (pm2 logs) o el panel de Supabase.`;
-            }
-        }
-
-        // Generar un HTML simple para leer logs oscuros estilo consola
         const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Logs: ${slug}</title>
 <style>
   body { font-family: 'Courier New', monospace; background: #0a0a1a; color: #00ff88; padding: 30px; }
-  h1 { color: #00d4ff; font-family: 'Segoe UI', sans-serif; }
   pre { background: #111; padding: 20px; border-radius: 8px; overflow-x: auto; line-height: 1.6; font-size: 13px; border: 1px solid #2a2a4e; white-space: pre-wrap; }
-  a { color: #00d4ff; }
 </style></head><body>
 <h1>📋 Logs de <b>${slug}</b></h1>
-<p><a href="/admin/health?token=${req.query.token}">← Volver al Dashboard</a> | <a href="/admin/logs/${slug}?token=${req.query.token}">↻ Refresh</a></p>
 <pre>${logOutput.replace(/</g, '&lt;').replace(/>/g, '&gt;')}</pre>
 </body></html>`;
-
         res.send(html);
     } catch (err) {
-        res.status(500).send(`Error crítico obteniendo logs de ${slug}: ${err.message}`);
+        res.status(500).send(err.message);
+    }
+}
+
+export async function adminGetLogs(req, res) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { slug } = req.params;
+    try {
+        const { data: logs } = await supabase
+            .from('system_logs')
+            .select('*')
+            .filter('message', 'ilike', `%${slug}%`)
+            .order('created_at', { ascending: false })
+            .limit(50);
+        res.json(logs || []);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+
+/**
+ * API: Retorna estadísticas base para el dashboard SPA
+ */
+export async function adminGetStats(req, res, activeSessions, qrCodes) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+
+    try {
+        const { data: clients, error: clientError } = await supabase
+            .from('user_souls')
+            .select('client_id, slug, port, last_active, restart_count');
+
+        if (clientError) {
+            console.error('[AdminStats] Supabase client fetch error:', clientError);
+        }
+
+        const memoryUsage = process.memoryUsage();
+
+        // Get Docker containers info
+        let dockerContainers = [];
+        try {
+            const { stdout } = await execPromise('docker ps -a --format "{{.Names}}\t{{.Status}}\t{{.Image}}"');
+            dockerContainers = stdout.trim().split('\n').filter(Boolean).map(line => {
+                const [name, status, image] = line.split('\t');
+                return { name, status, image };
+            });
+        } catch (e) {
+            console.error('[AdminStats] Docker error:', e.message);
+        }
+
+        // Get Docker stats for CPU/Memory usage
+        let dockerStats = {};
+        try {
+            const { stdout: statsOut } = await execPromise('docker stats --no-stream --format "{{.Name}}\\t{{.CPUPerc}}\\t{{.MemUsage}}\\t{{.MemPerc}}"');
+            statsOut.trim().split('\n').filter(Boolean).forEach(line => {
+                const [name, cpu, mem, memPerc] = line.split('\t');
+                dockerStats[name] = { cpu, mem, memPerc };
+            });
+        } catch (e) {
+            console.warn('[AdminStats] Docker stats error:', e.message);
+        }
+
+        const stats = {
+            system: {
+                ram_rss: (memoryUsage.rss / 1024 / 1024).toFixed(2),
+                ram_heap: (memoryUsage.heapUsed / 1024 / 1024).toFixed(2),
+                uptime: process.uptime(),
+                sessions_active: activeSessions.size
+            },
+            clients: (clients || []).map(c => ({
+                ...c,
+                is_online: activeSessions.has(c.client_id),
+                whatsapp: {
+                    connected: activeSessions.has(c.client_id) && activeSessions.get(c.client_id)?.user ? true : false,
+                    has_qr: qrCodes ? qrCodes.has(c.client_id) : false,
+                    qr: qrCodes ? qrCodes.get(c.client_id) : null
+                }
+            })),
+            containers: dockerContainers.map(ct => ({
+                ...ct,
+                resources: dockerStats[ct.name] || { cpu: '0%', mem: '0B / 0B', memPerc: '0%' }
+            }))
+        };
+
+        res.json(stats);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * API: Controla un contenedor Docker
+ */
+export async function adminControlContainer(req, res) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { action, containerName } = req.params;
+
+    const allowedActions = ['start', 'stop', 'restart', 'logs'];
+    if (!allowedActions.includes(action)) {
+        return res.status(400).json({ error: 'Acción no permitida' });
+    }
+
+    try {
+        console.log(`[Admin] Container Action: ${action} on ${containerName}`);
+
+        if (action === 'logs') {
+            const { stdout } = await execPromise(`docker logs --tail 100 ${containerName}`);
+            return res.json({ logs: stdout });
+        }
+
+        await execPromise(`docker ${action} ${containerName}`);
+
+        // Log to system_logs
+        await supabase.from('system_logs').insert({
+            level: 'info',
+            message: `Docker ${action} ejecutado sobre ${containerName} desde Panel.`
+        });
+
+        res.json({ success: true, message: `Contenedor ${containerName} ha sido ${action}ed` });
+    } catch (err) {
+        console.error(`[Admin] Container action failed:`, err.message);
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * API: Obtiene y descifra el SOUL de un cliente
+ */
+export async function adminGetSoul(req, res) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { slug } = req.params;
+
+    try {
+        const clientDir = path.resolve(`./clients/${slug}`);
+        const soulPath = path.join(clientDir, 'SOUL.md');
+        const userPath = path.join(clientDir, 'USER.md');
+
+        const soulEnc = await fs.readFile(soulPath, 'utf8');
+        const userEnc = await fs.readFile(userPath, 'utf8');
+
+        res.json({
+            soul: decrypt(soulEnc),
+            user: decrypt(userEnc)
+        });
+    } catch (err) {
+        res.status(500).json({ error: `Error leyendo archivos de ${slug}: ${err.message}` });
+    }
+}
+
+/**
+ * API: Neural Terminal - Prueba el cerebro directamente
+ */
+export async function adminNeuralChat(req, res) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { clientId, text, remoteId } = req.body;
+
+    if (!clientId || !text) return res.status(400).json({ error: 'Faltan parámetros' });
+
+    try {
+        console.log(`🧠 [Neural Terminal] Testing for ${clientId}: "${text.slice(0, 30)}..."`);
+        const reply = await processMessage({
+            clientId,
+            text,
+            senderId: remoteId || 'terminal-admin',
+            pushName: 'Admin Debugger'
+        });
+
+        res.json({ reply });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 }

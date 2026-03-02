@@ -1,11 +1,22 @@
 import supabase from '../config/supabase.mjs';
 import fs from 'fs/promises';
+import process from 'node:process';
 
 export async function handleSupabaseWebhook(req, res) {
     try {
         const payload = req.body;
 
-        // Verificar que es un evento DELETE de user_souls
+        // 1. Validate Secret Token
+        const authHeader = req.headers['authorization'] || req.headers['x-webhook-secret'];
+        const webhookSecret = process.env.SUPABASE_WEBHOOK_SECRET;
+
+        // Only validate if a secret is configured in the environment
+        if (webhookSecret && (!authHeader || authHeader.replace('Bearer ', '') !== webhookSecret)) {
+            console.warn('[Webhook] ⚠️ Unauthorized access attempt to webhook.');
+            return res.status(401).send('Unauthorized');
+        }
+
+        // 2. Process DELETE event
         if (payload.type === 'DELETE' && payload.table === 'user_souls') {
             const oldRecord = payload.old_record;
             if (oldRecord && oldRecord.slug) {
@@ -20,7 +31,6 @@ export async function handleSupabaseWebhook(req, res) {
                     console.log(`[Webhook] ⚠️ No se pudieron borrar archivos de ${clientSlug} o ya no existían:`, e.message);
                 }
 
-                // Opcional: Registrar en system_logs que el webhook actuó
                 await supabase.from('system_logs').insert({
                     level: 'info',
                     message: `Webhook: Archivos locales purgados tras borrado en DB para ${clientSlug}`

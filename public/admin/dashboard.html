@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenClaw | Mission Control</title>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;800&family=JetBrains+Mono:wght@500;700&display=swap"
+        rel="stylesheet">
+    <link rel="stylesheet" href="dashboard.css">
+    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+</head>
+
+<body>
+
+    <div class="container">
+        <header>
+            <div class="logo-container">
+                <div class="logo-glow"></div>
+                <div class="logo">
+                    <h1>MISSION CONTROL</h1>
+                </div>
+            </div>
+            <div id="uptime-display"
+                style="color: var(--text-dim); font-size: 11px; font-weight: 700; letter-spacing: 1px;">UPTIME: 00:00:00
+            </div>
+        </header>
+
+        <div class="stats-grid">
+            <div class="stat-card">
+                <div class="stat-label">RAM USAGE (RSS)</div>
+                <div id="ram-usage" class="stat-value">0.00 MB</div>
+            </div>
+            <div class="stat-card" onclick="scrollToIdentities()">
+                <div class="stat-label">ACTIVE SESSIONS</div>
+                <div id="active-sessions" class="stat-value" style="color: var(--primary);">0</div>
+            </div>
+            <div class="stat-card" onclick="scrollToIdentities()">
+                <div class="stat-label">TOTAL CLIENTS</div>
+                <div id="total-clients" class="stat-value">0</div>
+            </div>
+            <div class="stat-card">
+                <div class="stat-label">SYSTEM HEALTH</div>
+                <div class="stat-value" style="color: var(--success);">OPTIMAL</div>
+            </div>
+        </div>
+
+        <div class="dashboard-grid">
+            <!-- Panel de Cuentas -->
+            <div id="identities-panel" class="panel" style="grid-column: span 2;">
+                <div class="panel-header">
+                    <div class="panel-title">Identidades Activas</div>
+                    <button class="btn btn-primary" onclick="refreshData()">Refresh</button>
+                </div>
+                <div class="scroll-area">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>IDENTIDAD / SLUG</th>
+                                <th>ESTADO NODE</th>
+                                <th>WHATSAPP</th>
+                                <th>IDENTITY SCORE</th>
+                                <th>ACCIONES</th>
+                            </tr>
+                        </thead>
+                        <tbody id="client-table-body">
+                            <!-- JS Injected -->
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Panel de Integraciones (Docker Containers) -->
+            <div class="panel" style="grid-column: span 2;">
+                <div class="panel-header">
+                    <div class="panel-title">Integraciones (Containers)</div>
+                </div>
+                <div class="scroll-area" id="container-list">
+                    <!-- JS Injected -->
+                    <div style="padding: 20px; color: var(--text-dim); text-align: center;">Cargando contenedores...
+                    </div>
+                </div>
+            </div>
+
+            <!-- Neural Terminal -->
+            <div class="panel" style="grid-row: span 2;">
+                <div class="panel-header">
+                    <div class="panel-title">Neural Terminal</div>
+                </div>
+                <div class="terminal-chat">
+                    <div class="messages" id="neural-chat">
+                        <div class="message message-ai">Conexión establecida. Esperando selección de identidad...</div>
+                    </div>
+                    <div class="chat-input-container">
+                        <input type="text" id="neural-input" placeholder="Comando neural..." disabled>
+                        <button class="btn btn-primary" id="btn-send-neural" onclick="sendNeural()"
+                            disabled>Run</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Soul Inspector Modal -->
+    <div id="modal-overlay"
+        style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); backdrop-filter: blur(10px); display: none; justify-content: center; align-items: center; z-index: 1000;"
+        onclick="closeModal()">
+        <div class="panel" style="width: 800px; max-height: 80vh;" onclick="event.stopPropagation()">
+            <div class="panel-header">
+                <div class="panel-title" id="modal-title">Soul Inspector</div>
+                <button class="btn btn-ghost" onclick="closeModal()">X</button>
+            </div>
+            <div class="scroll-area">
+                <div id="modal-body-content">
+                    <pre id="modal-content"
+                        style="font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--primary); padding: 20px; background: rgba(0,0,0,0.3); border-radius: 12px; white-space: pre-wrap;"></pre>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Integration Config Modal -->
+    <div id="config-overlay"
+        style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); backdrop-filter: blur(10px); display: none; justify-content: center; align-items: center; z-index: 1001;"
+        onclick="closeConfigModal()">
+        <div class="panel" style="width: 500px; max-height: 80vh;" onclick="event.stopPropagation()">
+            <div class="panel-header">
+                <div class="panel-title" id="config-modal-title">Configuración de Integración</div>
+                <button class="btn btn-ghost" onclick="closeConfigModal()">X</button>
+            </div>
+            <div class="scroll-area"
+                style="padding: 30px; display: flex; flex-direction: column; align-items: center; gap: 20px;">
+                <div id="whatsapp-config-content"
+                    style="width: 100%; display: flex; flex-direction: column; align-items: center; gap: 20px;">
+                    <div id="wa-status-badge" class="status-pill">DESCONECTADO</div>
+                    <div id="qrcode-container"
+                        style="background: white; padding: 20px; border-radius: 12px; display: none;">
+                        <canvas id="qrcode-canvas"></canvas>
+                    </div>
+                    <p id="wa-info-text" style="color: var(--text-dim); text-align: center; font-size: 14px;">Iniciando
+                        WhatsApp...</p>
+                    <div style="display: flex; gap: 10px; width: 100%;">
+                        <button class="btn btn-primary" style="flex: 1;" onclick="relinkWhatsApp()">Re-vincular</button>
+                        <button class="btn btn-danger" style="flex: 1;" onclick="logoutWhatsApp()">Cerrar
+                            Sesión</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Log Viewer Modal -->
+    <div id="log-overlay"
+        style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.9); backdrop-filter: blur(15px); display: none; justify-content: center; align-items: center; z-index: 1002;"
+        onclick="closeLogModal()">
+        <div class="panel" style="width: 90%; height: 85vh;" onclick="event.stopPropagation()">
+            <div class="panel-header">
+                <div class="panel-title" id="log-modal-title">Neural Log Stream</div>
+                <div style="display: flex; gap: 10px;">
+                    <button class="btn btn-ghost" onclick="clearLogs()">Clear</button>
+                    <button class="btn btn-ghost" onclick="closeLogModal()">X</button>
+                </div>
+            </div>
+            <div class="scroll-area" id="log-container"
+                style="background: #050505; padding: 20px; font-family: 'JetBrains Mono', monospace; font-size: 12px; line-height: 1.5; color: #a0a0a0;">
+                <div id="log-inner"></div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const urlParams = new URLSearchParams(window.location.search);
+        const ADMIN_TOKEN = urlParams.get('token');
+        let currentClientId = null;
+        let currentSlug = null;
+        let clientsData = [];
+        let logPollInterval = null;
+
+        if (!ADMIN_TOKEN) {
+            document.body.innerHTML = '<div style="height:100vh; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:20px;">' +
+                '<div class="logo"><h1>ACCESS DENIED</h1></div>' +
+                '<p style="color:var(--accent)">SECURITY TOKEN MISSING</p></div>';
+        }
+
+        async function refreshData() {
+            try {
+                const res = await fetch(`/admin/api/stats?token=${ADMIN_TOKEN}`);
+                const data = await res.json();
+                clientsData = data.clients;
+
+                // Stats
+                document.getElementById('ram-usage').textContent = `${data.system.ram_rss} MB`;
+                document.getElementById('active-sessions').textContent = data.system.sessions_active;
+                document.getElementById('total-clients').textContent = data.clients.length;
+
+                // Format Uptime
+                const up = data.system.uptime;
+                const h = Math.floor(up / 3600).toString().padStart(2, '0');
+                const m = Math.floor((up % 3600) / 60).toString().padStart(2, '0');
+                const s = Math.floor(up % 60).toString().padStart(2, '0');
+                document.getElementById('uptime-display').textContent = `UPTIME: ${h}:${m}:${s}`;
+
+                // Client Table
+                const tbody = document.getElementById('client-table-body');
+                tbody.innerHTML = data.clients.map(c => `
+                <tr>
+                    <td>
+                        <div style="font-weight:700;">${c.slug}</div>
+                        <div style="font-size:10px; color:var(--text-dim)">ID: ${c.client_id} | R: ${c.restart_count || 0}</div>
+                    </td>
+                    <td>
+                        <span class="status-pill ${c.is_online ? 'status-online' : 'status-offline'}">
+                            ${c.is_online ? '● ONLINE' : '○ OFFLINE'}
+                        </span>
+                    </td>
+                    <td>
+                        <span class="status-pill ${c.whatsapp.connected ? 'status-online' : (c.whatsapp.has_qr ? 'status-warning' : 'status-offline')}">
+                            ${c.whatsapp.connected ? '● CONECTADO' : (c.whatsapp.has_qr ? '⚡ ESPERANDO QR' : '○ DESCONECTADO')}
+                        </span>
+                    </td>
+                    <td>
+                        <div style="display:flex; align-items:center; gap:12px;">
+                            <div style="flex:1; height:4px; background:rgba(255,255,255,0.05); border-radius:2px; overflow:hidden;">
+                                <div style="width:${c.identity_score || 0}%; height:100%; background:var(--primary); box-shadow:0 0 10px var(--primary)"></div>
+                            </div>
+                            <span style="font-size:12px; font-weight:700;">${c.identity_score || 0}%</span>
+                        </div>
+                    </td>
+                    <td>
+                        <div style="display:flex; gap:8px;">
+                            <button class="btn btn-ghost" style="padding:5px 10px" title="Logs" onclick="viewLogs('${c.slug}')">λ</button>
+                            <button class="btn btn-ghost" style="padding:5px 10px" onclick="openConfig('${c.client_id}', '${c.slug}')">Config</button>
+                            <button class="btn btn-ghost" style="padding:5px 10px" onclick="selectForChat('${c.client_id}', '${c.slug}')">Chat</button>
+                            <button class="btn btn-ghost" style="padding:5px 10px" onclick="inspectSoul('${c.slug}')">Soul</button>
+                            <button class="btn btn-danger" style="padding:5px 10px" title="Reiniciar" onclick="restartClient('${c.slug}')">⟳</button>
+                            <button class="btn btn-danger" style="padding:5px 10px; background: #ff0055; border-color: #ff0055;" title="ELIMINAR" onclick="deleteClient('${c.slug}')">🗑</button>
+                        </div>
+                    </td>
+                </tr>
+            `).join('');
+
+                // Container List
+                const containerList = document.getElementById('container-list');
+                containerList.innerHTML = data.containers.map(ct => `
+                <div class="integration-card">
+                    <div class="integration-info" style="flex: 2;">
+                        <h4>${ct.name}</h4>
+                        <p style="font-size: 11px;">${ct.image} | <span style="color:${ct.status.includes('Up') ? 'var(--success)' : 'var(--accent)'}">${ct.status}</span></p>
+                    </div>
+                    <div class="integration-resources" style="flex: 1.5; font-family: 'JetBrains Mono', monospace; font-size: 11px; display: flex; gap: 15px; align-items: center;">
+                        <div>
+                            <div style="color: var(--text-dim); font-size: 9px; margin-bottom: 2px;">CPU</div>
+                            <div style="color: var(--primary)">${ct.resources.cpu}</div>
+                        </div>
+                        <div>
+                            <div style="color: var(--text-dim); font-size: 9px; margin-bottom: 2px;">MEM</div>
+                            <div style="color: var(--secondary)">${ct.resources.memPerc}</div>
+                        </div>
+                    </div>
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn btn-ghost" style="padding: 5px 12px;" onclick="viewLogs('${ct.name}', true)">Logs</button>
+                        <button class="btn btn-ghost" style="padding: 5px 10px;" onclick="controlContainer('start', '${ct.name}')">▶</button>
+                        <button class="btn btn-ghost" style="padding: 5px 10px;" onclick="controlContainer('stop', '${ct.name}')">■</button>
+                    </div>
+                </div>
+            `).join('') || '<div style="padding:20px; text-align:center; color:var(--text-dim)">No docker containers found.</div>';
+
+            } catch (e) {
+                console.error("Refresh ERROR:", e);
+            }
+        }
+
+        // Modal para Configuración de Integración
+        function openConfig(id, slug) {
+            currentClientId = id;
+            currentSlug = slug;
+            document.getElementById('config-modal-title').textContent = `WhatsApp: ${slug}`;
+            document.getElementById('config-overlay').style.display = 'flex';
+            updateConfigModal();
+        }
+
+        function updateConfigModal() {
+            const client = clientsData.find(c => c.client_id === currentClientId);
+            if (!client) return;
+
+            const badge = document.getElementById('wa-status-badge');
+            const qrContainer = document.getElementById('qrcode-container');
+            const infoText = document.getElementById('wa-info-text');
+
+            if (client.whatsapp.connected) {
+                badge.className = 'status-pill status-online';
+                badge.textContent = 'CONECTADO';
+                qrContainer.style.display = 'none';
+                infoText.textContent = 'WhatsApp está vinculado y funcionando correctamente.';
+            } else if (client.whatsapp.has_qr) {
+                badge.className = 'status-pill status-warning';
+                badge.textContent = 'ESPERANDO QR';
+                qrContainer.style.display = 'block';
+                infoText.textContent = 'Escanea este código QR con tu WhatsApp para vincular la cuenta.';
+                // Render QR
+                QRCode.toCanvas(document.getElementById('qrcode-canvas'), client.whatsapp.qr, {
+                    width: 250,
+                    margin: 0,
+                    color: {
+                        dark: '#000000',
+                        light: '#ffffff'
+                    }
+                });
+            } else {
+                badge.className = 'status-pill status-offline';
+                badge.textContent = 'DESCONECTADO';
+                qrContainer.style.display = 'none';
+                infoText.textContent = 'WhatsApp no está iniciado o configurado. Haz clic en Re-vincular para generar un nuevo QR.';
+            }
+        }
+
+        async function relinkWhatsApp() {
+            try {
+                await fetch(`/admin/restart/${currentSlug}?token=${ADMIN_TOKEN}`, { method: 'POST' });
+                refreshData().then(() => updateConfigModal());
+                alert("Solicitando nuevo QR. Por favor espera a que se genere...");
+            } catch (e) {
+                alert("Error: " + e.message);
+            }
+        }
+
+        async function logoutWhatsApp() {
+            if (!confirm("¿Cerrar sesión de WhatsApp por completo?")) return;
+            try {
+                const res = await fetch(`/admin/api/whatsapp/logout/${currentSlug}?token=${ADMIN_TOKEN}`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    alert(data.message);
+                    refreshData();
+                    closeConfigModal();
+                } else {
+                    alert("Error: " + data.error);
+                }
+            } catch (e) {
+                alert("Error: " + e.message);
+            }
+        }
+
+        function closeConfigModal() {
+            document.getElementById('config-overlay').style.display = 'none';
+        }
+
+        // Log Viewer logic
+        async function viewLogs(name, isContainer = false) {
+            document.getElementById('log-modal-title').textContent = `LOG STREAM: ${name.toUpperCase()}`;
+            document.getElementById('log-overlay').style.display = 'flex';
+            const logInner = document.getElementById('log-inner');
+            logInner.innerHTML = '<div style="color: var(--primary)">Connecting to neural stream...</div>';
+
+            const fetchLogs = async () => {
+                try {
+                    const endpoint = isContainer ? `/admin/api/container/logs/${name}` : `/admin/api/logs/${name}`;
+                    const res = await fetch(`${endpoint}?token=${ADMIN_TOKEN}`);
+                    const data = await res.json();
+
+                    // Colorize logs a bit
+                    const formatted = (data.logs || 'No logs available.')
+                        .replace(/\[(INFO|OK|SUCCESS)\]/gi, '<span style="color: #00ffaa;">$0</span>')
+                        .replace(/\[(WARN|WARNING)\]/gi, '<span style="color: #ffaa00;">$0</span>')
+                        .replace(/\[(ERROR|CRITICAL|FAIL)\]/gi, '<span style="color: #ff0055;">$0</span>')
+                        .replace(/at /g, '<span style="color: #666;">at </span>');
+
+                    logInner.innerHTML = formatted;
+                    const container = document.getElementById('log-container');
+                    container.scrollTop = container.scrollHeight;
+                } catch (e) {
+                    logInner.innerHTML = `<span style="color: var(--accent)">LOG ERROR: ${e.message}</span>`;
+                }
+            };
+
+            fetchLogs();
+            logPollInterval = setInterval(fetchLogs, 3000);
+        }
+
+        function closeLogModal() {
+            document.getElementById('log-overlay').style.display = 'none';
+            if (logPollInterval) clearInterval(logPollInterval);
+        }
+
+        function clearLogs() {
+            document.getElementById('log-inner').innerHTML = '';
+        }
+
+        async function controlContainer(action, name) {
+            if (!confirm(`Confirm ${action} on ${name}?`)) return;
+            try {
+                const res = await fetch(`/admin/api/container/${action}/${name}?token=${ADMIN_TOKEN}`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    console.log(data.message);
+                    refreshData();
+                } else {
+                    alert("Error: " + data.error);
+                }
+            } catch (e) {
+                alert("Control failed: " + e.message);
+            }
+        }
+
+        function selectForChat(id, slug) {
+            currentClientId = id;
+            currentSlug = slug;
+            document.getElementById('neural-input').disabled = false;
+            document.getElementById('btn-send-neural').disabled = false;
+            document.getElementById('neural-input').placeholder = `Querying: ${slug}...`;
+
+            const chat = document.getElementById('neural-chat');
+            chat.innerHTML += `<div class="message message-ai" style="border-color:var(--primary); background:rgba(0, 242, 255, 0.05)"><b>[SYSTEM]</b> LINK ESTABLISHED WITH ${slug.toUpperCase()}</div>`;
+            chat.scrollTop = chat.scrollHeight;
+        }
+
+        async function sendNeural() {
+            const input = document.getElementById('neural-input');
+            const text = input.value.trim();
+            if (!text || !currentClientId) return;
+
+            appendMsg('user', text);
+            input.value = '';
+            input.disabled = true;
+
+            try {
+                const res = await fetch(`/admin/api/neural_chat?token=${ADMIN_TOKEN}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ clientId: currentClientId, text: text })
+                });
+                const data = await res.json();
+                appendMsg('ai', data.reply);
+            } catch (e) {
+                appendMsg('ai', `COMMUNICATION ERROR: ${e.message}`);
+            } finally {
+                input.disabled = false;
+                input.focus();
+            }
+        }
+
+        function appendMsg(role, text) {
+            const chat = document.getElementById('neural-chat');
+            chat.innerHTML += `<div class="message message-${role}">${text}</div>`;
+            chat.scrollTop = chat.scrollHeight;
+        }
+
+        async function inspectSoul(slug) {
+            try {
+                const res = await fetch(`/admin/api/soul/${slug}?token=${ADMIN_TOKEN}`);
+                const data = await res.json();
+                document.getElementById('modal-title').textContent = `SOUL DECRYPTED: ${slug.toUpperCase()}`;
+                document.getElementById('modal-content').textContent = JSON.stringify(JSON.parse(data.soul || '{}'), null, 4);
+                document.getElementById('modal-overlay').style.display = 'flex';
+            } catch (e) {
+                alert("DECRYPTION FAILED: " + e.message);
+            }
+        }
+
+        async function restartClient(slug) {
+            if (!confirm(`¿REINICIAR SESIÓN PARA ${slug}?`)) return;
+            try {
+                await fetch(`/admin/restart/${slug}?token=${ADMIN_TOKEN}`, { method: 'POST' });
+                refreshData();
+                alert(`Reinicio solicitado para ${slug}`);
+            } catch (e) {
+                alert("Error: " + e.message);
+            }
+        }
+
+        async function deleteClient(slug) {
+            if (!confirm(`⚠️ ALERTA NUCLEAR: ¿Eliminar permanentemente a ${slug} y TODOS sus datos (memoria, chats, configuración)? Esta acción es irreversible.`)) return;
+            try {
+                const res = await fetch(`/admin/api/client/delete/${slug}?token=${ADMIN_TOKEN}`, { method: 'POST' });
+                const data = await res.json();
+                if (data.success) {
+                    alert(data.message);
+                    refreshData();
+                } else {
+                    alert("Error: " + data.error);
+                }
+            } catch (e) {
+                alert("Error: " + e.message);
+            }
+        }
+
+        function closeModal() {
+            document.getElementById('modal-overlay').style.display = 'none';
+        }
+
+        function scrollToIdentities() {
+            document.getElementById('identities-panel').scrollIntoView({ behavior: 'smooth' });
+            // Flash effect
+            const panel = document.getElementById('identities-panel');
+            panel.style.transition = 'none';
+            panel.style.borderColor = 'var(--primary)';
+            panel.style.boxShadow = '0 0 30px var(--primary-glow)';
+            setTimeout(() => {
+                panel.style.transition = 'all 1s';
+                panel.style.borderColor = '';
+                panel.style.boxShadow = '';
+            }, 100);
+        }
+
+        setInterval(refreshData, 5000);
+        refreshData();
+    </script>
+
+</body>
+
+</html>

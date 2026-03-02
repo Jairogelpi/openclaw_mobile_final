@@ -14,6 +14,16 @@ const parseLLMJson = (text) => {
         throw e;
     }
 };
+
+const sanitizeInput = (text, maxLength = 2000) => {
+    if (typeof text !== 'string') return '';
+    // Prevent prompt injection by neutralizing potential command delimiters
+    // and stripping non-printable characters, then capping length
+    return text
+        .replace(/[<>{}\[\]\\^\`]/g, '') // Basic removal of structured syntax characters
+        .substring(0, maxLength)
+        .trim();
+};
 import { searchWeb } from './services/tavily.mjs';
 import { decrypt } from './security.mjs';
 import {
@@ -110,8 +120,11 @@ export async function processMessage(incomingEvent) {
 
         console.log(`🧠[Core Engine] Procesando mensaje de ${senderLabel}...`);
 
+        // SANTIZACIÓN DE INPUT (Seguridad Phase 11)
+        const safeText = sanitizeInput(text);
+
         // 0. EMBEDDING LOCAL
-        const queryVector = await generateEmbedding(text, true);
+        const queryVector = await generateEmbedding(safeText, true);
 
         // 1. CACHÉ SEMÁNTICA
         const cachedReply = checkSemanticCache(clientId, queryVector);

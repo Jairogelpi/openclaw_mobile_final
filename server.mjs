@@ -8,6 +8,7 @@ import multer from 'multer';
 import { createServer } from 'http';
 import { parse as parseUrl } from 'url';
 import JSON5 from 'json5';
+import path from 'path';
 
 // Global error handlers to prevent silent crashes
 process.on('unhandledRejection', (reason, promise) => {
@@ -18,7 +19,7 @@ process.on('uncaughtException', (err) => {
 });
 
 import { encrypt, decrypt } from './security.mjs';
-import { startWhatsAppClient, qrCodes, activeSessions, getWhatsAppStatus, logoutWhatsApp } from './channels/whatsapp.mjs';
+import { startWhatsAppClient, qrCodes, activeSessions, getWhatsAppStatus, logoutWhatsApp, sendHumanLikeMessage } from './channels/whatsapp.mjs';
 import supabase from './config/supabase.mjs';
 import redisClient from './config/redis.mjs';
 import { getClientSlug } from './utils/helpers.mjs';
@@ -27,7 +28,7 @@ import { authRegister, authLogin } from './controllers/auth.controller.mjs';
 import { onboardingChat } from './controllers/onboarding.controller.mjs';
 import { getInboxSummaries, getInboxHistory, generateSmartReply } from './controllers/inbox.controller.mjs';
 import { handleSupabaseWebhook } from './controllers/webhook.controller.mjs';
-import { adminHealthDashboard, adminRestartClient, adminDeleteClient, adminViewLogs } from './controllers/admin.controller.mjs';
+import { adminHealthDashboard, adminRestartClient, adminLogoutWhatsApp, adminApiDeleteClient, adminDeleteClient, adminViewLogs, adminGetStats, adminGetSoul, adminNeuralChat, adminGetLogs, adminControlContainer } from './controllers/admin.controller.mjs';
 import { handleWhatsAppPair, handleWhatsAppStatus, handleWhatsAppLogout, handleWhatsAppProxyMethod } from './controllers/whatsapp.controller.mjs';
 import { handleSoulGet, handleSoulRefine } from './controllers/soul.controller.mjs';
 import { handleUpdateSettings } from './controllers/settings.controller.mjs';
@@ -57,6 +58,7 @@ global.__wss = wss; // Expose for real-time broadcast from WhatsApp channel
 app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
+app.use(express.static(path.join(process.cwd(), 'public')));
 
 const PORT = 3000;
 const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || '';
@@ -187,8 +189,8 @@ app.post('/rpc', async (req, res) => {
                     opts.quoted = { key: { remoteJid: jid, id: quotedId } };
                 }
 
-                const sent = await sock.sendMessage(jid, msgPayload, opts);
-                console.log(`[WhatsApp-Send] ✅ Mensaje enviado a ${jid} (type: ${media ? media.mimetype : 'text'})`);
+                const sent = await sendHumanLikeMessage(clientId, jid, msgPayload, opts);
+                console.log(`[WhatsApp-Send] ✅ Mensaje humanizado enviado a ${jid} (type: ${media ? media.mimetype : 'text'})`);
                 return res.json({ result: { success: true, messageId: sent?.key?.id }, id });
             } catch (sendErr) {
                 console.error(`[WhatsApp-Send] ❌ Error:`, sendErr.message);
@@ -427,14 +429,22 @@ app.post('/inbox/smart-reply', authenticateToken, generateSmartReply);
 
 // === ADMIN HEALTH DASHBOARD ===
 app.get('/admin/health', (req, res) => adminHealthDashboard(req, res, activeSessions));
-
-// === ADMIN: RESTART CONTAINER ===
 app.post('/admin/restart/:slug', (req, res) => adminRestartClient(req, res, activeSessions, startWhatsAppClient));
-
-// === ADMIN: DELETE CLIENT ===
 app.post('/admin/delete/:slug', (req, res) => adminDeleteClient(req, res, activeSessions));
+app.get('/admin/logs/:slug', (req, res) => adminViewLogs(req, res));
 
-// === WEBHOOKS ===
+// --- NUEVAS RUTAS DASHBOARD (Phase 12) ---
+app.get('/admin/api/stats', (req, res) => adminGetStats(req, res, activeSessions, qrCodes));
+app.get('/admin/api/soul/:slug', (req, res) => adminGetSoul(req, res));
+app.get('/admin/api/logs/:slug', (req, res) => adminGetLogs(req, res));
+app.post('/admin/api/neural_chat', (req, res) => adminNeuralChat(req, res));
+app.post('/admin/api/whatsapp/logout/:slug', (req, res) => adminLogoutWhatsApp(req, res, activeSessions));
+app.post('/admin/api/client/delete/:slug', (req, res) => adminApiDeleteClient(req, res, activeSessions));
+app.post('/admin/api/container/:action/:containerName', (req, res) => adminControlContainer(req, res));
+app.get('/admin/api/container/logs/:containerName', (req, res) => {
+    req.params.action = 'logs';
+    adminControlContainer(req, res);
+});
 // Este endpoint debe ser configurado en Supabase > Database > Webhooks
 // Trigger: DELETE en la tabla 'user_souls'
 app.post('/admin/webhooks/supabase', express.json(), handleSupabaseWebhook);
@@ -493,4 +503,11 @@ httpServer.listen(PORT, '0.0.0.0', async () => {
     } catch (e) {
         console.error(`[Debug] ❌ Failed to start ${debugClientSlug}:`, e.message);
     }
+
+    // 5. BRIDGE HEALTH HEARTBEAT (Hourly)
+    setInterval(() => {
+        const mem = process.memoryUsage();
+        const sessions = activeSessions.size;
+        console.log(`💓 [Bridge-Health] Sessions: ${sessions}. Memory: ${Math.round(mem.heapUsed / 1024 / 1024)}MB / ${Math.round(mem.rss / 1024 / 1024)}MB RSS`);
+    }, 3600_000);
 });
