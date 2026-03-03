@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import { Worker } from 'bullmq';
 import { mediaQueue, incomingQueue } from './config/queues.mjs';
 import redisClient from './config/redis.mjs';
+import supabase from './config/supabase.mjs';
 import { transcribeAudio, analyzeImage, extractFileText } from './utils/media.mjs';
 
 console.log('🎧 [Media Worker] Iniciando servicio del "Oído" (Media Ingestion)...');
@@ -34,7 +35,29 @@ const mediaWorker = new Worker('mediaProcessingQueue', async (job) => {
         const finalText = [mediaDescription, text].filter(Boolean).join(' ');
 
         if (finalText) {
-            console.log(`[Queue-Media] 🗣️ Transcripción/Análisis completado. Encolando a incomingMessagesQueue...`);
+            console.log(`[Queue-Media] 🗣️ Transcripción/Análisis completado. Guardando en DB y encolando...`);
+
+            // 💾 GUARDAR EN DB (Persistencia de Media Procesado)
+            const { error: dbErr } = await supabase.from('raw_messages').insert([{
+                client_id: clientId,
+                sender_role: isSentByMe ? 'user_sent' : (pushName || senderId),
+                content: finalText,
+                remote_id: senderId,
+                metadata: {
+                    pushName,
+                    isGroup,
+                    hasMedia: true,
+                    mediaType: type,
+                    historical: false
+                }
+            }]);
+
+            if (dbErr) console.error(`[Queue-Media] ❌ DB Error:`, dbErr.message);
+
+            // ⏳ ACTIVAR TEMPORIZADOR DE MEMORIA (Trigger Memory Worker)
+            await redisClient.set(`idle:${clientId}`, 'process', { EX: 60 });
+            console.log(`[Queue-Media] ⏳ Reloj de memoria activado para ${clientId}.`);
+
             // Empujamos el texto crudo simulando un mensaje de WhatsApp normal
             await incomingQueue.add('process_message', {
                 clientId,

@@ -18,11 +18,11 @@ export async function traverseGraph(clientId, queryText, queryVector, matchCount
     }
 
     return (data || []).map(g => ({
-        content: g.knowledge,
+        content: `[Resonancia Cognitiva: ${(g.cognitive_resonance * 100).toFixed(1)}%] [Ruta: ${g.reasoning_path}]\n${g.knowledge}`,
         sender: g.entity_type,
-        similarity: null,
+        similarity: g.cognitive_resonance,
         hop: g.hop,
-        source: 'GRAPH'
+        source: 'GRAPH_V3'
     }));
 }
 

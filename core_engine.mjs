@@ -126,11 +126,14 @@ export async function processMessage(incomingEvent) {
         // 0. EMBEDDING LOCAL
         const queryVector = await generateEmbedding(safeText, true);
 
-        // 1. CACHÉ SEMÁNTICA
-        const cachedReply = await checkSemanticCache(clientId, queryVector);
-        if (cachedReply) {
-            console.log(`⚡[Cache Semántica] ¡Acierto en Redis!`);
-            return cachedReply;
+        // 1.5. INTENT GATING (Optimization God-Mode)
+        const lowerText = safeText.toLowerCase();
+        const trivialRegex = /^(ok|hola|bueno|vale|gracias|jaja|xd|good|hi|hello|thx|thanks)$/i;
+        if (trivialRegex.test(lowerText) && lowerText.length < 10) {
+            console.log(`⚡[Intent Gating] Mensaje trivial detectado. Saltando RAG profundo.`);
+            const trivialReply = lowerText.includes('hola') ? "¡Hola! ¿En qué puedo ayudarte hoy?" : "¡Entendido!";
+            // Aun así guardamos para mantener el estilo, pero sin RAG
+            return trivialReply;
         }
 
         // 2. Recuperar la Identidad (DB-First)
@@ -180,7 +183,8 @@ Responde JSON:
 }`;
 
             try {
-                const agenticRaw = await groqChat('llama-3.3-70b-versatile', [
+                // MODEL TIERING: Usamos 8B para el razonamiento de búsqueda (rápido y barato)
+                const agenticRaw = await groqChat('llama-3.1-8b-instant', [
                     { role: 'system', content: agenticPrompt },
                     { role: 'system', content: `CONTEXTO ACTUAL:\n${accumulatedContext || 'Vacío'}` }
                 ], { temperature: 0.1, response_format: { type: 'json_object' } });
@@ -221,12 +225,13 @@ Responde JSON:
             }
         }
 
-        // 4. DESTILACIÓN
-        console.log(`🧪 [Architect RAG] Destilando contexto...`);
+        // 4. CONTEXT ATOMIZATION (Beyond-God-Tier Cost Cut)
+        console.log(`🧪 [Architect RAG] Atomizando contexto (Ahorro de Tokens)...`);
         let distilledKnowledge = "";
         try {
-            distilledKnowledge = await groqChat('llama-3.3-70b-versatile', [
-                { role: 'system', content: `Destila el contexto en un "Núcleo de Hechos" breve.` },
+            // MODEL TIERING: 8B para destilación de hechos puros
+            distilledKnowledge = await groqChat('llama-3.1-8b-instant', [
+                { role: 'system', content: `Eres un Atomizador de Contexto. Extrae ÚNICAMENTE los "Átomos de Hecho" más relevantes del contexto provisto como una lista de viñetas muy cortas. Omite todo el texto de relleno. Formato: "- Hecho 1\n- Hecho 2". Si el contexto está vacío, responde "Sin hechos."` },
                 { role: 'user', content: `CONTEXTO:\n${accumulatedContext}` }
             ], { temperature: 0.1 });
         } catch (e) {
@@ -278,25 +283,46 @@ ESTILO DE ESCRITURA:
 - Formato y Mayúsculas: ${parsedSoul.style_profile.casing_and_formatting || 'Normal'}
 ` : "";
 
+        const axionas = parsedSoul.axiomas_filosoficos?.join('\n- ') || "No detectados.";
+        const matrices = parsedSoul.matrices_decision?.join('\n- ') || "No detectadas.";
+        const directives = parsedSoul.personal_directives?.join('\n- ') || "No hay directivas específicas.";
+        const psych = parsedSoul.psychological_profile ? JSON.stringify(parsedSoul.psychological_profile) : "No analizado.";
+
         const systemPrompt = `
 === IDENTIDAD Y VOZ ===
 ${soul}
-${styleInfo}
 
-EJEMPLOS REALES DE CÓMO ESCRIBE EL DUEÑO (IMÍTALO EXACTAMENTE):
-${userStyleExamples || "No hay ejemplos aún."}
+=== DIRECTIVAS DEL DUEÑO (PRIORIDAD ALTA) ===
+Reglas estrictas dadas por el dueño directamente:
+- ${directives}
+
+=== ALINEACIÓN AXIOLÓGICA Y PSICOLÓGICA ===
+AXIOMAS FILOSÓFICOS:
+- ${axionas}
+
+MATRICES DE DECISIÓN:
+- ${matrices}
+
+PERFIL PSICOLÓGICO (OCEAN):
+${psych}
 
 === DUEÑO (INFO PERSONAL) ===
 ${userProfile}
 
-=== MEMORIA Y CONTEXTO ===
-${distilledKnowledge}
-
 REGLAS DE ORO:
-1. MANTÉN EL PERSONAJE: Responde con el estilo, tono y emojis que viste arriba.
+1. MANTÉN EL PERSONAJE: Responde con el estilo, tono y emojis que verás en los ejemplos.
 2. BREVEDAD Y FORMATO: Si el dueño escribe en minúsculas y sin puntos, HAZ LO MISMO.
 3. CITA DATOS: [Fuente: Memoria] si usas info guardada.
-4. NO PAREZCAS IA: No digas "Como IA...", no seas excesivamente amable si el dueño no lo es.`;
+4. NO PAREZCAS IA: No digas "Como IA...", no seas excesivamente amable si el dueño no lo es.
+
+--- FIN DE INSTRUCCIONES ESTÁTICAS (OPTIMIZADO PARA CACHÉ) ---
+
+=== CONTEXTO DINÁMICO ===
+ATÓMOS DE MEMORIA Y HECHOS:
+${distilledKnowledge}
+
+EJEMPLOS REALES DE CÓMO ESCRIBE EL DUEÑO (IMÍTALO EXACTAMENTE):
+${userStyleExamples || "No hay ejemplos aún."}`;
 
         // 5. BUCLE DE REFLEXIÓN (DRAFT -> CRITIQUE -> REFINE)
         console.log(`🧠 [Reflection Loop] Iniciando ciclo de identidad espejo profunda...`);
@@ -310,10 +336,11 @@ REGLAS DE ORO:
             attempts++;
             console.log(`✍️ [Reflection] Intento ${attempts}: Generando borrador...`);
 
+            // MODEL TIERING: 70B para la respuesta FINAL (Máxima calidad e identidad)
             aiReply = await groqChat('llama-3.3-70b-versatile', history, { temperature: 0.3 });
 
-            // CRÍTICA INTERNA - Enfocada en Identidad
-            const critiquePrompt = `Eres el Auditor de Identidad de OpenClaw. Tu objetivo es el "Espejo Semántico Perfecto".
+            // CRÍTICA INTERNA - Enfocada en Identidad y Valores
+            const critiquePrompt = `Eres el Auditor de Identidad de OpenClaw. Tu objetivo es el "Espejo Semántico Perfecto" y la "Coherencia Axiológica".
             
             PERFIL DE ESTILO REQUERIDO:
             ${styleInfo}
@@ -321,19 +348,37 @@ REGLAS DE ORO:
             EJEMPLOS REALES DEL DUEÑO:
             ${userStyleExamples}
             
+            MENSAJE DEL USUARIO: "${text}"
             RESPUESTA A EVALUAR: "${aiReply}"
             
-            TAREA: Evalúa la respuesta en una escala de 0 a 10 en los siguientes criterios:
-            1. TONO: ¿Coincide con la personalidad detectada?
-            2. FORMATO: ¿Usa las mismas mayúsculas y puntuación?
-            3. EMOJIS: ¿Usa la cantidad y tipo correctos?
-            4. FLUIDEZ: ¿Suena a humano o a asistente IA?
-            
-            REGLA DE ORO: Si la respuesta empieza con "Como asistente..." o es demasiado servicial, CALIFICA 0.
-            
-            Responde JSON: { "approved": boolean, "score": number, "critique": "string", "suggestions": "string" }`;
+            VALORES Y AXIOMAS DEL DUEÑO:
+            ${axionas}
 
-            let audit = { approved: false, score: 0 };
+            DIRECTIVAS DEL DUEÑO (¡CRÍTICO!):
+            ${directives}
+            
+            TAREA 1: Evalúa la respuesta (0-10):
+            1. TONO: ¿Coincide con la personalidad?
+            2. FORMATO: ¿Mayúsculas/puntuación correctas?
+            3. EMOJIS: ¿Cantidad adecuada?
+            4. FLUIDEZ: ¿Suena a humano?
+            
+            TAREA 2: DETECCIÓN DE CONFLICTO COGNITIVO (¡CRÍTICO!)
+            Analiza profundamente si el MENSAJE DEL USUARIO o tu generación implican algo que va en contra DIRECTA de los "Valores y Axiomas del Dueño".
+            - Si hay un choque filosófico, define "conflict_detected: true" y explica en "conflict_details" qué axioma se está rompiendo.
+            
+            REGLA DE ORO: Si la respuesta parece de IA genérica, CALIFICA 0.
+            
+            Responde JSON: { 
+              "approved": boolean, 
+              "score": number, 
+              "critique": "string", 
+              "suggestions": "string",
+              "conflict_detected": boolean,
+              "conflict_details": "string"
+            }`;
+
+            let audit = { approved: false, score: 0, conflict_detected: false };
             let retryCount = 0;
             const MAX_AUDIT_RETRIES = 2;
 
@@ -347,6 +392,13 @@ REGLAS DE ORO:
                     });
 
                     audit = parseLLMJson(auditRaw);
+
+                    if (audit.conflict_detected) {
+                        console.log(`🚨 [Cognitive Conflict] ¡Contradicción Axiológica Detectada!`);
+                        aiReply = `⚙️ [Modo Autoconsciencia OpenClaw]\nHe detectado un conflicto fundamental con tus valores guardados.\n\n⚠️ Conflicto detectado: ${audit.conflict_details}\n\n¿Ha evolucionado tu forma de pensar sobre este tema? (Dime para actualizar mi núcleo de identidad).`;
+                        isApproved = true;
+                        break;
+                    }
 
                     if (audit.approved || audit.score >= 8) {
                         console.log(`✅ [Reflection] Auditoría aprobada (${audit.score}/10) en intento ${retryCount + 1}.`);

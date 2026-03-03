@@ -90,31 +90,46 @@ PROTOCOLOS DE EXTRACCIÓN (NIVEL GOD-TIER):
    - Aversiones (pet peeves) y pasiones ocultas.
    - Puntos ciegos cognitivos o sesgos detectados observados en el texto.
 
-2. "triplets": Arquitectura GraphRAG de Nivel 3. 
+2. "triplets": Arquitectura GraphRAG de Nivel 4 (Cognitivo-Relacional). 
    - No extraigas solo hechos simples ("X es lugar"). 
-   - Extrae matices viscerales: "Fulano [TIENE_TENSION_CON] Mengano". "Concepto_X [CAUSA_ESTRES_A] Usuario".
+   - Extrae matices viscerales y dinámicas de poder: "Sujeto [TIENE_TENSION_CON] Objeto". "Concepto_X [CAUSA_ESTRES_A] Usuario".
+   - Detecta compromisos: "Usuario [PROMETIO_ENTREGAR_X_A] Contacto".
+   - Identifica sentimientos profundos: "Contacto [EXPRESA_ADMIRACION_POR] Usuario".
 
 3. "style_profile": DECONSTRUCCIÓN LINGÜÍSTICO-PSICOLÓGICA. Analiza 'user_sent' con precisión milimétrica:
-   - "core_humor_framework": Identifica sarcasmo, ironía, absurdo, humor negro, humor inocente, shitposting.
-   - "syntactic_complexity": Valor (0.0 a 1.0) y descripción estructural.
-   - "emotional_baseline_valence": Valencia emocional (-1.0 a 1.0) y Tono Dominante constante.
-   - "formality_variance": Rango de formalidad y gatillos (qué temas le hacen hablar formal vs grosero).
-   - "common_emojis": Uso táctico, irónico o literal de emojis (y cuáles son).
-   - "slang_and_vocabulary": El lexicon único, barbarismos, localismos, jergas de nicho de internet o vida real.
    - "rhythm_and_pacing": Ráfagas, bloques monolíticos explicativos, tiempos de pausa.
    - "punctuation_signature": Manias puras (ausencia total de mayúsculas, elipsis dramáticas, exclamaciones hiperbólicas).
    - "conflict_resolution_style": Si hay discusiones, ¿es evasivo, confrontacional, diplomático, pasivo-agresivo?
 
-Responde ÚNICA Y EXCLUSIVAMENTE con el siguiente objeto JSON estricto (combina el perfil completo actualizado con el nuevo conocimiento):
+4. "personal_directives": EXTRAE ÓRDENES DIRECTAS.
+   - Si el dueño dice "A partir de ahora...", "No digas más...", "Háblame de Ud", esto es una directiva absoluta.
+   - Formato: ["No usar emojis con clientes", "Ser directo y seco"].
+
+5. "psychological_profile": ANALISIS DE TRANSFONDO (OCEAN).
+   - Deduce rasgos de personalidad (0 a 1): Apertura, Responsabilidad, Extraversión, Amabilidad, Neuroticismo.
+
+6. "contextual_mirrors": MAPEADO DE PÚBLICOS.
+   - ¿Cómo cambia su trato según el interlocutor? (ej: "Clientes": "Formal", "Amigos": "Slang").
+
+Responde ÚNICA Y EXCLUSIVAMENTE con el siguiente objeto JSON estricto:
 {
   "soul_patch": {
     "axiomas_filosoficos": ["..."],
     "matrices_decision": ["..."],
     "sesgos_cognitivos": ["..."],
-    "hechos_y_preferencias_duras": ["..."]
+    "hechos_y_preferencias_duras": ["..."],
+    "personal_directives": ["..."],
+    "psychological_profile": { "O": 0.5, "C": 0.5, "E": 0.5, "A": 0.5, "N": 0.5 },
+    "contextual_mirrors": { "Categoría": "Estilo" }
   },
   "triplets": [
-    ["Sujeto", "PREDICADO_RELACIONAL_COMPLEJO", "Objeto"]
+    {
+      "source": "Sujeto",
+      "relation": "PREDICADO_COMPLEJO",
+      "target": "Objeto",
+      "context": "Breve explicación del matiz detectado",
+      "flags": ["etiqueta1"]
+    }
   ],
   "style_profile": {
     "core_humor_framework": "",
@@ -140,6 +155,17 @@ Responde ÚNICA Y EXCLUSIVAMENTE con el siguiente objeto JSON estricto (combina 
             const updatedSoul = {
                 ...currentSoul,
                 ...result.soul_patch,
+                personal_directives: [
+                    ...new Set([...(currentSoul.personal_directives || []), ...(result.soul_patch.personal_directives || [])])
+                ],
+                psychological_profile: {
+                    ...(currentSoul.psychological_profile || {}),
+                    ...(result.soul_patch.psychological_profile || {})
+                },
+                contextual_mirrors: {
+                    ...(currentSoul.contextual_mirrors || {}),
+                    ...(result.soul_patch.contextual_mirrors || {})
+                },
                 style_profile: {
                     ...(currentSoul.style_profile || {}),
                     ...(result.style_profile || {})
@@ -172,14 +198,29 @@ Responde ÚNICA Y EXCLUSIVAMENTE con el siguiente objeto JSON estricto (combina 
             console.log(`✨ [Auto-Soul] Memoria e Identidad (Estilo) actualizadas en DB para ${clientSlug}.`);
         }
 
-        // 4. Upsert en el Grafo
+        // 4. Upsert en el Grafo (V4: Cognitive Depth)
         if (result.triplets && result.triplets.length > 0) {
-            for (const [s, p, o] of result.triplets) {
+            for (const t of result.triplets) {
+                const s = t.source || t[0];
+                const r = t.relation || t[1];
+                const o = t.target || t[2];
+                const ctx = t.context || "";
+                const flags = t.flags || [];
+
                 await upsertKnowledgeNode(clientId, s, 'ENTITY', '');
                 await upsertKnowledgeNode(clientId, o, 'ENTITY', '');
-                await upsertKnowledgeEdge(clientId, s, o, p);
+                
+                // Usamos la nueva función RPC para gestionar pesos y flags
+                await supabase.rpc('upsert_knowledge_edge_v4', {
+                    p_client_id: clientId,
+                    p_source_node: s,
+                    p_target_node: o,
+                    p_relation_type: r,
+                    p_context: ctx,
+                    p_flags: flags
+                });
             }
-            console.log(`🕸️ [Auto-Soul] ${result.triplets.length} tripletes añadidos.`);
+            console.log(`🕸️ [Auto-Soul] ${result.triplets.length} tripletes cognitivos procesados.`);
         }
 
     } catch (e) {
@@ -241,7 +282,7 @@ async function distillAndVectorize(clientId) {
                 conversations[m.remote_id] = {
                     messages: [],
                     lastSender: initialSender,
-                    lastText: m.content,
+                    lastText: "",
                     avatarUrl: m.metadata?.avatarUrl || null,
                     firstMessageTime: m.created_at,
                     lastMessageTime: m.created_at
@@ -256,7 +297,12 @@ async function distillAndVectorize(clientId) {
                 conversations[m.remote_id].lastSender = m.metadata.pushName;
             }
 
-            conversations[m.remote_id].lastText = m.content;
+            // Concatenar mensajes para formar el fragmento de la conversación
+            if (conversations[m.remote_id].lastText !== "") {
+                conversations[m.remote_id].lastText += "\n";
+            }
+            conversations[m.remote_id].lastText += m.content;
+
             if (m.metadata?.avatarUrl) {
                 conversations[m.remote_id].avatarUrl = m.metadata.avatarUrl; // Actualizar con el más reciente
             }
@@ -378,10 +424,10 @@ REGLAS CRÍTICAS DE ENTIDADES:
 - No uses nombres genéricos como "Contacto", "El amigo", usa exactamente "${contactIdentifier}".
 
 OBJETIVOS DE EXTRACCIÓN:
-- Relaciones familiares (ej: hermano de, hijo de)
-- Posesiones importantes (ej: tiene mascota, tiene coche)
-- Eventos fijos (ej: se casó en 2020)
-- Nombres propios (ej: su perro se llama Toby)
+- Relaciones familiares y dinámicas de poder (ej: hermano de, jefe de, mentor de).
+- Relaciones Psicológicas: ¿Qué siente uno por el otro? (ej: desconfía de, admira a).
+- Compromisos y Promesas: ¿Qué se han prometido? (ej: prometió descuento, acordó reunión).
+- Hechos y Posesiones importantes.
 
 Formato JSON esperado:
 {
@@ -391,8 +437,9 @@ Formato JSON esperado:
       "source_type": "PERSONA",
       "target": "Objeto (ej. Toby, Madrid, Fútbol)",
       "target_type": "ENTITY|CONCEPT|LOCATION",
-      "relation": "TIENE_MASCOTA|RESIDE_EN|GUSTA_DE|PADRE_DE",
-      "context": "Detalle breve del hecho"
+      "relation": "TIENE_MASCOTA|RESIDE_EN|GUSTA_DE|DESCONFIA_DE|PROMETIO_X",
+      "context": "Detalle breve con el porqué de la relación",
+      "flags": ["psicologico", "transaccional"]
     }
   ]
 }`
@@ -405,16 +452,18 @@ Formato JSON esperado:
                     triplets = graphData.triplets || [];
                     console.log(`🕸️ [GraphRAG] Extraídos ${triplets.length} triplets para ${remoteId}.`);
 
-                    // 3. Inserción Automática del Grafo para este contacto
+                    // 3. Inserción Automática del Grafo para este contacto (V4)
                     for (const t of triplets) {
-                        await upsertKnowledgeNode(clientId, t.source, t.source_type, "Entidad extraída.");
+                        await upsertKnowledgeNode(clientId, t.source, t.source_type, t.context || "Entidad extraída.");
                         await upsertKnowledgeNode(clientId, t.target, t.target_type, t.context || "Entidad extraída.");
-                        await supabase.from('knowledge_edges').insert({
-                            client_id: clientId,
-                            source_node: t.source,
-                            relation_type: t.relation,
-                            target_node: t.target,
-                            context: t.context
+                        
+                        await supabase.rpc('upsert_knowledge_edge_v4', {
+                            p_client_id: clientId,
+                            p_source_node: t.source,
+                            p_target_node: t.target,
+                            p_relation_type: t.relation,
+                            p_context: t.context,
+                            p_flags: t.flags || []
                         });
                     }
 
@@ -573,6 +622,96 @@ Formato JSON esperado:
 
 
 
+/**
+ * THE DREAM CYCLE: Descubrimiento de Conocimiento Latente.
+ * Se ejecuta en periodos de baja actividad (ej: noche) para "meditar" sobre las memorias
+ * y encontrar conexiones que no son evidentes en el procesamiento en tiempo real.
+ */
+async function dreamCycle(clientId) {
+    try {
+        console.log(`🌙 [DreamCycle] Iniciando meditación para: ${clientId}`);
+
+        // 1. Obtener una muestra del Grafo actual
+        const { data: nodes } = await supabase.from('knowledge_nodes').select('entity_name, entity_type').eq('client_id', clientId).limit(50);
+        const { data: edges } = await supabase.from('knowledge_edges').select('source_node, relation_type, target_node').eq('client_id', clientId).limit(50);
+
+        // 2. Obtener memorias recientes densas
+        const { data: recentMemories } = await supabase
+            .from('user_memories')
+            .select('content')
+            .eq('client_id', clientId)
+            .order('created_at', { ascending: false })
+            .limit(10);
+
+        if (!nodes?.length || !recentMemories?.length) return;
+
+        const dreamPrompt = `Eres el Subconsciente Analítico de OpenClaw. Tu función es el "Descubrimiento Latente".
+Vas a meditar sobre el Grafo de Conocimiento y las memorias recientes para encontrar conexiones OCULTAS o deducciones lógicas de Nivel 2.
+
+GRAFO ACTUAL (MUESTRA):
+Nodos: ${nodes.map(n => n.entity_name).join(', ')}
+Relaciones: ${edges.map(e => `${e.source_node} --[${e.relation_type}]--> ${e.target_node}`).join('; ')}
+
+MEMORIAS RECIENTES:
+${recentMemories.map(m => m.content).join('\n---\n')}
+
+TAREA (MEDITACIÓN NIVEL 3):
+1. Encuentra conexiones LATENTES (deducciones de segundo nivel).
+2. Detecta CONFLICTOS (si un hecho nuevo contradice uno viejo).
+3. Identifica OPORTUNIDADES (ej: "A necesita X y B ofrece X").
+4. Genera RAZONAMIENTO profundo.
+
+Responde JSON:
+{
+  "latent_connections": [
+    { 
+      "source": "Sujeto", 
+      "relation": "RELACION", 
+      "target": "Objeto", 
+      "reasoning": "Por qué has deducido esto",
+      "confidence": 0-1,
+      "flags": ["deduccion", "oportunidad"]
+    }
+  ],
+  "conflicts_detected": [
+    { "entity": "Sujeto", "conflict": "Descripción del choque" }
+  ]
+}`;
+
+        const response = await groq.chat.completions.create({
+            model: 'llama-3.3-70b-versatile',
+            messages: [{ role: 'system', content: dreamPrompt }],
+            response_format: { type: 'json_object' },
+            temperature: 0.4
+        });
+
+        const discovery = parseLLMJson(response.choices[0].message.content);
+
+        if (discovery.latent_connections?.length > 0) {
+            console.log(`🌙 [DreamCycle] ¡Se han descubierto ${discovery.latent_connections.length} conexiones latentes!`);
+            for (const conn of discovery.latent_connections) {
+                if (conn.confidence < 0.6) continue; // Filtrar deducciones debiles
+
+                await upsertKnowledgeNode(clientId, conn.source, 'ENTITY', 'Deducido en Dream Cycle');
+                await upsertKnowledgeNode(clientId, conn.target, 'ENTITY', 'Deducido en Dream Cycle');
+                
+                await supabase.rpc('upsert_knowledge_edge_v4', {
+                    p_client_id: clientId,
+                    p_source_node: conn.source,
+                    p_target_node: conn.target,
+                    p_relation_type: conn.relation,
+                    p_context: `Deducción: ${conn.reasoning}`,
+                    p_flags: conn.flags || ['dream_cycle']
+                });
+                console.log(`   ✨ Deducción: ${conn.source} ${conn.relation} ${conn.target} (${conn.reasoning})`);
+            }
+        }
+
+    } catch (e) {
+        console.error(`🌙 [DreamCycle] Error en la meditación:`, e.message);
+    }
+}
+
 // === MAIN: REDIS EVENT LISTENER ===
 async function main() {
     console.log('🚀 Worker de Memoria en Tiempo Real ONLINE');
@@ -604,6 +743,15 @@ async function main() {
     // ══════════════════════════════════════════════════════════
     // 6. FORMAL SCHEDULING (node-cron)
     // ══════════════════════════════════════════════════════════
+
+    // DREAM CYCLE: Diario a las 3:00 AM
+    cron.schedule('0 3 * * *', async () => {
+        console.log('🌙 [Cron] Iniciando Ciclo del Sueño (Dream Cycle)...');
+        const { data: clients } = await supabase.from('user_souls').select('client_id');
+        for (const client of clients) {
+            await dreamCycle(client.client_id);
+        }
+    });
 
     // Fallback: cada 30 min, procesar clientes que puedan haberse escapado
     cron.schedule('*/30 * * * *', async () => {
@@ -663,34 +811,34 @@ async function main() {
 }
 
 // ══════════════════════════════════════════════════════════
-// 4. MEMORY CONSOLIDATION — Every 6 hours, merge old chunks
+// 4. MEMORY CONSOLIDATION (RECURSIVE TEMPORAL NARRATIVE)
 // ══════════════════════════════════════════════════════════
 async function consolidateMemories() {
-    console.log('🧹 [Consolidation] Iniciando consolidación de memorias antiguas...');
+    console.log('🧹 [Consolidation] Iniciando consolidación recursiva de memorias (Infinite Memory)...');
     try {
-        const DAYS_THRESHOLD = 14; // ← Antes: 30 días. Ahora más agresivo.
+        const DAYS_THRESHOLD = 7; // Más agresivo para formar la pirámide rápido
         const cutoffDate = new Date(Date.now() - DAYS_THRESHOLD * 24 * 60 * 60 * 1000).toISOString();
 
-        // Get all clients with old memories
+        // Get old memories (raw chunks and old summaries)
         const { data: oldMemories, error } = await supabase
             .from('user_memories')
             .select('id, client_id, content, metadata, created_at')
             .lt('created_at', cutoffDate)
-            .is('metadata->>consolidated', null) // Not already consolidated
             .order('created_at', { ascending: true })
-            .limit(500);
+            .limit(1000);
 
         if (error || !oldMemories?.length) {
             console.log(`🧹 [Consolidation] ${error ? 'Error: ' + error.message : 'No hay memorias antiguas para consolidar.'}`);
             return;
         }
 
-        // Group by client_id + remoteId
+        // Group by client_id + remoteId + level
         const groups = {};
         for (const mem of oldMemories) {
             const remoteId = mem.metadata?.remoteId || 'unknown';
-            const key = `${mem.client_id}::${remoteId}`;
-            if (!groups[key]) groups[key] = { clientId: mem.client_id, remoteId, memories: [] };
+            const level = mem.metadata?.level || 0; // 0 = raw, 1 = summary, 2 = meta-summary...
+            const key = `${mem.client_id}::${remoteId}::level_${level}`;
+            if (!groups[key]) groups[key] = { clientId: mem.client_id, remoteId, level, memories: [] };
             groups[key].memories.push(mem);
         }
 
@@ -698,46 +846,45 @@ async function consolidateMemories() {
         let deleted = 0;
 
         for (const [key, group] of Object.entries(groups)) {
-            if (group.memories.length < 3) continue; // Not worth consolidating
+            // Need at least 4 items of the same level to justify a higher-level summary
+            if (group.memories.length < 4) continue;
 
-            // Build a text block for summarization
+            const isMeta = group.level > 0;
+            const nextLevel = group.level + 1;
+
             const fullText = group.memories
                 .map(m => m.content)
                 .join('\n---\n')
-                .slice(0, 6000); // Cap to avoid token limits
+                .slice(0, 12000); // Llama-3 8B handles 8k context
 
             try {
+                const systemMsg = isMeta
+                    ? `Eres un Historiador de Datos (Nivel ${nextLevel}). Consolida estos ${group.memories.length} resúmenes pasados en una "Narrativa Temporal". Extrae la evolución de la relación, eventos históricos clave que perduren en el tiempo, y el arco narrativo general. Sé denso en datos.`
+                    : `Eres un sistema de consolidación de memoria (Nivel 1). Dado un conjunto de fragmentos de conversación, genera un resumen conciso que capture temas principales, hechos clave (nombres, fechas, planes), tono y acuerdos tomados.`;
+
                 const summaryResponse = await groq.chat.completions.create({
                     model: 'llama-3.1-8b-instant',
                     messages: [{
                         role: 'system',
-                        content: `Eres un sistema de consolidación de memoria. Dado un conjunto de fragmentos de conversación, genera un resumen conciso que capture:
-1. Los temas principales discutidos
-2. Hechos clave mencionados (nombres, fechas, planes)
-3. El tono y estilo de la conversación
-4. Cualquier decisión o acuerdo tomado
-
-Formato: Resumen narrativo en 2-3 párrafos. Mantén el idioma original. NO añadas comentarios propios.`
+                        content: systemMsg + `\nFormato: Resumen narrativo. Mantén el idioma original. NO añadas comentarios propios.`
                     }, {
                         role: 'user',
-                        content: `Consolida estos ${group.memories.length} fragmentos de conversación con ${group.remoteId}:\n\n${fullText}`
+                        content: `Consolida estos fragmentos de ${group.remoteId}:\n\n${fullText}`
                     }],
                     temperature: 0.2,
-                    max_tokens: 500,
+                    max_tokens: 1000,
                 });
 
                 const summary = summaryResponse.choices[0].message.content;
-
-                // Generate embedding for the summary
                 const embedding = await generateEmbedding(summary);
 
-                // Insert consolidated memory
                 const dateStart = group.memories[0].created_at;
                 const dateEnd = group.memories[group.memories.length - 1].created_at;
+                const prefix = isMeta ? `[HISTORIA RECURSIVA L${nextLevel} — ${group.memories.length} resúmenes]` : `[RESUMEN CONSOLIDADO L1 — ${group.memories.length} fragmentos]`;
 
                 await supabase.from('user_memories').insert({
                     client_id: group.clientId,
-                    content: `[RESUMEN CONSOLIDADO — ${group.memories.length} fragmentos]\n${summary}`,
+                    content: `${prefix}\n${summary}`,
                     sender: 'system_consolidation',
                     embedding: embedding,
                     content_hash: crypto.createHash('sha256').update(`consolidated:${key}:${dateStart}:${dateEnd}`).digest('hex'),
@@ -747,24 +894,23 @@ Formato: Resumen narrativo en 2-3 párrafos. Mantén el idioma original. NO aña
                         dateStart,
                         dateEnd,
                         consolidated: true,
-                        originalCount: group.memories.length,
-                        chunkSize: group.memories.length,
+                        level: nextLevel,
+                        originalCount: group.memories.length
                     }
                 });
 
-                // Delete original old memories
                 const idsToDelete = group.memories.map(m => m.id);
                 await supabase.from('user_memories').delete().in('id', idsToDelete);
 
                 consolidated++;
                 deleted += idsToDelete.length;
-                console.log(`🧹 [Consolidation] ${group.remoteId.slice(0, 12)}...: ${idsToDelete.length} chunks → 1 resumen`);
+                console.log(`🧹 [Consolidation Level ${nextLevel}] ${group.remoteId.slice(0, 12)}...: ${idsToDelete.length} chunks → 1 Meta-Resumen`);
             } catch (e) {
                 console.warn(`[Consolidation] Error procesando ${key}:`, e.message);
             }
         }
 
-        console.log(`✅ [Consolidation] ${consolidated} grupos consolidados, ${deleted} chunks eliminados.`);
+        console.log(`✅ [Consolidation] ${consolidated} grupos consolidados (Recursivo), ${deleted} chunks eliminados.`);
     } catch (err) {
         console.error('[Consolidation] Error general:', err.message);
     }
