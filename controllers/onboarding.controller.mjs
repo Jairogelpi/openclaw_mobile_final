@@ -9,13 +9,19 @@ import groq from '../services/groq.mjs';
 import { encrypt } from '../security.mjs';
 
 // --- Soul Completeness Validator ---
-function soulIsComplete(soul) {
+// Tracks retry attempts to prevent infinite correction loops
+let extractionRetries = {};
+
+function soulIsComplete(soul, clientId) {
     const missing = [];
 
+    // Only flag truly placeholder values, NOT legitimate data that happens to contain common words
     const isPending = (val) => {
         if (!val) return true;
-        const str = String(val);
-        return str.includes('[') || str.includes('Pendiente') || str.includes('detalle') || str.includes('resumen');
+        const str = String(val).trim();
+        if (str.length === 0) return true;
+        // Only match exact placeholder patterns, not substrings in valid data
+        return str === '[Pendiente]' || str === 'Pendiente' || str === 'N/A' || str === 'No especificado' || str.startsWith('[') && str.endsWith(']');
     };
 
     // A. Identidad Básica
@@ -29,10 +35,10 @@ function soulIsComplete(soul) {
 
     // C. Hobbies y Propósito
     if (isPending(soul.perfil?.hobbies_usuario)) missing.push('hobbies_y_pasiones');
-    if (isPending(soul.perfil?.proposito) || soul.perfil.proposito?.length < 10) missing.push('proposito_de_vida_o_meta');
+    if (isPending(soul.perfil?.proposito)) missing.push('proposito_de_vida_o_meta');
 
     // D. Sustancia y Valores
-    if (isPending(soul.perfil?.sustancia?.filosofia_vida) || soul.perfil.sustancia.filosofia_vida?.length < 15) missing.push('filosofia_de_vida');
+    if (isPending(soul.perfil?.sustancia?.filosofia_vida)) missing.push('filosofia_de_vida');
 
     // E. Estilo de Comunicación y Zonas Rojas
     if (isPending(soul.perfil?.estilo_escritura?.estilo_que_odia)) missing.push('estilo_de_comunicacion_que_odia');
@@ -42,15 +48,28 @@ function soulIsComplete(soul) {
     // F. Herramientas y Rutina
     if (!soul.perfil?.herramientas || soul.perfil.herramientas.length === 0 || isPending(soul.perfil.herramientas[0])) missing.push('herramientas_clave');
     if (isPending(soul.perfil?.disponibilidad?.horario_pico)) missing.push('horario_de_productividad');
-    if (isPending(soul.perfil?.rutina) || soul.perfil.rutina?.length < 20) missing.push('rutina_diaria_detallada');
+    if (isPending(soul.perfil?.rutina)) missing.push('rutina_diaria_detallada');
 
-    // G. Resumen Narrativo (El nucleo del alma)
-    if (isPending(soul.resumen_narrativo) || soul.resumen_narrativo?.length < 100) missing.push('resumen_narrativo_denso');
+    // G. Resumen Narrativo (El nucleo del alma) — must exist and be reasonably long
+    if (isPending(soul.resumen_narrativo) || (soul.resumen_narrativo && soul.resumen_narrativo.length < 80)) missing.push('resumen_narrativo_denso');
+
+    // --- SAFETY NET: Max 3 retries per client to prevent infinite loops ---
+    if (clientId) {
+        extractionRetries[clientId] = (extractionRetries[clientId] || 0) + 1;
+        if (extractionRetries[clientId] > 3 && missing.length > 0) {
+            console.warn(`[Génesis] ⚠️ Max retries (${extractionRetries[clientId]}) alcanzados para ${clientId}. Forzando completado con ${missing.length} campos faltantes: ${missing.join(', ')}`);
+            delete extractionRetries[clientId];
+            return { complete: true, missing: [] };
+        }
+    }
 
     if (missing.length > 0) {
         console.warn(`[Génesis] ⚠️ Soul incompleto (${missing.length} vacíos): ${missing.join(', ')}`);
         return { complete: false, missing };
     }
+
+    // Reset retries on success
+    if (clientId) delete extractionRetries[clientId];
     return { complete: true, missing: [] };
 }
 
@@ -206,9 +225,10 @@ ESTÁ ESTRICTAMENTE PROHIBIDO GENERAR CÓDIGO JSON O RESÚMENES LARGOS. Solo des
             const EXTRACTION_PROMPT = `Eres un extractor de datos JSON analítico y perspicaz. Analiza el historial de Onboarding y extrae la identidad del usuario.
 
 REGLAS DE ORO DE EXTRACCIÓN:
-1. NO INVENTES DATOS: Si algo no está explícito, usa "[Pendiente]".
-2. INFERENCIA DE ESTILO: Analiza el historial para determinar el vocabulario (técnico, coloquial), uso de emojis (frecuente, nulo) y quirks (tics lingüísticos). NO dejes esto en pendiente si hay mensajes del usuario.
-3. RESUMEN NARRATIVO: Debe ser un bloque DENSO de 3-4 párrafos en segunda persona. Debe sonar como la biografía de una persona real, no una lista de puntos. Úsalo como el manual de instrucciones para que la futura IA sepa exactamente quién es este usuario.
+1. DATOS FALTANTES vs DEDUCCIÓN: NO uses "[Pendiente]" si hay información suficiente para deducirlo orgánicamente.
+2. INFERENCIA DE ESTILO (¡CRÍTICO!): Para los campos 'uso_emojis', 'vocabulario' y 'quirks', MÍDIA ESTRICTAMENTE cómo escribe el usuario en sus mensajes. ¡ESTÁ ROTUNDAMENTE PROHIBIDO usar "[Pendiente]" en estos tres campos! Si el usuario no tiene tics, escribe "Ninguno". Si no usa emojis, escribe "No aplica".
+3. RESPUESTAS NEGATIVAS: Si el usuario dice explícitamente que NO tiene rutina, NO tiene herramientas, o NO odia ningún estilo de comunicación, DEBES escribir "Ninguno" o "No aplica". ¡JAMÁS uses "[Pendiente]" si el usuario ya respondió a la pregunta negativamente!
+4. RESUMEN NARRATIVO: Debe ser un bloque DENSO de 3-4 párrafos en segunda persona. Debe sonar como la biografía de una persona real, no una lista de puntos.
 
 Formato requerido estricto:
 {
@@ -245,7 +265,7 @@ Formato requerido estricto:
             console.log(`[Génesis] 🧠 Soul Extraído para ${clientSlug}:`, JSON.stringify(soulJson, null, 2));
 
             // --- AUTO-VERIFICATION: Ensure soul has all 9 fields before creating ---
-            const { complete, missing } = soulIsComplete(soulJson);
+            const { complete, missing } = soulIsComplete(soulJson, clientId);
             if (!complete) {
                 console.log(`[Génesis] 🔄 Identidad extraída incompleta. Faltan: ${missing.join(', ')}. Generando pregunta transparente...`);
 
@@ -310,6 +330,14 @@ Ignora tu intento de despedida. Actúa con tu personalidad elegida y haz una sol
 
                 // === CREAR ARCHIVOS FÍSICOS ===
                 console.log(`🛠️[Provisioning] Iniciando para ${clientSlug}...`);
+
+                // Ensure the client directory exists to avoid ENOENT crashes
+                try {
+                    await fs.mkdir(clientDir, { recursive: true });
+                } catch (err) {
+                    if (err.code !== 'EEXIST') throw err;
+                }
+
                 const soulMd = `# Identidad\nEres ${soulJson.nombre}.${soulJson.tono} \n\n# Situación: ${soulJson.perfil?.ocupacion?.situacion || 'N/A'}\n\n# Directrices\n${(soulJson.perfil?.directrices || []).map(d => `- ${d}`).join('\n')} `;
                 await fs.writeFile(`${clientDir}/SOUL.md`, encrypt(soulMd));
 

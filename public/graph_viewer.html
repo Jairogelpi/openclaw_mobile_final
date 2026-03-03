@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OpenClaw - Neural Graph Viewer</title>
+    <!-- 3D Force Graph Library -->
+    <script src="https://unpkg.com/3d-force-graph"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            background-color: #000010;
+            color: #fff;
+            font-family: 'Space Grotesk', sans-serif;
+            overflow: hidden;
+        }
+
+        #3d-graph {
+            width: 100vw;
+            height: 100vh;
+        }
+
+        #hud {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            z-index: 10;
+            background: rgba(0, 0, 20, 0.8);
+            padding: 20px;
+            border-radius: 12px;
+            border: 1px solid rgba(0, 255, 255, 0.2);
+            backdrop-filter: blur(10px);
+            box-shadow: 0 4px 30px rgba(0, 255, 255, 0.1);
+            max-width: 350px;
+        }
+
+        h1 {
+            margin: 0 0 10px 0;
+            font-size: 24px;
+            color: #0df;
+            text-transform: uppercase;
+            letter-spacing: 2px;
+        }
+
+        p {
+            margin: 0 0 15px 0;
+            font-size: 14px;
+            color: #88a;
+            line-height: 1.5;
+        }
+
+        .stat {
+            display: flex;
+            justify-content: space-between;
+            margin-bottom: 8px;
+            font-size: 13px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
+            padding-bottom: 4px;
+        }
+
+        .stat-val {
+            color: #0df;
+            font-weight: bold;
+        }
+
+        #node-info {
+            margin-top: 20px;
+            display: none;
+            background: rgba(0, 255, 255, 0.1);
+            padding: 15px;
+            border-radius: 8px;
+            border-left: 3px solid #0df;
+        }
+
+        #node-name {
+            font-size: 18px;
+            font-weight: bold;
+            color: #fff;
+            margin-bottom: 5px;
+        }
+
+        #node-type {
+            font-size: 11px;
+            text-transform: uppercase;
+            color: #0df;
+            margin-bottom: 10px;
+            display: inline-block;
+            background: rgba(0, 255, 255, 0.2);
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+
+        #node-desc {
+            font-size: 13px;
+            color: #aaa;
+        }
+
+        .loading {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 24px;
+            color: #0df;
+            letter-spacing: 4px;
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0% {
+                opacity: 0.5;
+            }
+
+            50% {
+                opacity: 1;
+                text-shadow: 0 0 20px #0df;
+            }
+
+            100% {
+                opacity: 0.5;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div id="hud">
+        <h1>Neural Graph</h1>
+        <p>Visualización semántica en tiempo real del Cerebro RAG.</p>
+        <div class="stat"><span>Nodos Entendidos</span> <span class="stat-val" id="count-nodes">...</span></div>
+        <div class="stat"><span>Conexiones (Sinapsis)</span> <span class="stat-val" id="count-edges">...</span></div>
+        <div class="stat"><span>Cliente ID</span> <span class="stat-val" id="client-id"
+                style="font-size:10px; word-break: break-all;">...</span></div>
+
+        <div id="node-info">
+            <div id="node-name">Sujeto</div>
+            <div id="node-type">TIPO</div>
+            <div id="node-desc">Descripción del nodo.</div>
+        </div>
+    </div>
+
+    <div id="loading" class="loading">ESTABLECIENDO ENLACE NEURAL...</div>
+    <div id="3d-graph"></div>
+
+    <script>
+        const clientId = window.location.pathname.split('/').pop();
+        document.getElementById('client-id').innerText = clientId;
+
+        async function init() {
+            try {
+                const response = await fetch(`/api/graph-data/${clientId}`);
+                const data = await response.json();
+
+                document.getElementById('loading').style.display = 'none';
+                document.getElementById('count-nodes').innerText = data.nodes.length;
+                document.getElementById('count-edges').innerText = data.links.length;
+
+                const nodeInfo = document.getElementById('node-info');
+                const nodeName = document.getElementById('node-name');
+                const nodeType = document.getElementById('node-type');
+                const nodeDesc = document.getElementById('node-desc');
+
+                // Graph Configuration
+                const Graph = ForceGraph3D()
+                    (document.getElementById('3d-graph'))
+                    .graphData(data)
+                    .nodeLabel('id')
+                    .nodeColor(node => {
+                        if (node.id === 'Usuario' || node.id === 'Yo') return '#ff0055'; // The core
+                        if (node.type === 'PERSONA') return '#00ddff';
+                        if (node.type === 'LOCATION') return '#ffaa00';
+                        if (node.type === 'CONCEPT') return '#aa00ff';
+                        return '#ffffff';
+                    })
+                    .nodeRelSize(5)
+                    .linkColor(() => 'rgba(0, 255, 255, 0.2)')
+                    .linkWidth(link => link.weight || 1)
+                    .linkDirectionalParticles(2)
+                    .linkDirectionalParticleWidth(2)
+                    .linkDirectionalParticleSpeed(d => 0.005)
+                    .onNodeClick(node => {
+                        // Focus on node
+                        const distance = 100;
+                        const distRatio = 1 + distance / Math.hypot(node.x, node.y, node.z);
+                        Graph.cameraPosition(
+                            { x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio },
+                            node,
+                            3000
+                        );
+
+                        // Update HUD
+                        nodeInfo.style.display = 'block';
+                        nodeName.innerText = node.id;
+                        nodeType.innerText = node.type || 'ENTITY';
+                        nodeDesc.innerText = node.description || 'Sin descripción adicional.';
+                    })
+                    .onBackgroundClick(() => {
+                        nodeInfo.style.display = 'none';
+                    });
+
+                // Auto-spin camera
+                let angle = 0;
+                setInterval(() => {
+                    Graph.cameraPosition({
+                        x: 400 * Math.sin(angle),
+                        z: 400 * Math.cos(angle)
+                    });
+                    angle += Math.PI / 1000;
+                }, 20);
+
+            } catch (error) {
+                console.error("Error cargando grafo:", error);
+                document.getElementById('loading').innerText = "ERROR AL CONECTAR AL CEREBRO";
+                document.getElementById('loading').style.color = "#ff0055";
+            }
+        }
+
+        init();
+    </script>
+</body>
+
+</html>

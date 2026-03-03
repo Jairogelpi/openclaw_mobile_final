@@ -73,38 +73,61 @@ async function autonomousDistillation(clientId, clientSlug, messages) {
             model: 'llama-3.3-70b-versatile',
             messages: [{
                 role: 'system',
-                content: `Eres el Arquitecto de Identidad de OpenClaw. Analiza esta conversación.
-                
-                SOUL ACTUAL:
-                ${JSON.stringify(currentSoul)}
-                
-                CONVERSACIÓN:
-                ${textBlock}
-                
-                INSTRUCCIONES:
-                1. "soul_patch": Hechos directos (Preferencias, nombres, metas).
-                2. "triplets": Relaciones [Sujeto, Predicado, Objeto].
-                3. "style_profile": ANALIZA SOLO LOS MENSAJES DE 'user_sent'.
-                   - "common_emojis": Lista de emojis que el usuario usa frecuentemente.
-                   - "tone": (e.g., informal, sarcástico, seco, entusiasta).
-                   - "slang_and_vocabulary": Palabras o frases únicas que repite.
-                   - "punctuation_style": (e.g., "no usa mayúsculas", "usa muchos puntos suspensivos").
-                   - "message_length": (e.g., "muy corto/directo", "párrafos largos").
-                   - "casing_and_formatting": (e.g., "todo minúsculas", "usa negritas").
-                
-                Responde SOLO JSON:
-                {
-                  "soul_patch": {},
-                  "triplets": [],
-                  "style_profile": {
-                    "common_emojis": [],
-                    "tone": "",
-                    "slang_and_vocabulary": [],
-                    "punctuation_style": "",
-                    "message_length": "",
-                    "casing_and_formatting": ""
-                  }
-                }`
+                content: `Eres el Arquitecto Cognitivo OMNISCIENTE de un clúster de Inteligencia Artificial Avanzada. 
+Misión: Extraer absolutamente TODOS los matices posibles de esta conversación para construir un "Cerebro Gemelo Digital" (Clone) hiper-realista del usuario.
+
+SOUL ACTUAL (Contexto Base Acumulado):
+${JSON.stringify(currentSoul)}
+
+TRAZA DE CONVERSACIÓN (Mensajes recientes):
+${textBlock}
+
+PROTOCOLOS DE EXTRACCIÓN (NIVEL GOD-TIER):
+
+1. "soul_patch": Actualiza o añade hechos duros, pero escanea estratos profundos:
+   - Creencias fundamentales y Axiomas Filosóficos del usuario.
+   - Matrices de decisión (¿Cómo procesa los problemas? ¿Se guía por lógica rígida o emoción irracional?).
+   - Aversiones (pet peeves) y pasiones ocultas.
+   - Puntos ciegos cognitivos o sesgos detectados observados en el texto.
+
+2. "triplets": Arquitectura GraphRAG de Nivel 3. 
+   - No extraigas solo hechos simples ("X es lugar"). 
+   - Extrae matices viscerales: "Fulano [TIENE_TENSION_CON] Mengano". "Concepto_X [CAUSA_ESTRES_A] Usuario".
+
+3. "style_profile": DECONSTRUCCIÓN LINGÜÍSTICO-PSICOLÓGICA. Analiza 'user_sent' con precisión milimétrica:
+   - "core_humor_framework": Identifica sarcasmo, ironía, absurdo, humor negro, humor inocente, shitposting.
+   - "syntactic_complexity": Valor (0.0 a 1.0) y descripción estructural.
+   - "emotional_baseline_valence": Valencia emocional (-1.0 a 1.0) y Tono Dominante constante.
+   - "formality_variance": Rango de formalidad y gatillos (qué temas le hacen hablar formal vs grosero).
+   - "common_emojis": Uso táctico, irónico o literal de emojis (y cuáles son).
+   - "slang_and_vocabulary": El lexicon único, barbarismos, localismos, jergas de nicho de internet o vida real.
+   - "rhythm_and_pacing": Ráfagas, bloques monolíticos explicativos, tiempos de pausa.
+   - "punctuation_signature": Manias puras (ausencia total de mayúsculas, elipsis dramáticas, exclamaciones hiperbólicas).
+   - "conflict_resolution_style": Si hay discusiones, ¿es evasivo, confrontacional, diplomático, pasivo-agresivo?
+
+Responde ÚNICA Y EXCLUSIVAMENTE con el siguiente objeto JSON estricto (combina el perfil completo actualizado con el nuevo conocimiento):
+{
+  "soul_patch": {
+    "axiomas_filosoficos": ["..."],
+    "matrices_decision": ["..."],
+    "sesgos_cognitivos": ["..."],
+    "hechos_y_preferencias_duras": ["..."]
+  },
+  "triplets": [
+    ["Sujeto", "PREDICADO_RELACIONAL_COMPLEJO", "Objeto"]
+  ],
+  "style_profile": {
+    "core_humor_framework": "",
+    "conflict_resolution_style": "",
+    "syntactic_complexity_score": 0.0,
+    "emotional_baseline_valence": 0.0,
+    "formality_variance": "",
+    "common_emojis": [],
+    "slang_and_vocabulary": [],
+    "rhythm_and_pacing": "",
+    "punctuation_signature": ""
+  }
+}`
             }],
             response_format: { type: 'json_object' },
             temperature: 0.1
@@ -176,7 +199,10 @@ async function distillAndVectorize(clientId) {
     // 0. ADQUIRIR CANDADO ATÓMICO (Evita condiciones de carrera e hiperescalado de costes)
     // 0. BLOQUEO ATÓMICO (Phase 11: Idempotency)
     // Usamos RPC de Supabase para evitar que varios workers procesen al mismo cliente simultáneamente
-    const { data: lockAcquired, error: lockErr } = await supabase.rpc('acquire_worker_lock', { target_client_id: clientId });
+    const { data: lockAcquired, error: lockErr } = await supabase.rpc('acquire_worker_lock', {
+        p_client_id: clientId,
+        p_expiry_minutes: 30
+    });
 
     if (lockErr || !lockAcquired) {
         console.log(`[Worker] 🔒 Cliente ${clientId} bloqueado por otro proceso. Saltando.`);
@@ -184,7 +210,6 @@ async function distillAndVectorize(clientId) {
     }
 
     try {
-        const clientSlug = await getClientSlugFromDB(clientId);
         console.log(`🧠 [Process] Despertando proceso para ${clientSlug}...`);
 
         // 1. Obtener mensajes sin procesar
@@ -208,19 +233,34 @@ async function distillAndVectorize(clientId) {
         const conversations = {};
         messages.forEach(m => {
             if (!conversations[m.remote_id]) {
+                const fallbackName = m.remote_id ? m.remote_id.split('@')[0] : 'Desconocido';
+                const initialSender = (m.sender_role === 'Historial' || m.sender_role === 'user_sent')
+                    ? (m.metadata?.pushName || fallbackName)
+                    : m.sender_role;
+
                 conversations[m.remote_id] = {
                     messages: [],
-                    lastSender: m.sender_role,
+                    lastSender: initialSender,
                     lastText: m.content,
-                    avatarUrl: m.metadata?.avatarUrl || null // Extraer avatar del primer mensaje
+                    avatarUrl: m.metadata?.avatarUrl || null,
+                    firstMessageTime: m.created_at,
+                    lastMessageTime: m.created_at
                 };
             }
             conversations[m.remote_id].messages.push(`${m.sender_role}: ${m.content}`);
-            conversations[m.remote_id].lastSender = m.sender_role;
+
+            // Actualizar nombre realista si está disponible
+            if (m.sender_role !== 'Historial' && m.sender_role !== 'user_sent') {
+                conversations[m.remote_id].lastSender = m.sender_role;
+            } else if (m.metadata?.pushName) {
+                conversations[m.remote_id].lastSender = m.metadata.pushName;
+            }
+
             conversations[m.remote_id].lastText = m.content;
             if (m.metadata?.avatarUrl) {
                 conversations[m.remote_id].avatarUrl = m.metadata.avatarUrl; // Actualizar con el más reciente
             }
+            conversations[m.remote_id].lastMessageTime = m.created_at;
         });
 
         for (const [remoteId, conv] of Object.entries(conversations)) {
@@ -232,10 +272,12 @@ async function distillAndVectorize(clientId) {
                     messages: [
                         {
                             role: 'system',
-                            content: `Eres un sintetizador de inteligencia de alto nivel. 
-Tu tarea es capturar la ESENCIA de una conversación en un "Blink Summary" de máximo 12 palabras.
-Debe sonar sofisticado, minimalista y boutique. No uses frases genéricas como "El usuario pregunta sobre...". 
-Ve directo al grano con elegancia.`
+                            content: `Eres un sintetizador ultra-preciso de OpenClaw. Analizas una conversación de WhatsApp y extraes un TITULAR descriptivo de MÁXIMO 10 PALABRAS.
+REGLAS ESTRICTAS:
+1. NUNCA uses frases como "El usuario...", "La conversación trata...", "El resumen es...".
+2. ACTÚA COMO UN ASISTENTE EJECUTIVO que anota un recordatorio en una agenda.
+3. EJEMPLOS BUENOS: "Confirmación de cita médica para el martes", "Coordinando pago de factura pendiente", "Intercambio de bromas informales".
+4. DEVUELVE SOLO EL TEXTO DEL RESUMEN, SIN COMILLAS NI PREÁMBULOS.`
                         },
                         { role: 'user', content: `CONVERSACIÓN:\n${conv.messages.join('\n')}` }
                     ]
@@ -253,6 +295,8 @@ Ve directo al grano con elegancia.`
                     contact_name: isGroup ? null : (conv.lastSender.startsWith('[Grupo]') ? null : conv.lastSender),
                     group_name: isGroup ? conv.lastSender.replace('[Grupo] ', '') : null,
                     avatar_url: conv.avatarUrl,
+                    first_message_time: conv.firstMessageTime,
+                    last_message_time: conv.lastMessageTime,
                     is_unread: true,
                     last_updated: new Date().toISOString()
                 }, { onConflict: 'client_id, conversation_id' });
@@ -271,19 +315,25 @@ Ve directo al grano con elegancia.`
                         messages: [
                             {
                                 role: 'system',
-                                content: `Eres un analista de perfiles psicológicos. 
-Analiza esta conversación de WhatsApp entre "Usuario" (el dueño de la cuenta) y su contacto.
-Tu tarea es extraer un JSON con el "tono" y "dinámica" de ESTA relación específica.
+                                content: `Eres un motor algorítmico de perfilado psico-lingüístico.
+Procesa esta traza de comunicación y extrae una radiografía analítica (JSON) de la relación.
 
-Campos requeridos en el JSON:
-- formalidad (ej: "muy informal", "profesional", "respetuoso")
-- tono (ej: "bromista", "cariñoso", "cortante", "amigable")
-- largo_mensajes (ej: "cortos y rápidos", "párrafos largos")
-- emojis (ej: "usa muchos emojis", "casi nulo")
-- relacion_detectada (ej: "amigo cercano", "colega de trabajo", "familiar", "desconocido")
-- muletillas (lista de arrays con palabras repetidas del usuario. ej: ["jaja", "wey", "tipo"])
+REGLAS DE ORO:
+1. SOLO JSON VÁLIDO. Cero texto auxiliar, cero excusas.
+2. Basado 100% en evidencia matemática de la conversación (longitud de strings, varianza de tiempos, lexicon).
 
-Devuelve SOLO EL JSON y nada más.`
+ESTRUCTURA OBLIGATORIA DEL JSON:
+{
+  "affinity_score": <1-100, float>,
+  "formality_index": <1-100, float>,
+  "lexical_diversity": "alta|media|baja",
+  "average_latency_sec": <float o null>,
+  "power_dynamic": "simetrica|usuario_dominante|contacto_dominante",
+  "emotional_valence": <float entre -1.0 y 1.0>,
+  "recurrent_patterns": ["patron1", "patron2"],
+  "relationship_classification": "string_exacto",
+  "technical_summary": "Análisis conciso de 15 palabras max."
+}`
                             },
                             { role: 'user', content: `CONVERSACIÓN:\n${conv.messages.join('\n')}` }
                         ],
@@ -514,7 +564,10 @@ Formato JSON esperado:
         console.error(`❌ [Process] Error para ${clientId}:`, err.message);
     } finally {
         // LIBERAR BLOQUEO
-        await supabase.rpc('release_worker_lock', { target_client_id: clientId }).catch(() => { });
+        const { error: releaseErr } = await supabase.rpc('release_worker_lock', { target_client_id: clientId });
+        if (releaseErr) {
+            console.error(`[Worker] Error releasing lock for ${clientId}:`, releaseErr.message);
+        }
     }
 }
 

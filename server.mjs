@@ -75,6 +75,55 @@ import { authenticate, strictAuth, authenticateToken } from './middlewares/auth.
 
 
 /**
+ * NEURAL GRAPH VIEWER (GraphRAG Visualization)
+ */
+app.get('/graph/:clientId', (req, res) => {
+    res.sendFile(path.join(process.cwd(), 'public', 'graph_viewer.html'));
+});
+
+app.get('/api/graph-data/:clientId', async (req, res) => {
+    try {
+        const { clientId } = req.params;
+
+        // Fetch Nodes
+        const { data: nodesData, error: nodesErr } = await supabase
+            .from('knowledge_nodes')
+            .select('entity_name, entity_type, description')
+            .eq('client_id', clientId);
+
+        // Fetch Edges
+        const { data: edgesData, error: edgesErr } = await supabase
+            .from('knowledge_edges')
+            .select('source_node, target_node, relation_type')
+            .eq('client_id', clientId);
+
+        if (nodesErr || edgesErr) {
+            console.error('[Graph-API] DB Error:', nodesErr || edgesErr);
+            return res.status(500).json({ error: 'DB Error' });
+        }
+
+        // Format for 3d-force-graph
+        const graphData = {
+            nodes: (nodesData || []).map(n => ({
+                id: n.entity_name,
+                name: n.entity_name,
+                type: n.entity_type,
+                description: n.description
+            })),
+            links: (edgesData || []).map(e => ({
+                source: e.source_node,
+                target: e.target_node,
+                name: e.relation_type
+            }))
+        };
+
+        res.json(graphData);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+/**
  * RPC GATEWAY
  */
 app.post('/rpc', async (req, res) => {
@@ -503,6 +552,48 @@ httpServer.listen(PORT, '0.0.0.0', async () => {
     } catch (e) {
         console.error(`[Debug] ❌ Failed to start ${debugClientSlug}:`, e.message);
     }
+
+    // --- 🧹 GARBAGE COLLECTOR (Self-Healing) ---
+    // Runs every 15 minutes to forcefully delete physical folders that no longer exist in Supabase DB
+    // This bypasses the limitations of PostgreSQL cascaded delete triggers bypassing Webhooks.
+    const runGarbageCollector = async () => {
+        try {
+            const { data: activeUsers, error } = await supabase.from('user_souls').select('slug');
+            if (error || !activeUsers) throw error;
+
+            const activeSlugs = activeUsers.map(u => u.slug).filter(Boolean);
+
+            // Revisa carpetas físicas
+            const clientsPath = path.resolve('./clients');
+            let directories;
+            try {
+                directories = await fs.readdir(clientsPath, { withFileTypes: true });
+            } catch (readErr) {
+                // clients folder doesn't exist yet
+                await fs.mkdir(clientsPath, { recursive: true });
+                directories = [];
+            }
+
+            let purged = 0;
+            for (let dirent of directories) {
+                if (dirent.isDirectory()) {
+                    const folderName = dirent.name;
+                    if (!activeSlugs.includes(folderName)) {
+                        console.log(`[GarbageCollector] 🗑️ Carpeta fantasma detectada: ${folderName}. Purging...`);
+                        await fs.rm(path.join(clientsPath, folderName), { recursive: true, force: true });
+                        purged++;
+                    }
+                }
+            }
+            console.log(`[GarbageCollector] ✅ Ciclo completado. DB slugs: ${activeSlugs.length}, Carpetas: ${directories.filter(d => d.isDirectory()).length}, Purgadas: ${purged}`);
+        } catch (e) {
+            console.error('[GarbageCollector] ⚠️ Fallo al recolectar basura de clientes:', e.message);
+        }
+    };
+
+    // Ejecutar inmediatamente al arrancar y luego cada 2 minutos
+    runGarbageCollector();
+    setInterval(runGarbageCollector, 2 * 60 * 1000);
 
     // 5. BRIDGE HEALTH HEARTBEAT (Hourly)
     setInterval(() => {

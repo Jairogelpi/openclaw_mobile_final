@@ -260,7 +260,7 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 sender_role: isSentByMe ? 'user_sent' : (msg.pushName || 'Historial'),
                 content: text,
                 remote_id: senderId,
-                metadata: { historical: true, msgId: msg.key.id },
+                metadata: { historical: true, msgId: msg.key.id, pushName: msg.pushName },
                 created_at: new Date(msg.messageTimestamp * 1000).toISOString()
             });
         }
@@ -334,6 +334,7 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                     const tempFileName = `${clientId}_${crypto.randomBytes(4).toString('hex')}${ext}`;
                     const tempFilePath = `./uploads/${tempFileName}`;
 
+                    await fs.mkdir('./uploads', { recursive: true });
                     await fs.writeFile(tempFilePath, buffer);
 
                     console.log(`[Queue] 📸 Encolando media (${type}) a mediaProcessingQueue para ${clientSlug}...`);
@@ -379,18 +380,33 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
 
             console.log(`[${clientSlug} - ${isSentByMe ? 'Sent' : 'Recv'}]: ${finalText.slice(0, 50)}...`);
 
+            // 👤 Obtener Avatar URL (con caché de 1h)
+            let avatarUrl = null;
+            const cacheKey = `${sessionKey}_${senderId}`;
+            if (profilePicCache.has(cacheKey) && Date.now() - profilePicCache.get(cacheKey).time < 3600000) {
+                avatarUrl = profilePicCache.get(cacheKey).url;
+            } else {
+                try {
+                    avatarUrl = await sock.profilePictureUrl(senderId, 'image');
+                    profilePicCache.set(cacheKey, { url: avatarUrl, time: Date.now() });
+                } catch (e) {
+                    profilePicCache.set(cacheKey, { url: null, time: Date.now() });
+                }
+            }
+
             // INSERTAR EN DB
             const supabase = (await import('../config/supabase.mjs')).default;
             const { error: dbErr } = await supabase.from('raw_messages').insert([{
                 client_id: clientId,
                 sender_role: isSentByMe ? 'user_sent' : pushName,
                 content: finalText,
-                remote_id: senderId,
+                remote_id: senderId, // This acts as conversation/group ID
                 metadata: {
                     pushName,
                     isGroup,
                     hasMedia: !!mediaDescription,
-                    historical: false
+                    historical: false,
+                    avatarUrl
                 }
             }]);
 
@@ -400,11 +416,11 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 console.log(`[${clientSlug}] ✅ Message stored in raw_messages`);
             }
 
-            if (!isSentByMe) {
-                // Notificar al worker de memoria (Amnesia Consolidator)
-                await triggerMemoryTimer(clientId);
+            // Notificar al worker de memoria (Amnesia Consolidator) en cada interacción
+            await triggerMemoryTimer(clientId);
 
-                // Enviar el mensaje al Cortex (Cerebro) a través de la Cola de BullMQ
+            if (!isSentByMe) {
+                // Enviar el mensaje al Cortex (Cerebro) a través de la Cola de BullMQ para auto-respuesta
                 console.log(`[Queue] 📬 Encolando mensaje a incomingMessagesQueue para ${clientSlug}...`);
                 await incomingQueue.add('process_message', {
                     clientId,

@@ -124,6 +124,7 @@ export async function processAttachment(attachment) {
         isTemp = true;
         const base64Data = data.replace(/^data:.*?;base64,/, '');
         localPath = `/tmp/media_${Date.now()}_${filename || 'file'}`;
+        await fs.mkdir('/tmp', { recursive: true }).catch(() => { });
         await fs.writeFile(localPath, Buffer.from(base64Data, 'base64'));
     }
 
