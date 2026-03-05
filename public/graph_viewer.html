@@ -4,14 +4,18 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>OpenClaw - Neural Graph Viewer</title>
-    <!-- 3D Force Graph Library -->
-    <script src="https://unpkg.com/3d-force-graph"></script>
+    <title>OpenClaw - Neural Graph</title>
+    <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/3d-force-graph@1"></script>
     <style>
+        * {
+            box-sizing: border-box;
+        }
+
         body {
             margin: 0;
             padding: 0;
-            background-color: #000010;
+            background: #000010;
             color: #fff;
             font-family: 'Space Grotesk', sans-serif;
             overflow: hidden;
@@ -22,105 +26,320 @@
             height: 100vh;
         }
 
+        /* HUD Panel */
         #hud {
             position: absolute;
             top: 20px;
             left: 20px;
             z-index: 10;
-            background: rgba(0, 0, 20, 0.8);
-            padding: 20px;
-            border-radius: 12px;
-            border: 1px solid rgba(0, 255, 255, 0.2);
-            backdrop-filter: blur(10px);
-            box-shadow: 0 4px 30px rgba(0, 255, 255, 0.1);
-            max-width: 350px;
+            background: rgba(0, 5, 25, 0.85);
+            padding: 24px;
+            border-radius: 16px;
+            border: 1px solid rgba(0, 200, 255, 0.15);
+            backdrop-filter: blur(16px);
+            box-shadow: 0 8px 40px rgba(0, 180, 255, 0.08);
+            max-width: 340px;
+            transition: opacity 0.3s;
+        }
+
+        #hud:hover {
+            border-color: rgba(0, 200, 255, 0.35);
         }
 
         h1 {
-            margin: 0 0 10px 0;
-            font-size: 24px;
+            margin: 0 0 6px 0;
+            font-size: 22px;
             color: #0df;
             text-transform: uppercase;
-            letter-spacing: 2px;
+            letter-spacing: 3px;
+            text-shadow: 0 0 15px rgba(0, 221, 255, 0.4);
         }
 
-        p {
-            margin: 0 0 15px 0;
-            font-size: 14px;
-            color: #88a;
-            line-height: 1.5;
+        .subtitle {
+            margin: 0 0 18px;
+            font-size: 12px;
+            color: #556;
         }
 
         .stat {
             display: flex;
             justify-content: space-between;
-            margin-bottom: 8px;
+            margin-bottom: 6px;
             font-size: 13px;
-            border-bottom: 1px solid rgba(255, 255, 255, 0.1);
-            padding-bottom: 4px;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+            padding-bottom: 5px;
+        }
+
+        .stat-label {
+            color: #88a;
         }
 
         .stat-val {
             color: #0df;
-            font-weight: bold;
+            font-weight: 700;
+            font-size: 15px;
         }
 
+        /* Node Info */
         #node-info {
-            margin-top: 20px;
+            margin-top: 18px;
             display: none;
-            background: rgba(0, 255, 255, 0.1);
-            padding: 15px;
-            border-radius: 8px;
+            background: linear-gradient(135deg, rgba(0, 180, 255, 0.08), rgba(120, 0, 255, 0.06));
+            padding: 16px;
+            border-radius: 10px;
             border-left: 3px solid #0df;
+            animation: fadeIn 0.3s ease;
+        }
+
+        @keyframes fadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(4px);
+            }
+
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
         }
 
         #node-name {
-            font-size: 18px;
-            font-weight: bold;
+            font-size: 17px;
+            font-weight: 700;
             color: #fff;
-            margin-bottom: 5px;
+            margin-bottom: 4px;
         }
 
         #node-type {
-            font-size: 11px;
+            font-size: 10px;
             text-transform: uppercase;
             color: #0df;
-            margin-bottom: 10px;
             display: inline-block;
-            background: rgba(0, 255, 255, 0.2);
-            padding: 2px 6px;
-            border-radius: 4px;
+            background: rgba(0, 200, 255, 0.15);
+            padding: 2px 8px;
+            border-radius: 6px;
+            margin-bottom: 10px;
+            letter-spacing: 1px;
         }
 
         #node-desc {
-            font-size: 13px;
-            color: #aaa;
+            font-size: 12px;
+            color: #99a;
+            line-height: 1.5;
         }
 
+        #node-connections {
+            font-size: 11px;
+            color: #666;
+            margin-top: 8px;
+        }
+
+        /* Edge Info */
+        #edge-label {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            background: rgba(0, 5, 25, 0.9);
+            padding: 10px 20px;
+            border-radius: 10px;
+            border: 1px solid rgba(0, 200, 255, 0.2);
+            font-size: 13px;
+            color: #0df;
+            display: none;
+            z-index: 10;
+            backdrop-filter: blur(10px);
+            text-align: center;
+            max-width: 500px;
+        }
+
+        /* Controls */
+        #controls {
+            position: absolute;
+            bottom: 20px;
+            right: 20px;
+            z-index: 10;
+            display: flex;
+            gap: 8px;
+        }
+
+        .ctrl-btn {
+            background: rgba(0, 5, 25, 0.85);
+            border: 1px solid rgba(0, 200, 255, 0.2);
+            color: #0df;
+            padding: 8px 14px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-family: inherit;
+            font-size: 12px;
+            transition: all 0.2s;
+        }
+
+        .ctrl-btn:hover {
+            background: rgba(0, 200, 255, 0.15);
+            border-color: #0df;
+        }
+
+        .ctrl-btn.active {
+            background: rgba(0, 200, 255, 0.2);
+            border-color: #0df;
+        }
+
+        /* Loading */
         .loading {
             position: absolute;
             top: 50%;
             left: 50%;
             transform: translate(-50%, -50%);
-            font-size: 24px;
+            font-size: 18px;
             color: #0df;
             letter-spacing: 4px;
             animation: pulse 2s infinite;
         }
 
         @keyframes pulse {
-            0% {
+
+            0%,
+            100% {
                 opacity: 0.5;
             }
 
             50% {
                 opacity: 1;
-                text-shadow: 0 0 20px #0df;
+                text-shadow: 0 0 25px #0df;
+            }
+        }
+
+        /* Trace Panel */
+        #trace-panel {
+            position: absolute;
+            top: 20px;
+            right: 20px;
+            width: 380px;
+            max-height: calc(100vh - 40px);
+            background: rgba(0, 5, 25, 0.95);
+            border: 1px solid rgba(0, 200, 255, 0.3);
+            border-radius: 16px;
+            z-index: 100;
+            display: none;
+            flex-direction: column;
+            backdrop-filter: blur(20px);
+            box-shadow: -10px 0 40px rgba(0, 0, 0, 0.5);
+            animation: slideIn 0.4s cubic-bezier(0.16, 1, 0.3, 1);
+        }
+
+        @keyframes slideIn {
+            from {
+                transform: translateX(100%);
+                opacity: 0;
             }
 
-            100% {
-                opacity: 0.5;
+            to {
+                transform: translateX(0);
+                opacity: 1;
             }
+        }
+
+        .trace-header {
+            padding: 20px;
+            border-bottom: 1px solid rgba(0, 200, 255, 0.2);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .trace-title {
+            font-size: 16px;
+            font-weight: 700;
+            color: #0df;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .close-btn {
+            background: none;
+            border: none;
+            color: #556;
+            cursor: pointer;
+            font-size: 24px;
+            line-height: 1;
+        }
+
+        .close-btn:hover {
+            color: #fff;
+        }
+
+        .trace-content {
+            padding: 20px;
+            overflow-y: auto;
+            flex-grow: 1;
+        }
+
+        .timeline-item {
+            position: relative;
+            padding-left: 24px;
+            margin-bottom: 24px;
+            border-left: 1px solid rgba(0, 200, 255, 0.3);
+        }
+
+        .timeline-item::before {
+            content: '';
+            position: absolute;
+            left: -5px;
+            top: 0;
+            width: 9px;
+            height: 9px;
+            background: #0df;
+            border-radius: 50%;
+            box-shadow: 0 0 10px #0df;
+        }
+
+        .timeline-date {
+            font-size: 10px;
+            color: #556;
+            text-transform: uppercase;
+            margin-bottom: 4px;
+        }
+
+        .timeline-rel {
+            font-size: 13px;
+            font-weight: 700;
+            color: #fff;
+            margin-bottom: 2px;
+        }
+
+        .timeline-target {
+            font-size: 12px;
+            color: #0df;
+            margin-bottom: 6px;
+        }
+
+        .timeline-context {
+            font-size: 11px;
+            color: #88a;
+            font-style: italic;
+            background: rgba(0, 0, 0, 0.3);
+            padding: 8px;
+            border-radius: 6px;
+        }
+
+        .trace-btn {
+            margin-top: 15px;
+            width: 100%;
+            background: transparent;
+            border: 1px solid #0df;
+            color: #0df;
+            padding: 10px;
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: bold;
+            transition: all 0.2s;
+            font-family: inherit;
+        }
+
+        .trace-btn:hover {
+            background: rgba(0, 200, 255, 0.1);
+            box-shadow: 0 0 15px rgba(0, 200, 255, 0.3);
         }
     </style>
 </head>
@@ -128,25 +347,99 @@
 <body>
     <div id="hud">
         <h1>Neural Graph</h1>
-        <p>Visualización semántica en tiempo real del Cerebro RAG.</p>
-        <div class="stat"><span>Nodos Entendidos</span> <span class="stat-val" id="count-nodes">...</span></div>
-        <div class="stat"><span>Conexiones (Sinapsis)</span> <span class="stat-val" id="count-edges">...</span></div>
-        <div class="stat"><span>Cliente ID</span> <span class="stat-val" id="client-id"
-                style="font-size:10px; word-break: break-all;">...</span></div>
-
+        <p class="subtitle">Mapa semántico del Cerebro RAG en tiempo real</p>
+        <div class="stat"><span class="stat-label">Nodos Entendidos</span><span class="stat-val"
+                id="count-nodes">...</span></div>
+        <div class="stat"><span class="stat-label">Conexiones (Sinapsis)</span><span class="stat-val"
+                id="count-edges">...</span></div>
+        <div class="stat"><span class="stat-label">Cliente</span><span class="stat-val" id="client-id"
+                style="font-size:10px; word-break:break-all;">...</span></div>
         <div id="node-info">
-            <div id="node-name">Sujeto</div>
-            <div id="node-type">TIPO</div>
-            <div id="node-desc">Descripción del nodo.</div>
+            <div id="node-name"></div>
+            <div id="node-type"></div>
+            <div id="node-desc"></div>
+            <div id="node-connections"></div>
         </div>
     </div>
 
+    <div id="edge-label"></div>
+
+    <div id="controls">
+        <button class="ctrl-btn active" id="btn-spin" onclick="toggleSpin()">🌀 Auto-Spin</button>
+        <button class="ctrl-btn" onclick="reheatSim()">⚡ Reheat</button>
+        <button class="ctrl-btn" onclick="focusOwner()">🎯 Centrar</button>
+    </div>
+
     <div id="loading" class="loading">ESTABLECIENDO ENLACE NEURAL...</div>
+    <div id="trace-panel">
+        <div class="trace-header">
+            <div class="trace-title">Neural Trace</div>
+            <button class="close-btn" onclick="closeTrace()">×</button>
+        </div>
+        <div class="trace-content" id="trace-content">
+            <!-- Timeline items injected here -->
+        </div>
+    </div>
+
     <div id="3d-graph"></div>
 
     <script>
         const clientId = window.location.pathname.split('/').pop();
         document.getElementById('client-id').innerText = clientId;
+
+        let Graph;
+        let spinning = true;
+        let ownerNodeId = null;
+        let connectionCount = {};
+
+        // Color palette by type
+        const TYPE_COLORS = {
+            'PERSONA': '#00ddff',
+            'LUGAR': '#ffaa00',
+            'LOCATION': '#ffaa00',
+            'OBJETO': '#ff6688',
+            'CONCEPTO': '#aa55ff',
+            'CONCEPT': '#aa55ff',
+            'EVENTO': '#55ff88',
+            'EVENT': '#55ff88',
+            'ENTITY': '#8899bb',
+        };
+        const OWNER_COLOR = '#ff0066';
+
+        function getNodeColor(node) {
+            if (node.id === ownerNodeId) return OWNER_COLOR;
+            return TYPE_COLORS[node.type?.toUpperCase()] || '#667799';
+        }
+
+        function getNodeSize(node) {
+            const conns = connectionCount[node.id] || 0;
+            if (node.id === ownerNodeId) return 12;
+            if (conns > 10) return 7;
+            if (conns > 5) return 5;
+            if (conns > 2) return 4;
+            return 3;
+        }
+
+        function toggleSpin() {
+            spinning = !spinning;
+            document.getElementById('btn-spin').classList.toggle('active', spinning);
+        }
+
+        function reheatSim() {
+            if (Graph) Graph.d3ReheatSimulation();
+        }
+
+        function focusOwner() {
+            if (!Graph || !ownerNodeId) return;
+            const node = Graph.graphData().nodes.find(n => n.id === ownerNodeId);
+            if (!node) return;
+            const dist = 200;
+            const distRatio = 1 + dist / Math.hypot(node.x || 1, node.y || 1, node.z || 1);
+            Graph.cameraPosition(
+                { x: (node.x || 0) * distRatio, y: (node.y || 0) * distRatio, z: (node.z || 0) * distRatio },
+                node, 2000
+            );
+        }
 
         async function init() {
             try {
@@ -154,61 +447,88 @@
                 const data = await response.json();
 
                 document.getElementById('loading').style.display = 'none';
-                document.getElementById('count-nodes').innerText = data.nodes.length;
-                document.getElementById('count-edges').innerText = data.links.length;
+                document.getElementById('count-nodes').innerText = data.nodes.length.toLocaleString();
+                document.getElementById('count-edges').innerText = data.links.length.toLocaleString();
+
+                // Count connections per node
+                data.links.forEach(l => {
+                    const src = typeof l.source === 'object' ? l.source.id : l.source;
+                    const tgt = typeof l.target === 'object' ? l.target.id : l.target;
+                    connectionCount[src] = (connectionCount[src] || 0) + 1;
+                    connectionCount[tgt] = (connectionCount[tgt] || 0) + 1;
+                });
+
+                // Find the owner node — use the API-provided ownerName if available
+                if (data.ownerName) {
+                    ownerNodeId = data.ownerName;
+                } else {
+                    // Fallback: most connected node is the owner
+                    let maxConns = 0;
+                    for (const [id, count] of Object.entries(connectionCount)) {
+                        if (count > maxConns) { maxConns = count; ownerNodeId = id; }
+                    }
+                }
 
                 const nodeInfo = document.getElementById('node-info');
-                const nodeName = document.getElementById('node-name');
-                const nodeType = document.getElementById('node-type');
-                const nodeDesc = document.getElementById('node-desc');
+                const edgeLabel = document.getElementById('edge-label');
 
-                // Graph Configuration
-                const Graph = ForceGraph3D()
+                Graph = ForceGraph3D()
                     (document.getElementById('3d-graph'))
                     .graphData(data)
-                    .nodeLabel('id')
-                    .nodeColor(node => {
-                        if (node.id === 'Usuario' || node.id === 'Yo') return '#ff0055'; // The core
-                        if (node.type === 'PERSONA') return '#00ddff';
-                        if (node.type === 'LOCATION') return '#ffaa00';
-                        if (node.type === 'CONCEPT') return '#aa00ff';
-                        return '#ffffff';
+                    .backgroundColor('#000010')
+                    // NODE CONFIG
+                    .nodeLabel(null)  // We handle this via click
+                    .nodeColor(getNodeColor)
+                    .nodeVal(n => getNodeSize(n))
+                    .nodeOpacity(0.92)
+                    .nodeResolution(16)
+                    // LINK CONFIG
+                    .linkColor(link => {
+                        const w = link.weight || 1;
+                        const alpha = Math.min(0.15 + w * 0.04, 0.5);
+                        return `rgba(0, 200, 255, ${alpha})`;
                     })
-                    .nodeRelSize(5)
-                    .linkColor(() => 'rgba(0, 255, 255, 0.2)')
-                    .linkWidth(link => link.weight || 1)
-                    .linkDirectionalParticles(2)
-                    .linkDirectionalParticleWidth(2)
-                    .linkDirectionalParticleSpeed(d => 0.005)
-                    .onNodeClick(node => {
-                        // Focus on node
-                        const distance = 100;
-                        const distRatio = 1 + distance / Math.hypot(node.x, node.y, node.z);
-                        Graph.cameraPosition(
-                            { x: node.x * distRatio, y: node.y * distRatio, z: node.z * distRatio },
-                            node,
-                            3000
-                        );
-
-                        // Update HUD
-                        nodeInfo.style.display = 'block';
-                        nodeName.innerText = node.id;
-                        nodeType.innerText = node.type || 'ENTITY';
-                        nodeDesc.innerText = node.description || 'Sin descripción adicional.';
+                    .linkWidth(link => Math.min((link.weight || 1) * 0.5, 3))
+                    .linkDirectionalParticles(link => (link.weight || 1) > 2 ? 2 : 1)
+                    .linkDirectionalParticleWidth(1.5)
+                    .linkDirectionalParticleSpeed(0.003)
+                    .linkDirectionalParticleColor(() => '#0df')
+                    // INTERACTIONS
+                    .onNodeClick(node => selectNodeById(node.id))
+                    .onNodeHover(node => {
+                        document.body.style.cursor = node ? 'pointer' : 'default';
+                    })
+                    .onLinkHover(link => {
+                        if (link) {
+                            const src = typeof link.source === 'object' ? link.source.id : link.source;
+                            const tgt = typeof link.target === 'object' ? link.target.id : link.target;
+                            edgeLabel.innerHTML = `
+                                <div style="color:cyan; font-weight:bold; margin-bottom:4px;">${link.relation || 'CONEXIÓN'}</div>
+                                <div>${src} ➔ ${tgt}</div>
+                                ${link.context ? `<div style="font-size:11px; color:#0df; margin-top:4px; font-style:italic;">"${link.context}"</div>` : ''}
+                                ${link.flags?.[0]?.confidence ? `<div style="font-size:10px; color:#88a; margin-top:3px;">Confianza: ${link.flags[0].confidence}% | ${link.flags[0].temporal_state || 'active'} | ${link.flags[0].fact_type || 'explicit'}</div>` : ''}
+                                ${link.last_seen ? `<div style="font-size:9px; color:#556; margin-top:2px;">Última vez: ${new Date(link.last_seen).toLocaleDateString()}</div>` : ''}
+                            `;
+                            edgeLabel.style.display = 'block';
+                        } else {
+                            edgeLabel.style.display = 'none';
+                        }
                     })
                     .onBackgroundClick(() => {
-                        nodeInfo.style.display = 'none';
+                        document.getElementById('node-info').style.display = 'none';
+                        document.getElementById('edge-label').style.display = 'none';
                     });
 
-                // Auto-spin camera
+                // Gentle auto-spin (slowest possible)
                 let angle = 0;
                 setInterval(() => {
+                    if (!spinning) return;
                     Graph.cameraPosition({
-                        x: 400 * Math.sin(angle),
-                        z: 400 * Math.cos(angle)
+                        x: 800 * Math.sin(angle),
+                        z: 800 * Math.cos(angle)
                     });
-                    angle += Math.PI / 1000;
-                }, 20);
+                    angle += Math.PI / 10000;
+                }, 30);
 
             } catch (error) {
                 console.error("Error cargando grafo:", error);
@@ -217,8 +537,106 @@
             }
         }
 
+        function openTrace(nodeId) {
+            const panel = document.getElementById('trace-panel');
+            const content = document.getElementById('trace-content');
+            const node = Graph.graphData().nodes.find(n => n.id === nodeId);
+
+            content.innerHTML = `<div style="text-align:center; padding:20px; color:#556;">Cargando rastro neural para <b>${nodeId}</b>...</div>`;
+            panel.style.display = 'flex';
+
+            // Filter edges related to this node
+            const edges = Graph.graphData().links
+                .filter(l => l.source.id === nodeId || l.target.id === nodeId)
+                .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
+
+            if (edges.length === 0) {
+                content.innerHTML = `<div style="text-align:center; padding:20px; color:#556;">No se encontraron conexiones históricas para esta entidad.</div>`;
+                return;
+            }
+
+            content.innerHTML = edges.map(e => {
+                const isSource = e.source.id === nodeId;
+                const otherId = isSource ? e.target.id : e.source.id;
+                const otherNode = Graph.graphData().nodes.find(n => n.id === otherId);
+                const otherName = otherNode?.name || otherId;
+                const date = e.created_at ? new Date(e.created_at).toLocaleString() : 'FECHA DESCONOCIDA';
+
+                return `
+                    <div class="timeline-item">
+                        <div class="timeline-date">${date}</div>
+                        <div class="timeline-rel">${e.relation || 'CONEXIÓN'}</div>
+                        <div class="timeline-target" onclick="selectNodeById('${otherId}')" style="cursor:pointer; text-decoration:underline;">
+                            ${isSource ? '➔' : '←'} ${otherName}
+                        </div>
+                        ${e.context ? `<div class="timeline-context">"${e.context}"</div>` : ''}
+                    </div>
+                `;
+            }).join('');
+        }
+
+        function selectNodeById(nodeId) {
+            if (!Graph) return;
+            const node = Graph.graphData().nodes.find(n => n.id === nodeId);
+            if (!node) return;
+
+            // Fly to node
+            const distance = 400;
+            const distRatio = 1 + distance / Math.hypot(node.x || 1, node.y || 1, node.z || 1);
+            Graph.cameraPosition(
+                { x: (node.x || 0) * distRatio, y: (node.y || 0) * distRatio, z: (node.z || 0) * distRatio },
+                node,
+                2500
+            );
+
+            // HUD Update
+            const nodeInfo = document.getElementById('node-info');
+            nodeInfo.style.display = 'block';
+
+            const data = Graph.graphData();
+            const nodeLinks = data.links.filter(l => l.source.id === node.id || l.target.id === node.id);
+
+            let expertBio = node.description || "Entidad sin descripción detallada.";
+            if (node.id === ownerNodeId || node.id === 'Usuario') {
+                expertBio = `<b style="color:cyan">ESTRATEGIA COGNITIVA:</b><br>${expertBio}<br><br>`;
+                expertBio += `<b style="color:cyan">MÉTRICAS NEURALES:</b><br>`;
+                expertBio += `• Sinapsis activas: ${nodeLinks.length}<br>`;
+                expertBio += `• Relevancia sistémica: ${(nodeLinks.length / (data.nodes.length || 1) * 100).toFixed(1)}%<br>`;
+            }
+
+            let metaHtml = '';
+            if (node.metadata) {
+                metaHtml = '<div style="margin-top:10px; border-top:1px solid rgba(0,255,255,0.1); padding-top:8px;">';
+                metaHtml += '<b style="color:#0df; font-size:9px; letter-spacing:1px; text-transform:uppercase;">Knowledge Breakdown:</b>';
+                metaHtml += '<div style="font-family:monospace; font-size:10px; color:#88a; background:rgba(0,0,0,0.3); padding:8px; border-radius:4px; margin-top:5px; max-height:150px; overflow-y:auto;">';
+                for (const [key, val] of Object.entries(node.metadata)) {
+                    if (val) metaHtml += `<div><span style="color:#0df">${key}:</span> ${typeof val === 'object' ? JSON.stringify(val) : val}</div>`;
+                }
+                metaHtml += '</div></div>';
+            }
+
+            nodeInfo.innerHTML = `
+                <div id="node-name">${node.name || node.id}</div>
+                <div id="node-type">${node.type || 'ENTITY'}</div>
+                <div id="node-desc">${expertBio}</div>
+                ${metaHtml}
+                <div id="node-connections" style="border-top: 1px solid rgba(0,255,255,0.1); padding-top:8px; margin-top:10px;">🔗 ${nodeLinks.length} conexión${nodeLinks.length !== 1 ? 'es' : ''}</div>
+                <button class="trace-btn" onclick="openTrace('${node.id}')">👁 Ver Línea de Tiempo</button>
+            `;
+
+            // Highlight node temporarily
+            const previousColor = node.color;
+            node.color = '#ffffff';
+            setTimeout(() => { node.color = previousColor; Graph.nodeColor(Graph.nodeColor()); }, 1000);
+        }
+
+        function closeTrace() {
+            document.getElementById('trace-panel').style.display = 'none';
+        }
+
         init();
     </script>
 </body>
 
 </html>
+```

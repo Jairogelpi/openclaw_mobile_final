@@ -10,938 +10,405 @@ import util from 'util';
 const execPromise = util.promisify(exec);
 import { encrypt, decrypt } from './security.mjs';
 import crypto from 'node:crypto';
-import { generateEmbedding, cosineSimilarity } from './services/local_ai.mjs';
+import { generateEmbedding, cosineSimilarity, invalidateSemanticCache } from './services/local_ai.mjs';
 import redisClient from './config/redis.mjs';
 import { upsertKnowledgeNode, upsertKnowledgeEdge } from './services/graph.service.mjs';
+import { detectAndSaveCommunities } from './services/community.service.mjs';
+import { resolveIdentity } from "./skills/whatsapp_contacts.mjs";
+import { processAttachment } from "./utils/media.mjs";
 import cron from 'node-cron';
+
+// === HYPER-ROBUST HELPERS ===
+function cleanJSON(text) {
+    if (!text) return null;
+    try {
+        let cleaned = text.replace(/```json|```/g, '').trim();
+        const start = cleaned.indexOf('{');
+        const end = cleaned.lastIndexOf('}');
+        if (start !== -1 && end !== -1) {
+            cleaned = cleaned.substring(start, end + 1);
+        }
+        // Basic healing for common trailing comma issues or missing braces
+        try {
+            return JSON.parse(cleaned);
+        } catch (e) {
+            // Attempt secondary healing
+            const healed = cleaned.replace(/,\s*([}\]])/g, '$1');
+            return JSON.parse(healed);
+        }
+    } catch (e) {
+        console.warn('⚠️ [cleanJSON] Fallback failed:', e.message, 'TEXT:', text.substring(0, 100));
+        return null;
+    }
+}
 
 const parseLLMJson = (text) => {
     try {
         const cleaned = text.replace(/```json|```/g, '').trim();
         return JSON.parse(cleaned);
     } catch (e) {
-        console.warn('⚠️ [LLM-JSON] Fallback parsing failed for:', text.slice(0, 100));
-        throw e;
-    }
-};
-
-const sanitizeInput = (text, maxLength = 2000) => {
-    if (typeof text !== 'string') return '';
-    return text
-        .replace(/[<>{}\[\]\\^\`]/g, '')
-        .substring(0, maxLength)
-        .trim();
-};
-
-/**
- * Resetea el temporizador de inactividad para un cliente.
- */
-async function triggerMemoryTimer(clientId) {
-    if (!redisClient) return;
-    try {
-        await redisClient.set(`idle:${clientId}`, 'process', { EX: 60 });
-        console.log(`[Timer] ⏳ Reloj reseteado para ${clientId}. Procesando en 60s de inactividad.`);
-    } catch (e) {
-        console.warn('[Timer] Error reseteando temporizador:', e.message);
+        return null;
     }
 }
 
-// No local initializations needed anymore as they are in config/services
+const sanitizeInput = (text, maxLength = 2000) => {
+    if (typeof text !== 'string') return '';
+    return text.replace(/[<>{}\\^\`]/g, '').substring(0, maxLength).trim();
+};
 
-// No longer needed: local upsertKnowledgeNode and upsertKnowledgeEdge removed to use services/graph.service.mjs
+/**
+ * 2026 Grounded Extraction: Semántica Cuádruple + Temporal + Thematic (GraphRAG Level 4)
+ */
+async function processConversationDepth(clientId, remoteId, userName, contactName, messages, senderRole, chunkText, timestamp) {
+    try {
+        const prompt = `### INSTRUCCIONES DE HIPER-EXTRACCIÓN CÍBORYG (GraphRAG Nivel 5) ###
+CONTEXTO: Conversación entre "${userName}" (tú/usuario) y "${contactName}" (identidad remota).
+OBJETIVO: Crear una red neuronal de máxima densidad donde TODO esté conectado.
+
+REGLAS DE IDENTIDAD (PROHIBIDO GENÉRICOS):
+1. **IDENTIDADES DE NODO**: Prohibido usar "Usuario", "Contacto", "Él", "Persona", "Interlocutor" o "Anónimo". 
+   - SIEMPRE usa "${userName}" y "${contactName}".
+   - Si se menciona a alguien sin nombre, usa su rol descriptivo (ej: "Primo de Víctor", "Vendedor de Amazon") o su ID (${remoteId}). Pero NUNCA "Contacto".
+2. **ENTIDADES TÁCITAS**: Extrae miedos, metas, rasgos (ej: "Resiliente", "Obsesivo").
+
+REGLAS DE CONECTIVIDAD (DENSIDAD EXTREMA):
+3. **RELACIONES OBLIGATORIAS**: CADA entidad extraída DEBE estar conectADA al menos con otra. No se permiten nodos huérfanos.
+4. **MATRIZ DE CONEXIÓN**: Si en un mismo párrafo se mencionan tres cosas (A, B y C), intenta conectarlas todas entre sí (A->B, B->C, A->C) si existe una relación lógica o contextual.
+5. **RELACIONES ESTANDARIZADAS**: [CREENCIA], [CONFLICTO], [EXPERIENCIA], [PROMESA], [SECRETO], [RUTINA], [GUSTO], [ODIO], [DEPENDENCIA], [INFLUENCIA], [AMISTAD], [FAMILIA], [TRABAJO], [AMOR], [RELACIONADO_CON].
+
+=== EJEMPLO DE DENSIDAD MÁXIMA ===
+User: "${userName}: El 12 de mayo Víctor me dijo que Rust es difícil. Me dio ansiedad."
+EXTRAE ESTO:
+{
+  "entities": [
+    {"name": "${userName}", "type": "PERSONA", "desc": "Sujeto principal.", "traits": ["Vulnerable a la ansiedad técnica"]},
+    {"name": "Víctor", "type": "PERSONA", "desc": "Amigo técnico.", "traits": ["Opinológico"]},
+    {"name": "12 de mayo", "type": "EVENTO_TEMPORAL", "desc": "Fecha del incidente.", "traits": []},
+    {"name": "Rust", "type": "TEMA", "desc": "Lenguaje de programación.", "traits": []}
+  ],
+  "relationships": [
+    {"source": "${userName}", "target": "Víctor", "type": "[AMISTAD]", "weight": 0.8, "sentiment": "NEUTRO", "context": "Conversación técnica."},
+    {"source": "${userName}", "target": "Rust", "type": "[MIEDO]", "weight": 0.9, "sentiment": "ANSIOSO", "context": "Ansiedad por dificultad."},
+    {"source": "Víctor", "target": "Rust", "type": "[CREENCIA]", "weight": 0.9, "sentiment": "NEGATIVO", "context": "Él dice que es difícil."},
+    {"source": "12 de mayo", "target": "${userName}", "type": "[EXPERIENCIA]", "weight": 1.0, "sentiment": "ANSIOSO", "context": "Día del evento traumático."},
+    {"source": "12 de mayo", "target": "Rust", "type": "[RELACIONADO_CON]", "weight": 0.7, "sentiment": "NEUTRO", "context": "Fecha vinculada al tema."},
+    {"source": "Víctor", "target": "12 de mayo", "type": "[EXPERIENCIA]", "weight": 0.5, "sentiment": "NEUTRO", "context": "Participación en el evento."}
+  ]
+}
+================================
+
+Analiza y responde ÚNICAMENTE en JSON ESTRICTO.`;
+
+        const response = await groq.chat.completions.create({
+            model: 'llama-3.3-70b-versatile',
+            messages: [{ role: 'system', content: prompt }, { role: 'user', content: messages.join('\n') }],
+            response_format: { type: 'json_object' },
+            temperature: 0.0
+        });
+
+        const quads = parseLLMJson(response.choices[0].message.content);
+        if (!quads) return;
+
+        let explicit = 0;
+        let implicit = 0;
+
+        for (const ent of (quads.entities || [])) {
+            const description = `${ent.desc || ''} ${ent.traits?.length ? `[Traits: ${ent.traits.join(', ')}]` : ''} `.trim();
+            await upsertKnowledgeNode(clientId, ent.name, ent.type || 'ENTITY', description);
+            explicit++;
+        }
+        for (const rel of (quads.relationships || [])) {
+            const enrichedType = rel.sentiment ? `${rel.type} (${rel.sentiment})` : rel.type;
+            const finalWeight = rel.weight ? Math.min(10, Math.max(1, Math.round(rel.weight * 10))) : 1; // Normalize to 1-10 scale for the DB if they return 0-1
+            await upsertKnowledgeEdge(clientId, rel.source, rel.target, enrichedType, finalWeight, rel.context);
+            implicit++;
+        }
+
+        console.log(`🕸️[Hyper-Graph Level 4] ${explicit} entidades + ${implicit} relaciones detectadas.`);
+    } catch (e) {
+        console.warn(`[GraphRAG] Error en Hyper-Extractor: ${e.message}`);
+    }
+}
 
 // === AUTONOMOUS KNOWLEDGE DISTILLATION (AUTO-SOUL) ===
 async function autonomousDistillation(clientId, clientSlug, messages) {
     if (!messages?.length) return;
-
-    console.log(`🍯 [Auto-Soul] Destilando conocimiento de ${messages.length} mensajes para ${clientSlug}...`);
-
     try {
-        // 1. Obtener SOUL actual
-        const { data: soulRow } = await supabase
-            .from('user_souls')
-            .select('soul_json')
-            .eq('client_id', clientId)
-            .single();
-
+        const { data: soulRow } = await supabase.from('user_souls').select('soul_json').eq('client_id', clientId).single();
         const currentSoul = soulRow?.soul_json || {};
-
-        // 2. Extraer hechos, tripletes y PERFIL DE ESTILO
-        const textBlock = messages.map(m => `${m.sender_role}: ${m.content}`).join('\n');
-
         const response = await groq.chat.completions.create({
             model: 'llama-3.3-70b-versatile',
-            messages: [{
-                role: 'system',
-                content: `Eres el Arquitecto Cognitivo OMNISCIENTE de un clúster de Inteligencia Artificial Avanzada. 
-Misión: Extraer absolutamente TODOS los matices posibles de esta conversación para construir un "Cerebro Gemelo Digital" (Clone) hiper-realista del usuario.
-
-SOUL ACTUAL (Contexto Base Acumulado):
-${JSON.stringify(currentSoul)}
-
-TRAZA DE CONVERSACIÓN (Mensajes recientes):
-${textBlock}
-
-PROTOCOLOS DE EXTRACCIÓN (NIVEL GOD-TIER):
-
-1. "soul_patch": Actualiza o añade hechos duros, pero escanea estratos profundos:
-   - Creencias fundamentales y Axiomas Filosóficos del usuario.
-   - Matrices de decisión (¿Cómo procesa los problemas? ¿Se guía por lógica rígida o emoción irracional?).
-   - Aversiones (pet peeves) y pasiones ocultas.
-   - Puntos ciegos cognitivos o sesgos detectados observados en el texto.
-
-2. "triplets": Arquitectura GraphRAG de Nivel 4 (Cognitivo-Relacional). 
-   - No extraigas solo hechos simples ("X es lugar"). 
-   - Extrae matices viscerales y dinámicas de poder: "Sujeto [TIENE_TENSION_CON] Objeto". "Concepto_X [CAUSA_ESTRES_A] Usuario".
-   - Detecta compromisos: "Usuario [PROMETIO_ENTREGAR_X_A] Contacto".
-   - Identifica sentimientos profundos: "Contacto [EXPRESA_ADMIRACION_POR] Usuario".
-
-3. "style_profile": DECONSTRUCCIÓN LINGÜÍSTICO-PSICOLÓGICA. Analiza 'user_sent' con precisión milimétrica:
-   - "rhythm_and_pacing": Ráfagas, bloques monolíticos explicativos, tiempos de pausa.
-   - "punctuation_signature": Manias puras (ausencia total de mayúsculas, elipsis dramáticas, exclamaciones hiperbólicas).
-   - "conflict_resolution_style": Si hay discusiones, ¿es evasivo, confrontacional, diplomático, pasivo-agresivo?
-
-4. "personal_directives": EXTRAE ÓRDENES DIRECTAS.
-   - Si el dueño dice "A partir de ahora...", "No digas más...", "Háblame de Ud", esto es una directiva absoluta.
-   - Formato: ["No usar emojis con clientes", "Ser directo y seco"].
-
-5. "psychological_profile": ANALISIS DE TRANSFONDO (OCEAN).
-   - Deduce rasgos de personalidad (0 a 1): Apertura, Responsabilidad, Extraversión, Amabilidad, Neuroticismo.
-
-6. "contextual_mirrors": MAPEADO DE PÚBLICOS.
-   - ¿Cómo cambia su trato según el interlocutor? (ej: "Clientes": "Formal", "Amigos": "Slang").
-
-Responde ÚNICA Y EXCLUSIVAMENTE con el siguiente objeto JSON estricto:
-{
-  "soul_patch": {
-    "axiomas_filosoficos": ["..."],
-    "matrices_decision": ["..."],
-    "sesgos_cognitivos": ["..."],
-    "hechos_y_preferencias_duras": ["..."],
-    "personal_directives": ["..."],
-    "psychological_profile": { "O": 0.5, "C": 0.5, "E": 0.5, "A": 0.5, "N": 0.5 },
-    "contextual_mirrors": { "Categoría": "Estilo" }
-  },
-  "triplets": [
-    {
-      "source": "Sujeto",
-      "relation": "PREDICADO_COMPLEJO",
-      "target": "Objeto",
-      "context": "Breve explicación del matiz detectado",
-      "flags": ["etiqueta1"]
-    }
-  ],
-  "style_profile": {
-    "core_humor_framework": "",
-    "conflict_resolution_style": "",
-    "syntactic_complexity_score": 0.0,
-    "emotional_baseline_valence": 0.0,
-    "formality_variance": "",
-    "common_emojis": [],
-    "slang_and_vocabulary": [],
-    "rhythm_and_pacing": "",
-    "punctuation_signature": ""
-  }
-}`
-            }],
-            response_format: { type: 'json_object' },
-            temperature: 0.1
+            messages: [{ role: 'system', content: `Update Soul JSON based on conversation.Accumulate info.\nCURRENT SOUL: ${JSON.stringify(currentSoul)} \nCONVERSATION: \n${messages.map(m => `${m.sender_role}: ${m.content}`).join('\n')} ` }],
+            response_format: { type: 'json_object' }
         });
+        const result = cleanJSON(response.choices[0].message.content);
+        if (result) {
+            const updatedSoul = { ...currentSoul, ...result };
+            await supabase.from('user_souls').update({ soul_json: updatedSoul }).eq('client_id', clientId);
+            await upsertKnowledgeNode(clientId, updatedSoul.nombre || 'Usuario', 'PERSONA', `[ALMA] ${updatedSoul.bio || ''} `);
 
-        const result = parseLLMJson(response.choices[0].message.content);
-
-        // 3. Aplicar Parche al SOUL e Identidad
-        if ((result.soul_patch && Object.keys(result.soul_patch).length > 0) || result.style_profile) {
-            const updatedSoul = {
-                ...currentSoul,
-                ...result.soul_patch,
-                personal_directives: [
-                    ...new Set([...(currentSoul.personal_directives || []), ...(result.soul_patch.personal_directives || [])])
-                ],
-                psychological_profile: {
-                    ...(currentSoul.psychological_profile || {}),
-                    ...(result.soul_patch.psychological_profile || {})
-                },
-                contextual_mirrors: {
-                    ...(currentSoul.contextual_mirrors || {}),
-                    ...(result.soul_patch.contextual_mirrors || {})
-                },
-                style_profile: {
-                    ...(currentSoul.style_profile || {}),
-                    ...(result.style_profile || {})
-                }
-            };
-
-            // A. Guardar en DB (Single Source of Truth)
-            const { error: updateError } = await supabase
-                .from('user_souls')
-                .update({
-                    soul_json: updatedSoul,
-                    updated_at: new Date().toISOString()
-                })
-                .eq('client_id', clientId);
-
-            if (updateError) throw new Error(`DB Update Failed: ${updateError.message}`);
-
-            // B. Exportar a SOUL.md (Caché local / Auditoría)
+            // --- SYNC PHYSICAL MD FILES ---
             try {
-                const clientDir = path.join('./clients', clientSlug);
+                const fs = await import('fs/promises');
+                const { encrypt } = await import('./security.mjs');
+                const clientDir = `./clients/${clientSlug}`;
+
                 await fs.mkdir(clientDir, { recursive: true });
-                const soulPath = path.join(clientDir, 'SOUL.md');
-                const soulText = JSON.stringify(updatedSoul, null, 2);
-                await fs.writeFile(soulPath, encrypt(soulText));
-                console.log(`✨ [Auto-Soul] Exportado exitosamente a ${soulPath}`);
-            } catch (fileErr) {
-                console.warn(`⚠️ [Auto-Soul] Error exportando a archivo (DB está OK):`, fileErr.message);
+
+                const soulMd = `# Identidad\nEres ${updatedSoul.nombre || 'OpenClaw'}. ${updatedSoul.tono || ''}\n\n# Situación: ${updatedSoul.perfil?.ocupacion?.situacion || 'N/A'}\n\n# Directrices\n${(updatedSoul.perfil?.directrices || []).map(d => `- ${d}`).join('\n')}`;
+                await fs.writeFile(`${clientDir}/SOUL.md`, encrypt(soulMd));
+
+                const userMd = `# Perfil\n- Usuario: ${updatedSoul.nombre || 'Usuario'}\n- Edad: ${updatedSoul.edad || 'N/A'}\n- Trabajo: ${updatedSoul.perfil?.ocupacion?.detalle || 'N/A'}\n- Herramientas: ${(updatedSoul.perfil?.herramientas || []).join(', ')}\n- Horario pico: ${updatedSoul.perfil?.disponibilidad?.horario_pico || 'N/A'}`;
+                await fs.writeFile(`${clientDir}/USER.md`, encrypt(userMd));
+
+                const contextMd = `# Contexto Actual\n- Última actualización: ${new Date().toLocaleDateString()}\n- Tempos: Atualizado vía Memory Worker Distillation.`;
+                await fs.writeFile(`${clientDir}/CONTEXT.md`, encrypt(contextMd));
+
+                const agentMd = `# Directrices de Agente (Axiomas e Instrucciones Core)\n- Núcleo Evolutivo sincronizado el ${new Date().toLocaleTimeString()}.\n${(updatedSoul.personal_directives || []).map(d => `- [DIRECTIVA]: ${d}`).join('\n')}\n${(updatedSoul.axiomas_filosoficos || []).map(a => `- [AXIOMA]: ${a}`).join('\n')}`;
+                await fs.writeFile(`${clientDir}/AGENT.md`, encrypt(agentMd));
+
+                console.log(`📝 [Auto-Soul] Archivos MD sincronizados para ${clientSlug}`);
+            } catch (fsErr) {
+                console.warn(`[Auto-Soul] Error escribiendo MDs: ${fsErr.message}`);
             }
-
-            console.log(`✨ [Auto-Soul] Memoria e Identidad (Estilo) actualizadas en DB para ${clientSlug}.`);
         }
-
-        // 4. Upsert en el Grafo (V4: Cognitive Depth)
-        if (result.triplets && result.triplets.length > 0) {
-            for (const t of result.triplets) {
-                const s = t.source || t[0];
-                const r = t.relation || t[1];
-                const o = t.target || t[2];
-                const ctx = t.context || "";
-                const flags = t.flags || [];
-
-                await upsertKnowledgeNode(clientId, s, 'ENTITY', '');
-                await upsertKnowledgeNode(clientId, o, 'ENTITY', '');
-                
-                // Usamos la nueva función RPC para gestionar pesos y flags
-                await supabase.rpc('upsert_knowledge_edge_v4', {
-                    p_client_id: clientId,
-                    p_source_node: s,
-                    p_target_node: o,
-                    p_relation_type: r,
-                    p_context: ctx,
-                    p_flags: flags
-                });
-            }
-            console.log(`🕸️ [Auto-Soul] ${result.triplets.length} tripletes cognitivos procesados.`);
-        }
-
     } catch (e) {
-        console.error('❌ [Auto-Soul] Error en destilación:', e.message);
+        console.error('[Auto-Soul] Error:', e.message);
     }
 }
 
-// === DISTILL + GRAPHRAG VECTORIZE + INBOX SUMMARIES ===
-async function distillAndVectorize(clientId) {
-    // Obtener slug del cliente para rutas de archivos
-    const { data: client } = await supabase.from('user_souls').select('slug').eq('client_id', clientId).single();
-    if (!client) return;
-    const clientSlug = client.slug;
+// === MAIN PROCESS: DISTILL + VECTORIZE + INBOX ===
+export async function distillAndVectorize(clientId) {
+    const { data: soulData } = await supabase.from('user_souls').select('slug, soul_json').eq('client_id', clientId).single();
+    if (!soulData) return;
+    const clientSlug = soulData.slug;
 
-    console.log(`\n🧠 [Memory Worker] Procesando memoria e inbox para: ${clientSlug}`);
-
-    // 0. ADQUIRIR CANDADO ATÓMICO (Evita condiciones de carrera e hiperescalado de costes)
-    // 0. BLOQUEO ATÓMICO (Phase 11: Idempotency)
-    // Usamos RPC de Supabase para evitar que varios workers procesen al mismo cliente simultáneamente
-    const { data: lockAcquired, error: lockErr } = await supabase.rpc('acquire_worker_lock', {
-        p_client_id: clientId,
-        p_expiry_minutes: 30
-    });
-
-    if (lockErr || !lockAcquired) {
-        console.log(`[Worker] 🔒 Cliente ${clientId} bloqueado por otro proceso. Saltando.`);
+    // Acquire lock
+    const { data: soul2 } = await supabase.from('user_souls').select('is_processing').eq('client_id', clientId).single();
+    if (soul2?.is_processing) {
+        console.log(`[Worker] 🔒 Cliente ${clientId} bloqueado.Saltando.`);
         return;
     }
 
+    await supabase.from('user_souls').update({ is_processing: true, worker_status: '🧠 Procesando...' }).eq('client_id', clientId);
+
     try {
-        console.log(`🧠 [Process] Despertando proceso para ${clientSlug}...`);
+        let totalProcessedThisRun = 0;
+        let hasMore = true;
+        const LIMIT = 200;
 
-        // 1. Obtener mensajes sin procesar
-        const { data: messages } = await supabase
-            .from('raw_messages')
-            .select('*')
-            .eq('client_id', clientId)
-            .eq('processed', false)
-            .order('created_at', { ascending: true });
+        while (hasMore && totalProcessedThisRun < 1000) {
+            const { data: messages } = await supabase.from('raw_messages').select('*').eq('client_id', clientId).eq('processed', false).order('created_at', { ascending: true }).limit(LIMIT);
 
-        if (!messages?.length) {
-            console.log(`🏝️ Sin mensajes pendientes para ${clientId}.`);
-            return;
-        }
-
-        // SANTIZACIÓN (Phase 11)
-        messages.forEach(m => m.content = sanitizeInput(m.content));
-
-        // --- PARTE A: RESÚMENES PARA EL INBOX ---
-        // Agrupamos por conversación (remote_id)
-        const conversations = {};
-        messages.forEach(m => {
-            if (!conversations[m.remote_id]) {
-                const fallbackName = m.remote_id ? m.remote_id.split('@')[0] : 'Desconocido';
-                const initialSender = (m.sender_role === 'Historial' || m.sender_role === 'user_sent')
-                    ? (m.metadata?.pushName || fallbackName)
-                    : m.sender_role;
-
-                conversations[m.remote_id] = {
-                    messages: [],
-                    lastSender: initialSender,
-                    lastText: "",
-                    avatarUrl: m.metadata?.avatarUrl || null,
-                    firstMessageTime: m.created_at,
-                    lastMessageTime: m.created_at
-                };
-            }
-            conversations[m.remote_id].messages.push(`${m.sender_role}: ${m.content}`);
-
-            // Actualizar nombre realista si está disponible
-            if (m.sender_role !== 'Historial' && m.sender_role !== 'user_sent') {
-                conversations[m.remote_id].lastSender = m.sender_role;
-            } else if (m.metadata?.pushName) {
-                conversations[m.remote_id].lastSender = m.metadata.pushName;
+            if (!messages?.length) {
+                hasMore = false;
+                break;
             }
 
-            // Concatenar mensajes para formar el fragmento de la conversación
-            if (conversations[m.remote_id].lastText !== "") {
-                conversations[m.remote_id].lastText += "\n";
-            }
-            conversations[m.remote_id].lastText += m.content;
+            console.log(`🧠[Process] Lote de ${messages.length} mensajes(Acumulado: ${totalProcessedThisRun}) para ${clientSlug} `);
 
-            if (m.metadata?.avatarUrl) {
-                conversations[m.remote_id].avatarUrl = m.metadata.avatarUrl; // Actualizar con el más reciente
-            }
-            conversations[m.remote_id].lastMessageTime = m.created_at;
-        });
-
-        for (const [remoteId, conv] of Object.entries(conversations)) {
-            console.log(`📝 [Inbox] Generando resumen premium para: ${remoteId}`);
-
-            try {
-                const summaryResponse = await groq.chat.completions.create({
-                    model: 'llama-3.1-8b-instant', // OPTIMIZACIÓN DE COSTES: 8B para resúmenes
-                    messages: [
-                        {
-                            role: 'system',
-                            content: `Eres un sintetizador ultra-preciso de OpenClaw. Analizas una conversación de WhatsApp y extraes un TITULAR descriptivo de MÁXIMO 10 PALABRAS.
-REGLAS ESTRICTAS:
-1. NUNCA uses frases como "El usuario...", "La conversación trata...", "El resumen es...".
-2. ACTÚA COMO UN ASISTENTE EJECUTIVO que anota un recordatorio en una agenda.
-3. EJEMPLOS BUENOS: "Confirmación de cita médica para el martes", "Coordinando pago de factura pendiente", "Intercambio de bromas informales".
-4. DEVUELVE SOLO EL TEXTO DEL RESUMEN, SIN COMILLAS NI PREÁMBULOS.`
-                        },
-                        { role: 'user', content: `CONVERSACIÓN:\n${conv.messages.join('\n')}` }
-                    ]
-                });
-
-                const summary = summaryResponse.choices[0].message.content.trim().replace(/^"|"$/g, '');
-                const isGroup = remoteId.includes('@g.us');
-
-                // Upsert en inbox_summaries
-                const { error: upsertError } = await supabase.from('inbox_summaries').upsert({
-                    client_id: clientId,
-                    conversation_id: remoteId,
-                    summary: summary,
-                    last_message_text: conv.lastText,
-                    contact_name: isGroup ? null : (conv.lastSender.startsWith('[Grupo]') ? null : conv.lastSender),
-                    group_name: isGroup ? conv.lastSender.replace('[Grupo] ', '') : null,
-                    avatar_url: conv.avatarUrl,
-                    first_message_time: conv.firstMessageTime,
-                    last_message_time: conv.lastMessageTime,
-                    is_unread: true,
-                    last_updated: new Date().toISOString()
-                }, { onConflict: 'client_id, conversation_id' });
-
-                if (upsertError) {
-                    console.error(`❌ [Inbox] Error haciendo upsert para ${remoteId}:`, upsertError.message);
-                } else {
-                    console.log(`✅ [Inbox] Resumen guardado exitosamente para ${remoteId}`);
-                }
-
-                // --- PARTE A.2: EXTRACCIÓN DE PERFIL DE RELACIÓN (PERSONA) ---
-                console.log(`🎭 [Persona] Extrayendo perfil de relación para: ${remoteId}`);
-                try {
-                    const personaResponse = await groq.chat.completions.create({
-                        model: 'llama-3.1-8b-instant', // OPTIMIZACIÓN DE COSTES: 8B para personas
-                        messages: [
-                            {
-                                role: 'system',
-                                content: `Eres un motor algorítmico de perfilado psico-lingüístico.
-Procesa esta traza de comunicación y extrae una radiografía analítica (JSON) de la relación.
-
-REGLAS DE ORO:
-1. SOLO JSON VÁLIDO. Cero texto auxiliar, cero excusas.
-2. Basado 100% en evidencia matemática de la conversación (longitud de strings, varianza de tiempos, lexicon).
-
-ESTRUCTURA OBLIGATORIA DEL JSON:
-{
-  "affinity_score": <1-100, float>,
-  "formality_index": <1-100, float>,
-  "lexical_diversity": "alta|media|baja",
-  "average_latency_sec": <float o null>,
-  "power_dynamic": "simetrica|usuario_dominante|contacto_dominante",
-  "emotional_valence": <float entre -1.0 y 1.0>,
-  "recurrent_patterns": ["patron1", "patron2"],
-  "relationship_classification": "string_exacto",
-  "technical_summary": "Análisis conciso de 15 palabras max."
-}`
-                            },
-                            { role: 'user', content: `CONVERSACIÓN:\n${conv.messages.join('\n')}` }
-                        ],
-                        response_format: { type: 'json_object' }
-                    });
-
-                    const personaJson = parseLLMJson(personaResponse.choices[0].message.content);
-
-                    const { error: personaError } = await supabase.from('contact_personas').upsert({
-                        client_id: clientId,
-                        remote_id: remoteId,
-                        persona_json: personaJson,
-                        updated_at: new Date().toISOString()
-                    }, { onConflict: 'client_id, remote_id' });
-
-                    if (personaError) {
-                        console.error(`❌ [Persona] Error guardando perfil para ${remoteId}:`, personaError.message);
-                    } else {
-                        console.log(`✅ [Persona] Perfil guardado para ${remoteId} (${personaJson.relacion_detectada})`);
-                    }
-                } catch (e) {
-                    console.warn(`⚠️ [Persona] Error extrayendo perfil para ${remoteId}:`, e.message);
-                }
-
-                // --- PARTE A.3: GRAPHRAG (Memoria Episódica Verdadera) ---
-                console.log(`🔍 [GraphRAG] Extrayendo hechos lógicos para: ${remoteId}`);
-                let triplets = [];
-                try {
-                    const contactIdentifier = isGroup ? `Grupo (${conv.lastSender.replace('[Grupo] ', '')})` : (conv.lastSender || remoteId);
-                    const graphResponse = await groq.chat.completions.create({
-                        model: 'llama-3.3-70b-versatile',
-                        response_format: { type: 'json_object' },
-                        messages: [
-                            {
-                                role: 'system',
-                                content: `Eres un analista de inteligencia construyendo un Grafo de Conocimiento (GraphRAG).
-Tu misión es extraer hechos fijos y permanentes de esta conversación.
-
-REGLAS CRÍTICAS DE ENTIDADES:
-- Si el hecho es sobre el dueño de la cuenta, el Sujeto debe ser SIEMPRE: "Usuario".
-- Si el hecho es sobre la persona con la que habla, el Sujeto debe ser ESTRICTAMENTE: "${contactIdentifier}".
-- No uses nombres genéricos como "Contacto", "El amigo", usa exactamente "${contactIdentifier}".
-
-OBJETIVOS DE EXTRACCIÓN:
-- Relaciones familiares y dinámicas de poder (ej: hermano de, jefe de, mentor de).
-- Relaciones Psicológicas: ¿Qué siente uno por el otro? (ej: desconfía de, admira a).
-- Compromisos y Promesas: ¿Qué se han prometido? (ej: prometió descuento, acordó reunión).
-- Hechos y Posesiones importantes.
-
-Formato JSON esperado:
-{
-  "triplets": [
-    {
-      "source": "Sujeto (Usuario o ${contactIdentifier})",
-      "source_type": "PERSONA",
-      "target": "Objeto (ej. Toby, Madrid, Fútbol)",
-      "target_type": "ENTITY|CONCEPT|LOCATION",
-      "relation": "TIENE_MASCOTA|RESIDE_EN|GUSTA_DE|DESCONFIA_DE|PROMETIO_X",
-      "context": "Detalle breve con el porqué de la relación",
-      "flags": ["psicologico", "transaccional"]
-    }
-  ]
-}`
-                            },
-                            { role: 'user', content: `CONVERSACIÓN:\n${conv.messages.join('\n')}` }
-                        ]
-                    });
-
-                    const graphData = parseLLMJson(graphResponse.choices[0].message.content);
-                    triplets = graphData.triplets || [];
-                    console.log(`🕸️ [GraphRAG] Extraídos ${triplets.length} triplets para ${remoteId}.`);
-
-                    // 3. Inserción Automática del Grafo para este contacto (V4)
-                    for (const t of triplets) {
-                        await upsertKnowledgeNode(clientId, t.source, t.source_type, t.context || "Entidad extraída.");
-                        await upsertKnowledgeNode(clientId, t.target, t.target_type, t.context || "Entidad extraída.");
-                        
-                        await supabase.rpc('upsert_knowledge_edge_v4', {
-                            p_client_id: clientId,
-                            p_source_node: t.source,
-                            p_target_node: t.target,
-                            p_relation_type: t.relation,
-                            p_context: t.context,
-                            p_flags: t.flags || []
-                        });
-                    }
-
-                } catch (e) {
-                    console.warn(`⚠️ [GraphRAG] Error o salto para ${remoteId}:`, e.message);
-                }
-
-            } catch (e) {
-                console.warn(`⚠️ [Inbox] No se pudo generar el resumen para ${remoteId}:`, e.message);
-            }
-        }
-
-        // --- PARTE B (LEGACY GLOBAL GRAPHRAG REMOVED) ---
-
-
-        // --- PARTE C: CHUNKING ADAPTATIVO + METADATA ENRIQUECIDA ---
-        // Detect topic boundaries via cosine similarity between consecutive messages
-        const SIMILARITY_THRESHOLD = 0.65; // Below this = new topic
-        const MAX_CHUNK_SIZE = 8;           // Hard cap on chunk size
-
-        const convGroups = {};
-        messages.forEach(m => {
-            if (!convGroups[m.remote_id]) convGroups[m.remote_id] = [];
-            convGroups[m.remote_id].push(m);
-        });
-
-        let totalChunks = 0;
-        let skipped = 0;
-
-        for (const [remoteId, convMsgs] of Object.entries(convGroups)) {
-            convMsgs.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
-
-            const isGroup = remoteId.includes('@g.us');
-
-            // Embed all messages in parallel for topic detection
-            const msgEmbeddings = await Promise.all(
-                convMsgs.map(m => generateEmbedding(`${m.sender_role}: ${m.content}`))
-            );
-
-            // Build adaptive chunks by detecting topic boundaries
-            const chunks = [];
-            let currentChunk = [0]; // indices into convMsgs
-
-            for (let i = 1; i < convMsgs.length; i++) {
-                const sim = cosineSimilarity(msgEmbeddings[i - 1], msgEmbeddings[i]);
-                const timeDiffMs = new Date(convMsgs[i].created_at) - new Date(convMsgs[currentChunk[0]].created_at);
-                const MAX_TIME_WINDOW_MS = 2 * 60 * 60 * 1000; // 2 hours
-
-                if (sim < SIMILARITY_THRESHOLD || currentChunk.length >= MAX_CHUNK_SIZE || timeDiffMs > MAX_TIME_WINDOW_MS) {
-                    // Topic boundary detected, max size reached, or time window exceeded → finalize chunk
-                    chunks.push(currentChunk.map(idx => convMsgs[idx]));
-                    currentChunk = [i];
-                } else {
-                    currentChunk.push(i);
-                }
-            }
-            // Finalize last chunk
-            if (currentChunk.length > 0) {
-                chunks.push(currentChunk.map(idx => convMsgs[idx]));
-            }
-
-            console.log(`🔬 [Adaptive] ${remoteId.slice(0, 12)}...: ${convMsgs.length} msgs → ${chunks.length} chunks`);
-
-            // Replace the old windows variable with chunks
-            const windows = chunks;
-
-            // Batch process: build all chunk data first, then embed + insert in parallel
-            const BATCH_SIZE = 5;
-            const pendingChunks = [];
-
-            for (const windowMsgs of windows) {
-                const chunkText = windowMsgs.map(m => `${m.sender_role}: ${m.content}`).join('\n');
-
-                // GUARDRAIL: Evitar fragmentación de mensajes cortos sin valor (ej: "Ok", "Vale")
-                const wordCount = chunkText.split(/\s+/).length;
-                if (wordCount < 10 && windowMsgs.length < 2) {
-                    skipped++;
-                    continue;
-                }
-
-                const contentHash = crypto.createHash('sha256')
-                    .update(`${clientId}:chunk:${chunkText}`)
-                    .digest('hex');
-
-                const { data: existing } = await supabase
-                    .from('user_memories')
-                    .select('id')
-                    .eq('client_id', clientId)
-                    .eq('content_hash', contentHash)
-                    .limit(1);
-
-                if (existing?.length > 0) {
-                    skipped++;
-                    continue;
-                }
-
-                const participants = [...new Set(windowMsgs.map(m => m.sender_role))];
-                pendingChunks.push({
-                    chunkText,
-                    contentHash,
-                    participants,
-                    dateStart: windowMsgs[0].created_at,
-                    dateEnd: windowMsgs[windowMsgs.length - 1].created_at,
-                    chunkSize: windowMsgs.length,
-                    remoteId,
-                    isGroup,
-                });
-            }
-
-            // Embed + insert in parallel batches
-            for (let b = 0; b < pendingChunks.length; b += BATCH_SIZE) {
-                const batch = pendingChunks.slice(b, b + BATCH_SIZE);
-                await Promise.all(batch.map(async (chunk) => {
-                    const embedding = await generateEmbedding(chunk.chunkText);
-                    await supabase.from('user_memories').insert({
-                        client_id: clientId,
-                        content: chunk.chunkText,
-                        sender: chunk.participants.join(', '),
-                        embedding: embedding,
-                        content_hash: chunk.contentHash,
-                        metadata: {
-                            remoteId: chunk.remoteId,
-                            isGroup: chunk.isGroup,
-                            dateStart: chunk.dateStart,
-                            dateEnd: chunk.dateEnd,
-                            participants: chunk.participants,
-                            chunkSize: chunk.chunkSize,
+            // --- Multimedia Pre-processing ---
+            for (const m of messages) {
+                m.content = sanitizeInput(m.content);
+                const attachments = m.metadata?.attachments || [];
+                if (attachments.length > 0) {
+                    console.log(`[Worker] 📎 Procesando ${attachments.length} adjuntos para mensaje ${m.id}`);
+                    for (const att of attachments) {
+                        try {
+                            const result = await processAttachment(att);
+                            if (result?.text) {
+                                m.content = `${m.content} \n${result.text}`.trim();
+                                // Persist text description back to raw_messages so we don't re-process media next time
+                                await supabase.from('raw_messages').update({ content: m.content }).eq('id', m.id);
+                            }
+                        } catch (mediaErr) {
+                            console.warn(`[Worker] ❌ Error procesando multimedia en ${m.id}: ${mediaErr.message}`);
                         }
-                    });
-                    totalChunks++;
-                }));
+                    }
+                }
             }
+
+            const conversations = {};
+            messages.forEach(m => {
+                if (!conversations[m.remote_id]) {
+                    conversations[m.remote_id] = { raw: [], firstMessageTime: m.created_at };
+                }
+                conversations[m.remote_id].raw.push(m);
+            });
+
+            for (const [remoteId, conv] of Object.entries(conversations)) {
+                // Identity Resolution
+                let contactName = remoteId;
+                try {
+                    const identity = await resolveIdentity(clientId, remoteId, null);
+                    if (identity?.name) contactName = identity.name;
+                } catch (e) { }
+
+                const userName = soulData?.soul_json?.nombre || "Usuario Principal";
+
+                const CHUNK_SIZE = 20;
+                const msgCount = conv.raw.length;
+
+                // Preparar todos los chunks
+                const allChunks = [];
+                for (let i = 0; i < msgCount; i += CHUNK_SIZE) {
+                    allChunks.push({
+                        chunk: conv.raw.slice(i, i + CHUNK_SIZE),
+                        startIndex: i
+                    });
+                }
+
+                // Procesar en lotes paralelos (concurrencia de 5) para no saturar APIs
+                const CONCURRENCY_LIMIT = 5;
+                for (let b = 0; b < allChunks.length; b += CONCURRENCY_LIMIT) {
+                    const batchChunks = allChunks.slice(b, b + CONCURRENCY_LIMIT);
+
+                    await Promise.all(batchChunks.map(async ({ chunk, startIndex: i }) => {
+                        const chunkMessages = chunk.map(m => `${m.sender_role}: ${m.content} `);
+                        const chunkText = chunk.map(m => m.content).join('\n');
+                        const lastM = chunk[chunk.length - 1];
+
+                        const hasUnread = chunk.some(m => m.metadata?.is_new_unread);
+                        const isHistorical = chunk.every(m => m.metadata?.isHistory);
+
+                        // 1. Inbox Summary
+                        if (i + CHUNK_SIZE >= msgCount || hasUnread) {
+                            try {
+                                const summaryRes = await groq.chat.completions.create({
+                                    model: 'llama-3.1-8b-instant',
+                                    messages: [{ role: 'system', content: 'Crea un titular de 10 palabras max para esta charla.' }, { role: 'user', content: chunkMessages.join('\n') }]
+                                });
+                                const summary = summaryRes.choices[0].message.content.trim();
+                                await supabase.from('inbox_summaries').upsert({
+                                    client_id: clientId, conversation_id: remoteId, summary, last_message_text: lastM.content,
+                                    last_updated: new Date().toISOString(), is_unread: hasUnread
+                                }, { onConflict: 'client_id, conversation_id' });
+                            } catch (e) { }
+                        }
+
+                        // 2. Holographic Checkpoint
+                        try {
+                            const chunkHeader = `[Fragmento Conversacional(Holograma)][Contacto: ${contactName}][ID: ${remoteId}][Fecha: ${chunk[0]?.created_at || '?'}]\n`;
+                            const enrichedText = chunkHeader + chunkText;
+                            const holographicEmbedding = await generateEmbedding(enrichedText);
+                            await supabase.from('user_memories').insert({
+                                client_id: clientId, content: enrichedText, sender: 'system_vectorization',
+                                embedding: holographicEmbedding, metadata: { remoteId, contactName, holographic: true, chunkIndex: i / CHUNK_SIZE, date: chunk[0]?.created_at }
+                            });
+                        } catch (embErr) { }
+
+                        // 3. Deep Extraction (Cíborg 4.0)
+                        if (!isHistorical || hasUnread) {
+                            await processConversationDepth(clientId, remoteId, userName, contactName, chunkMessages, lastM.sender_role, chunkText, lastM.created_at);
+                        }
+                    }));
+                }
+            }
+
+            const allIds = messages.map(m => m.id).filter(id => id);
+            for (let i = 0; i < allIds.length; i += 100) {
+                const chunkIds = allIds.slice(i, i + 100);
+                await supabase.from('raw_messages').update({ processed: true }).in('id', chunkIds);
+            }
+            totalProcessedThisRun += messages.length;
+            await autonomousDistillation(clientId, client.slug, messages.slice(-50));
         }
-
-        console.log(`📡 [Chunking] ${totalChunks} chunks creados de ${messages.length} mensajes (${skipped} dedup skips).`);
-
-        // 4. AMNESIA: Marcar como procesado (Retención de 7 días activa)
-        await supabase.from('raw_messages')
-            .update({ processed: true })
-            .in('id', messages.map(m => m.id));
-
-        // 3. Destilación de Conocimiento e Identidad (Auto-Soul)
-        await autonomousDistillation(clientId, clientSlug, messages);
-
-        console.log(`✅ [Memory Worker] Procesamiento completo para ${clientSlug}.`);
-    } catch (err) {
-        console.error(`❌ [Process] Error para ${clientId}:`, err.message);
+        await invalidateSemanticCache(clientId);
+    } catch (e) {
+        console.error('[Memory Worker] Error:', e.message);
     } finally {
-        // LIBERAR BLOQUEO
-        const { error: releaseErr } = await supabase.rpc('release_worker_lock', { target_client_id: clientId });
-        if (releaseErr) {
-            console.error(`[Worker] Error releasing lock for ${clientId}:`, releaseErr.message);
-        }
+        await supabase.from('user_souls').update({ is_processing: false, worker_status: '○ Cerebro en reposo' }).eq('client_id', clientId);
     }
 }
 
-
-
-/**
- * THE DREAM CYCLE: Descubrimiento de Conocimiento Latente.
- * Se ejecuta en periodos de baja actividad (ej: noche) para "meditar" sobre las memorias
- * y encontrar conexiones que no son evidentes en el procesamiento en tiempo real.
- */
+// === 4. DREAM CYCLE ===
 async function dreamCycle(clientId) {
     try {
-        console.log(`🌙 [DreamCycle] Iniciando meditación para: ${clientId}`);
-
-        // 1. Obtener una muestra del Grafo actual
         const { data: nodes } = await supabase.from('knowledge_nodes').select('entity_name, entity_type').eq('client_id', clientId).limit(50);
-        const { data: edges } = await supabase.from('knowledge_edges').select('source_node, relation_type, target_node').eq('client_id', clientId).limit(50);
-
-        // 2. Obtener memorias recientes densas
-        const { data: recentMemories } = await supabase
-            .from('user_memories')
-            .select('content')
-            .eq('client_id', clientId)
-            .order('created_at', { ascending: false })
-            .limit(10);
-
+        const { data: edges } = await supabase.from('knowledge_edges').select('source_node, relationship_type, target_node').eq('client_id', clientId).limit(50);
+        const { data: recentMemories } = await supabase.from('user_memories').select('content').eq('client_id', clientId).order('created_at', { ascending: false }).limit(10);
         if (!nodes?.length || !recentMemories?.length) return;
 
-        const dreamPrompt = `Eres el Subconsciente Analítico de OpenClaw. Tu función es el "Descubrimiento Latente".
-Vas a meditar sobre el Grafo de Conocimiento y las memorias recientes para encontrar conexiones OCULTAS o deducciones lógicas de Nivel 2.
-
-GRAFO ACTUAL (MUESTRA):
-Nodos: ${nodes.map(n => n.entity_name).join(', ')}
-Relaciones: ${edges.map(e => `${e.source_node} --[${e.relation_type}]--> ${e.target_node}`).join('; ')}
-
-MEMORIAS RECIENTES:
-${recentMemories.map(m => m.content).join('\n---\n')}
-
-TAREA (MEDITACIÓN NIVEL 3):
-1. Encuentra conexiones LATENTES (deducciones de segundo nivel).
-2. Detecta CONFLICTOS (si un hecho nuevo contradice uno viejo).
-3. Identifica OPORTUNIDADES (ej: "A necesita X y B ofrece X").
-4. Genera RAZONAMIENTO profundo.
-
-Responde JSON:
-{
-  "latent_connections": [
-    { 
-      "source": "Sujeto", 
-      "relation": "RELACION", 
-      "target": "Objeto", 
-      "reasoning": "Por qué has deducido esto",
-      "confidence": 0-1,
-      "flags": ["deduccion", "oportunidad"]
-    }
-  ],
-  "conflicts_detected": [
-    { "entity": "Sujeto", "conflict": "Descripción del choque" }
-  ]
-}`;
-
-        const response = await groq.chat.completions.create({
+        const dreamResponse = await groq.chat.completions.create({
             model: 'llama-3.3-70b-versatile',
-            messages: [{ role: 'system', content: dreamPrompt }],
-            response_format: { type: 'json_object' },
-            temperature: 0.4
+            messages: [{ role: 'system', content: 'Extrae conexiones latentes en JSON: {"latent_connections": [{"source", "relation", "target", "reasoning", "confidence"}]}' }, { role: 'user', content: `NODOS: ${nodes.map(n => n.entity_name).join(', ')} \nMEMORIAS: \n${recentMemories.map(m => m.content).join('\n')} ` }],
+            response_format: { type: 'json_object' }
         });
 
-        const discovery = parseLLMJson(response.choices[0].message.content);
-
-        if (discovery.latent_connections?.length > 0) {
-            console.log(`🌙 [DreamCycle] ¡Se han descubierto ${discovery.latent_connections.length} conexiones latentes!`);
-            for (const conn of discovery.latent_connections) {
-                if (conn.confidence < 0.6) continue; // Filtrar deducciones debiles
-
-                await upsertKnowledgeNode(clientId, conn.source, 'ENTITY', 'Deducido en Dream Cycle');
-                await upsertKnowledgeNode(clientId, conn.target, 'ENTITY', 'Deducido en Dream Cycle');
-                
-                await supabase.rpc('upsert_knowledge_edge_v4', {
-                    p_client_id: clientId,
-                    p_source_node: conn.source,
-                    p_target_node: conn.target,
-                    p_relation_type: conn.relation,
-                    p_context: `Deducción: ${conn.reasoning}`,
-                    p_flags: conn.flags || ['dream_cycle']
-                });
-                console.log(`   ✨ Deducción: ${conn.source} ${conn.relation} ${conn.target} (${conn.reasoning})`);
+        const discovery = parseLLMJson(dreamResponse.choices[0].message.content);
+        for (const conn of (discovery?.latent_connections || [])) {
+            if (conn.confidence > 0.7) {
+                await upsertKnowledgeNode(clientId, conn.source, 'ENTITY', 'Deducido');
+                await upsertKnowledgeNode(clientId, conn.target, 'ENTITY', 'Deducido');
+                await upsertKnowledgeEdge(clientId, conn.source, conn.target, conn.relation, 0.5, conn.reasoning);
             }
         }
-
-    } catch (e) {
-        console.error(`🌙 [DreamCycle] Error en la meditación:`, e.message);
-    }
+    } catch (e) { }
 }
 
-// === MAIN: REDIS EVENT LISTENER ===
-async function main() {
-    console.log('🚀 Worker de Memoria en Tiempo Real ONLINE');
-
-    // 1. Suscribirse a eventos de expiración de llaves Redis
-    const redisListener = createRedisClient();
-    await redisListener.connect();
-
-    // Redis requires a dedicated connection for subscriptions
-    const redisSub = redisListener.duplicate();
-    await redisSub.connect();
-
-    await redisSub.subscribe('__keyevent@0__:expired', async (key) => {
-        if (key.startsWith('idle:')) {
-            const clientId = key.split('idle:')[1];
-            console.log(`⚡ [RAG-Event] Inactividad detectada para: ${clientId}. Procesando ahora...`);
-            await distillAndVectorize(clientId);
-        }
-    });
-
-    console.log('👂 Escuchando eventos de expiración de Redis...');
-
-    // 2. Ya no hay Docker. Scale-To-Zero se maneja internamente.
-
-    // Run once at startup after 30 seconds
-    setTimeout(consolidateMemories, 30 * 1000);
-    setTimeout(cleanupRawMessages, 60 * 1000);
-
-    // ══════════════════════════════════════════════════════════
-    // 6. FORMAL SCHEDULING (node-cron)
-    // ══════════════════════════════════════════════════════════
-
-    // DREAM CYCLE: Diario a las 3:00 AM
-    cron.schedule('0 3 * * *', async () => {
-        console.log('🌙 [Cron] Iniciando Ciclo del Sueño (Dream Cycle)...');
-        const { data: clients } = await supabase.from('user_souls').select('client_id');
-        for (const client of clients) {
-            await dreamCycle(client.client_id);
-        }
-    });
-
-    // Fallback: cada 30 min, procesar clientes que puedan haberse escapado
-    cron.schedule('*/30 * * * *', async () => {
-        console.log('🔄 [Cron: Fallback] Barrido de seguridad...');
-        const { data: clients } = await supabase
-            .from('raw_messages')
-            .select('client_id')
-            .eq('processed', false); // Added .eq('processed', false) for correctness
-
-        const uniqueClients = [...new Set(clients?.map(c => c.client_id))];
-        for (const clientId of uniqueClients) {
-            await distillAndVectorize(clientId);
-        }
-    });
-
-    // Memory Consolidation: Cada 3 horas
-    cron.schedule('0 */3 * * *', async () => {
-        await consolidateMemories();
-    });
-
-    // Raw Messages Cleanup: Cada 6 horas
-    cron.schedule('0 */6 * * *', async () => {
-        await cleanupRawMessages();
-    });
-
-    // 4. LIMPIEZA DE UPLOADS (Diario a las 04:00 AM)
-    cron.schedule('0 4 * * *', async () => {
-        console.log('🧹 [Cleanup] Iniciando limpieza de archivos temporales en uploads/...');
-        try {
-            const uploadsDir = './uploads';
-            const files = await fs.readdir(uploadsDir);
-            const now = Date.now();
-            const MAX_AGE = 24 * 60 * 60 * 1000; // 24 horas
-
-            for (const file of files) {
-                if (file === '.placeholder') continue;
-                const filePath = path.join(uploadsDir, file);
-                const stats = await fs.stat(filePath);
-                if (now - stats.mtimeMs > MAX_AGE) {
-                    await fs.unlink(filePath);
-                    console.log(`- Eliminado: ${file}`);
-                }
-            }
-            console.log('✅ [Cleanup] Limpieza completada.');
-        } catch (err) {
-            console.error('❌ [Cleanup] Error en limpieza:', err.message);
-        }
-    });
-
-    // 5. HEALTH CHECK (Cada 1 hora)
-    cron.schedule('0 * * * *', () => {
-        const mem = process.memoryUsage();
-        console.log(`💓 [Health] Worker vivo. Memoria: ${Math.round(mem.heapUsed / 1024 / 1024)}MB / ${Math.round(mem.rss / 1024 / 1024)}MB RSS`);
-    });
-
-    console.log('📅 [Scheduler] Tareas programadas: Fallback (30m), Consolidación (3h), Purga (6h), Limpieza (4am), Health (1h).');
-}
-
-// ══════════════════════════════════════════════════════════
-// 4. MEMORY CONSOLIDATION (RECURSIVE TEMPORAL NARRATIVE)
-// ══════════════════════════════════════════════════════════
+// === 5. MEMORY CONSOLIDATION ===
 async function consolidateMemories() {
-    console.log('🧹 [Consolidation] Iniciando consolidación recursiva de memorias (Infinite Memory)...');
     try {
-        const DAYS_THRESHOLD = 7; // Más agresivo para formar la pirámide rápido
-        const cutoffDate = new Date(Date.now() - DAYS_THRESHOLD * 24 * 60 * 60 * 1000).toISOString();
+        const cutoffDate = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+        const { data: oldMemories } = await supabase.from('user_memories').select('*').lt('created_at', cutoffDate).order('created_at', { ascending: true }).limit(1000);
+        if (!oldMemories?.length) return;
 
-        // Get old memories (raw chunks and old summaries)
-        const { data: oldMemories, error } = await supabase
-            .from('user_memories')
-            .select('id, client_id, content, metadata, created_at')
-            .lt('created_at', cutoffDate)
-            .order('created_at', { ascending: true })
-            .limit(1000);
-
-        if (error || !oldMemories?.length) {
-            console.log(`🧹 [Consolidation] ${error ? 'Error: ' + error.message : 'No hay memorias antiguas para consolidar.'}`);
-            return;
-        }
-
-        // Group by client_id + remoteId + level
         const groups = {};
         for (const mem of oldMemories) {
-            const remoteId = mem.metadata?.remoteId || 'unknown';
-            const level = mem.metadata?.level || 0; // 0 = raw, 1 = summary, 2 = meta-summary...
-            const key = `${mem.client_id}::${remoteId}::level_${level}`;
-            if (!groups[key]) groups[key] = { clientId: mem.client_id, remoteId, level, memories: [] };
-            groups[key].memories.push(mem);
+            const key = `${mem.client_id}::${mem.metadata?.remoteId || 'unknown'} `;
+            if (!groups[key]) groups[key] = [];
+            groups[key].push(mem);
         }
 
-        let consolidated = 0;
-        let deleted = 0;
-
-        for (const [key, group] of Object.entries(groups)) {
-            // Need at least 4 items of the same level to justify a higher-level summary
-            if (group.memories.length < 4) continue;
-
-            const isMeta = group.level > 0;
-            const nextLevel = group.level + 1;
-
-            const fullText = group.memories
-                .map(m => m.content)
-                .join('\n---\n')
-                .slice(0, 12000); // Llama-3 8B handles 8k context
-
-            try {
-                const systemMsg = isMeta
-                    ? `Eres un Historiador de Datos (Nivel ${nextLevel}). Consolida estos ${group.memories.length} resúmenes pasados en una "Narrativa Temporal". Extrae la evolución de la relación, eventos históricos clave que perduren en el tiempo, y el arco narrativo general. Sé denso en datos.`
-                    : `Eres un sistema de consolidación de memoria (Nivel 1). Dado un conjunto de fragmentos de conversación, genera un resumen conciso que capture temas principales, hechos clave (nombres, fechas, planes), tono y acuerdos tomados.`;
-
-                const summaryResponse = await groq.chat.completions.create({
-                    model: 'llama-3.1-8b-instant',
-                    messages: [{
-                        role: 'system',
-                        content: systemMsg + `\nFormato: Resumen narrativo. Mantén el idioma original. NO añadas comentarios propios.`
-                    }, {
-                        role: 'user',
-                        content: `Consolida estos fragmentos de ${group.remoteId}:\n\n${fullText}`
-                    }],
-                    temperature: 0.2,
-                    max_tokens: 1000,
-                });
-
-                const summary = summaryResponse.choices[0].message.content;
-                const embedding = await generateEmbedding(summary);
-
-                const dateStart = group.memories[0].created_at;
-                const dateEnd = group.memories[group.memories.length - 1].created_at;
-                const prefix = isMeta ? `[HISTORIA RECURSIVA L${nextLevel} — ${group.memories.length} resúmenes]` : `[RESUMEN CONSOLIDADO L1 — ${group.memories.length} fragmentos]`;
-
-                await supabase.from('user_memories').insert({
-                    client_id: group.clientId,
-                    content: `${prefix}\n${summary}`,
-                    sender: 'system_consolidation',
-                    embedding: embedding,
-                    content_hash: crypto.createHash('sha256').update(`consolidated:${key}:${dateStart}:${dateEnd}`).digest('hex'),
-                    metadata: {
-                        remoteId: group.remoteId,
-                        isGroup: group.remoteId.includes('@g.us'),
-                        dateStart,
-                        dateEnd,
-                        consolidated: true,
-                        level: nextLevel,
-                        originalCount: group.memories.length
-                    }
-                });
-
-                const idsToDelete = group.memories.map(m => m.id);
-                await supabase.from('user_memories').delete().in('id', idsToDelete);
-
-                consolidated++;
-                deleted += idsToDelete.length;
-                console.log(`🧹 [Consolidation Level ${nextLevel}] ${group.remoteId.slice(0, 12)}...: ${idsToDelete.length} chunks → 1 Meta-Resumen`);
-            } catch (e) {
-                console.warn(`[Consolidation] Error procesando ${key}:`, e.message);
-            }
+        for (const [key, memories] of Object.entries(groups)) {
+            if (memories.length < 5) continue;
+            const [clientId, remoteId] = key.split('::');
+            const summaryRes = await groq.chat.completions.create({
+                model: 'llama-3.1-8b-instant',
+                messages: [{ role: 'system', content: 'Consolida en narrativa densa.' }, { role: 'user', content: memories.map(m => m.content).join('\n') }]
+            });
+            const summary = summaryRes.choices[0].message.content;
+            const embedding = await generateEmbedding(summary);
+            await supabase.from('user_memories').insert({
+                client_id: clientId, content: `[HISTORIA CONSOLIDADA]\n${summary} `,
+                sender: 'system_consolidation', embedding, metadata: { remoteId, consolidated: true, level: 1 }
+            });
+            await supabase.from('user_memories').delete().in('id', memories.map(m => m.id));
         }
-
-        console.log(`✅ [Consolidation] ${consolidated} grupos consolidados (Recursivo), ${deleted} chunks eliminados.`);
-    } catch (err) {
-        console.error('[Consolidation] Error general:', err.message);
-    }
+    } catch (e) { }
 }
 
-// ═══════════════════════════════════════════════════════════
-// 5. RAW MESSAGES CLEANUP — Purge processed msgs older than 7 days
-// ═══════════════════════════════════════════════════════════
 async function cleanupRawMessages() {
-    console.log('🗑️ [Cleanup] Purgando raw_messages procesados (+7 días)...');
-    try {
-        const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
-        const { count, error } = await supabase
-            .from('raw_messages')
-            .delete({ count: 'exact' })
-            .eq('processed', true)
-            .lt('created_at', cutoff);
-
-        if (error) {
-            console.error('[Cleanup] Error:', error.message);
-        } else {
-            console.log(`✅ [Cleanup] ${count || 0} mensajes antiguos eliminados.`);
-        }
-    } catch (e) {
-        console.error('[Cleanup] Error general:', e.message);
-    }
+    const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
+    await supabase.from('raw_messages').delete().eq('processed', true).lt('created_at', cutoff);
 }
 
-main().catch(err => {
-    console.error('💀 [Worker] Error fatal:', err.message);
-    process.exit(1);
-});
+// === MAIN ===
+async function main() {
+    console.log('🚀 OpenClaw Memory Worker 2026 Online');
+    try {
+        const redisSub = redisClient.duplicate();
+        await redisSub.connect();
 
-export { distillAndVectorize };
+        await redisSub.subscribe('__keyevent@0__:expired', async (key) => {
+            if (key.startsWith('idle:')) {
+                const clientId = key.split('idle:')[1];
+                await distillAndVectorize(clientId);
+            }
+        });
+
+        cron.schedule('*/30 * * * *', async () => {
+            const { data: clients } = await supabase.from('raw_messages').select('client_id').eq('processed', false);
+            const active = [...new Set(clients?.map(c => c.client_id))];
+            for (const cid of active) await distillAndVectorize(cid);
+        });
+        cron.schedule('0 3 * * *', async () => {
+            const { data: clients } = await supabase.from('user_souls').select('client_id');
+            for (const c of (clients || [])) await dreamCycle(c.client_id);
+        });
+        cron.schedule('0 */3 * * *', consolidateMemories);
+        cron.schedule('0 4 * * *', cleanupRawMessages);
+    } catch (err) { }
+}
+
+main().catch(console.error);

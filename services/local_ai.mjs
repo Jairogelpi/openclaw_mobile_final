@@ -46,19 +46,48 @@ export async function generateEmbedding(text, isQuery = false) {
 }
 
 /**
- * Re-clasifica una lista de memorias según su relevancia con la consulta.
- * @param {string} query 
- * @param {Array} memories 
+ * Re-clasifica memorias usando similitud coseno REAL contra el vector de la query.
+ * OPTIMIZADO: Usa el score RRF existente como base y solo genera embeddings
+ * para candidatos de grafo que no tienen uno (cap de 10 máximo).
+ * @param {string} query - Texto original de la consulta
+ * @param {Array} memories - Candidatos del hybrid+graph search
+ * @param {number[]} queryVector - Vector pre-computado de la query (opcional)
  * @returns {Promise<Array>}
  */
-export async function reRankMemories(query, memories) {
+export async function reRankMemories(query, memories, queryVector = null) {
     if (!memories || memories.length === 0) return [];
-    // BYPASS Local Re-Ranker: PostgreSQL Hybrid RRF is already accurate enough
-    // and avoids HuggingFace ONNX parsing/download errors.
-    return memories.map((m, i) => ({
-        ...m,
-        rerank_score: 1.0 - (i * 0.01) // Mantener orden original (RRF)
+
+    // Generar el vector de la query si no se proporcionó
+    const qVec = queryVector || await generateEmbedding(query, true);
+
+    let onTheFlyCount = 0;
+    const MAX_ON_THE_FLY = 10; // Cap para evitar bloqueo de CPU
+
+    // Computar similitud coseno REAL para cada candidato
+    const scored = await Promise.all(memories.map(async (m) => {
+        let score = m.similarity || 0; // Base: score RRF de PostgreSQL
+
+        // Si la memoria tiene embedding guardado, usarlo para re-rank preciso
+        if (m.embedding && Array.isArray(m.embedding)) {
+            score = cosineSimilarity(qVec, m.embedding);
+        } else if (m.content && onTheFlyCount < MAX_ON_THE_FLY) {
+            // Solo generar embedding en caliente para un número limitado de candidatos
+            try {
+                onTheFlyCount++;
+                const memVec = await generateEmbedding(m.content);
+                score = cosineSimilarity(qVec, memVec);
+            } catch (e) {
+                // Mantener score original si falla
+            }
+        }
+        // Si ya superamos el cap, mantener el score RRF original (ya normalizado)
+
+        return { ...m, rerank_score: score };
     }));
+
+    // Ordenar por score real descendente
+    scored.sort((a, b) => b.rerank_score - a.rerank_score);
+    return scored;
 }
 
 /**
@@ -99,9 +128,10 @@ export async function checkSemanticCache(clientId, queryVector, threshold = 0.95
  * Guarda una respuesta en la caché semántica.
  * @param {string} clientId 
  * @param {number[]} vector 
+ * @param {string} query 
  * @param {string} reply 
  */
-export async function saveToSemanticCache(clientId, vector, reply) {
+export async function saveToSemanticCache(clientId, vector, query, reply) {
     if (!redisClient) return;
 
     try {
@@ -110,7 +140,7 @@ export async function saveToSemanticCache(clientId, vector, reply) {
         let cacheEntries = rawCache ? JSON.parse(rawCache) : [];
 
         // Añadir nuevo ítem al principio para búsqueda LIFO
-        cacheEntries.unshift({ vector, reply, timestamp: Date.now() });
+        cacheEntries.unshift({ vector, query, reply, timestamp: Date.now() });
 
         // Limitar a los 500 últimos
         if (cacheEntries.length > 500) {
@@ -121,6 +151,21 @@ export async function saveToSemanticCache(clientId, vector, reply) {
         await redisClient.set(cacheKey, JSON.stringify(cacheEntries), { EX: 86400 });
     } catch (e) {
         console.warn('⚠️ [Semantic Cache] Error guardando en Redis:', e.message);
+    }
+}
+
+/**
+ * Invalida la caché semántica de un cliente cuando se ingieren nuevos recuerdos.
+ * Esto evita que respuestas "No tengo información" queden cacheadas permanentemente.
+ */
+export async function invalidateSemanticCache(clientId) {
+    if (!redisClient) return;
+    try {
+        const cacheKey = `semcache:${clientId}`;
+        await redisClient.del(cacheKey);
+        console.log(`🗑️ [Semantic Cache] Caché invalidada para ${clientId} (nuevos recuerdos ingresados).`);
+    } catch (e) {
+        console.warn('⚠️ [Semantic Cache] Error invalidando:', e.message);
     }
 }
 

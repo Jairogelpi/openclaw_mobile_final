@@ -2,6 +2,7 @@ import supabase from '../config/supabase.mjs';
 import redisClient from '../config/redis.mjs';
 import groq from '../services/groq.mjs';
 import { cosineSimilarity } from '../utils/math.mjs';
+import { resolveIdentity } from '../skills/whatsapp_contacts.mjs';
 
 // Cache para Smart Reply (10 mins)
 const smartReplyCache = new Map();
@@ -30,10 +31,25 @@ export async function getInboxSummaries(req, res) {
             .from('inbox_summaries')
             .select('*')
             .eq('client_id', clientId)
+            .eq('is_unread', true)
             .order('last_updated', { ascending: false });
 
         if (error) throw error;
-        res.json(data);
+
+        const enrichedData = await Promise.all(data.map(async (item) => {
+            const { count } = await supabase
+                .from('user_memories')
+                .select('*', { count: 'exact', head: true })
+                .eq('client_id', clientId)
+                .contains('metadata', { remoteId: item.conversation_id });
+            return { 
+                ...item, 
+                is_read: !item.is_unread, // User spec: Boolean for Inbox Zero
+                msg_count: count || 0 
+            };
+        }));
+
+        res.json(enrichedData);
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -44,17 +60,109 @@ export async function getInboxHistory(req, res) {
         const clientId = req.user.clientId;
         const { remoteId } = req.params;
 
-        // Consultamos user_memories filtrando por el remoteId en el JSONB de metadata
+        // Query raw_messages for the actual conversation log
         const { data, error } = await supabase
-            .from('user_memories')
-            .select('content, sender, created_at')
+            .from('raw_messages')
+            .select('id, content, sender_role, created_at, metadata')
             .eq('client_id', clientId)
-            .contains('metadata', { remoteId: remoteId })
+            .eq('remote_id', remoteId)
             .order('created_at', { ascending: true })
-            .limit(30);
+            .limit(100);
 
         if (error) throw error;
-        res.json(data);
+
+        // Transform to the format the native clone expects with identity resolution
+        const messages = await Promise.all((data || []).map(async (m) => {
+            const meta = m.metadata || {};
+            const participantJid = meta.participantJid;
+            const isSentByMe = m.sender_role === 'user_sent';
+            
+            let senderName = isSentByMe ? 'Yo' : (meta.pushName || m.sender_role || 'Contacto');
+            
+            // Si es un grupo, intentamos resolver el nombre real del participante
+            if (!isSentByMe && participantJid) {
+                const identity = await resolveIdentity(clientId, participantJid);
+                if (identity && identity.name) {
+                    senderName = identity.name;
+                }
+            }
+
+            return {
+                id: meta.msgId || m.id, // Prefer Baileys ID for tracking
+                text: m.content,
+                timestamp: m.created_at,
+                from_me: isSentByMe,
+                sender_name: senderName,
+                media_url: meta.media_url || null,
+                media_type: meta.media_type || null,
+                status: meta.status || (isSentByMe ? 'sent' : 'read'), // 'sent' | 'read'
+                contact_name: senderName
+            };
+        }));
+
+        res.json(messages);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+export async function getWhatsAppMetadata(req, res) {
+    try {
+        const clientId = req.user.clientId;
+        const { jid } = req.params;
+        const isGroup = jid.endsWith('@g.us');
+
+        if (isGroup) {
+            // Read from Redis group_meta cache
+            const cached = redisClient ? await redisClient.get(`group_meta:${clientId}:${jid}`) : null;
+            if (cached) {
+                const meta = JSON.parse(cached);
+                return res.json({
+                    name: meta.subject || jid,
+                    description: meta.desc || 'Sin descripción',
+                    avatar: meta.avatar || null,
+                    phone: jid.split('@')[0],
+                    participants: [], // Full participant list requires live socket query
+                    participantsCount: meta.participantsCount || 0,
+                    isGroup: true
+                });
+            }
+            // Fallback: no cached metadata
+            return res.json({
+                name: jid.split('@')[0],
+                description: 'Grupo de WhatsApp',
+                avatar: null,
+                phone: jid.split('@')[0],
+                participants: [],
+                participantsCount: 0,
+                isGroup: true
+            });
+        } else {
+            // Read from Redis contacts cache
+            const cached = redisClient ? await redisClient.get(`contacts:${clientId}:${jid}`) : null;
+            const phone = jid.replace('@s.whatsapp.net', '');
+            if (cached) {
+                const contact = JSON.parse(cached);
+                return res.json({
+                    name: contact.name || phone,
+                    description: 'Contacto de WhatsApp',
+                    avatar: contact.avatar || null,
+                    phone: `+${phone}`,
+                    participants: [],
+                    participantsCount: 0,
+                    isGroup: false
+                });
+            }
+            return res.json({
+                name: phone,
+                description: 'Contacto de WhatsApp',
+                avatar: null,
+                phone: `+${phone}`,
+                participants: [],
+                participantsCount: 0,
+                isGroup: false
+            });
+        }
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -506,5 +614,26 @@ REGLAS:
             res.write(`data: ${JSON.stringify({ error: err.message })}\n\n`);
             res.end();
         }
+    }
+}
+
+export async function markAsRead(req, res) {
+    try {
+        const clientId = req.user.clientId;
+        const { jid } = req.params;
+
+        console.log(`[Inbox] Marcando como leído: ${jid} para cliente ${clientId}`);
+
+        const { error } = await supabase
+            .from('inbox_summaries')
+            .update({ is_unread: false })
+            .eq('client_id', clientId)
+            .eq('conversation_id', jid);
+
+        if (error) throw error;
+
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
     }
 }

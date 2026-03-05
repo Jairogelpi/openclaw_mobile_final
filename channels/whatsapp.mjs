@@ -5,6 +5,7 @@ import { Worker } from 'bullmq';
 import { incomingQueue, outgoingQueue, mediaQueue } from '../config/queues.mjs';
 import redisClient from '../config/redis.mjs';
 import groq from '../services/groq.mjs';
+import { resolveIdentity } from '../skills/whatsapp_contacts.mjs';
 import supabase from '../config/supabase.mjs';
 
 /**
@@ -24,6 +25,7 @@ export const activeSessions = new Map();
 export const lastActivity = new Map(); // Novedad: Registro de última actividad
 console.log("🚀🚀🚀 WHATSAPP.MJS LOADED AT " + new Date().toISOString());
 export const qrCodes = new Map();
+export const pairingCodes = new Map();
 const startingSessions = new Set();
 const reconnectAttempts = new Map(); // Track reconnect attempts for exponential backoff
 
@@ -59,7 +61,14 @@ const extractMessageContent = (m) => {
     if (typeof m === 'string') return m;
 
     // Si m es el objeto msg.message completo, intentamos sacar el contenido real
-    const content = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m;
+    // Desglosar capas de envoltorio (Ephemeral, ViewOnce, Edited, Protocol)
+    let content = m.ephemeralMessage?.message || m.viewOnceMessage?.message || m.viewOnceMessageV2?.message || m.editedMessage?.message || m;
+
+    // Si sigue habiendo un envoltorio de editedMessage dentro (visto en algunos casos)
+    if (content.editedMessage?.message) content = content.editedMessage.message;
+
+    // Si es un messageContextInfo, bajar un nivel
+    if (content.messageContextInfo?.message) content = content.messageContextInfo.message;
 
     if (content.conversation) return content.conversation;
     if (content.extendedTextMessage?.text) return content.extendedTextMessage.text;
@@ -70,6 +79,14 @@ const extractMessageContent = (m) => {
     if (content.listResponseMessage?.singleSelectReply?.selectedRowId) return content.listResponseMessage.singleSelectReply.selectedRowId;
     if (content.templateButtonReplyMessage?.selectedId) return content.templateButtonReplyMessage.selectedId;
     if (content.interactiveResponseMessage?.nativeFlowResponseMessage?.paramsJson) return content.interactiveResponseMessage.nativeFlowResponseMessage.paramsJson;
+
+    // Protocol Message (History sync uses this)
+    if (content.protocolMessage) {
+        // Si es una edición
+        if (content.protocolMessage.editedMessage) return extractMessageContent(content.protocolMessage.editedMessage);
+        // Silenciamos otros tipos de protocolo para no ensuciar logs, pero no son texto
+        return '';
+    }
 
     // Recursión para mensajes citados si no hay texto arriba
     if (content.quotedMessage) return extractMessageContent(content.quotedMessage);
@@ -127,6 +144,7 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 await new Promise(resolve => setTimeout(resolve, 2000));
                 let code = await sock.requestPairingCode(formattedNumber);
                 code = code?.match(/.{1,4}/g)?.join("-") || code;
+                pairingCodes.set(sessionKey, code);
                 return { status: 'pairing_code', code };
             } catch (e) {
                 console.error(`[WhatsApp-Baileys] ❌ Error requesting pairing code:`, e.message);
@@ -164,10 +182,15 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
         version: waVersion,
         printQRInTerminal: !phoneNumber,
         browser: ['Mac OS', 'Chrome', '121.0.6167.85'],
-        syncFullHistory: true, // Habilitado para cumplir con la ingesta de 1 año
-        markOnlineOnConnect: false,
-        qrTimeout: 120_000, // 2 minutos por ciclo QR (default: 60s) — da más tiempo al usuario
-        logger: pino({ level: 'silent' })
+        syncFullHistory: true, // Re-activado para capturar mensajes no leídos (Inbox)
+        markOnlineOnConnect: true,
+        qrTimeout: 120_000,
+        logger: pino({ level: 'error' }) // Solo errores críticos de Baileys
+    });
+
+    // Debug: Capturar errores de eventos globales
+    sock.ev.on('error', (err) => {
+        console.error(`[${clientSlug}] 🔴 Error de Baileys Event:`, err);
     });
 
     // 1. Guardar credenciales automáticamente si cambian
@@ -193,6 +216,7 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
 
             activeSessions.delete(sessionKey);
             qrCodes.delete(sessionKey);
+            pairingCodes.delete(sessionKey);
             startingSessions.delete(sessionKey);
 
             if (shouldReconnect && statusCode !== 405 && statusCode !== 401) {
@@ -226,218 +250,521 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
         } else if (connection === 'open') {
             console.log(`[WhatsApp-Baileys] ✅ ${clientSlug} conectado y listo (RAM al mínimo).`);
             qrCodes.delete(sessionKey);
+            pairingCodes.delete(sessionKey);
             startingSessions.delete(sessionKey);
             reconnectAttempts.delete(sessionKey); // Reset attempts on successful connection
+
+            // 🔑 CRITICAL: Deeply request message history and contacts sync
+            setTimeout(async () => {
+                const results = await Promise.allSettled([
+                    (async () => {
+                        console.log(`[${clientSlug}] 📬 Solicitando historial profundo (10000 msgs)...`);
+                        await sock.fetchMessageHistory(10000, { remoteJid: '0@s.whatsapp.net', id: '' }, 0);
+                        console.log(`[${clientSlug}] ✅ Historial solicitado.`);
+                    })(),
+                    (async () => {
+                        console.log(`[${clientSlug}] 📖 Sincronizando agenda de contactos...`);
+                        await sock.resyncAppState(['critical_unblock_low', 'regular_low']);
+                        console.log(`[${clientSlug}] ✅ Resync de agenda solicitado.`);
+                    })()
+                ]);
+
+                results.forEach((res, i) => {
+                    if (res.status === 'rejected') {
+                        console.warn(`[${clientSlug}] ⚠️ Tarea post-conexión ${i} falló:`, res.reason?.message);
+                    }
+                });
+            }, 6000); // 6s to ensure session is fully ready
         }
     });
 
-    // 3.1 Sincronización de Historial (Indexing on Login - Last 1 Year + Chunked Batching)
-    sock.ev.on('messaging-history.set', async ({ messages, isLatest }) => {
-        console.log(`[${clientSlug}] 📚 Sincronizando historial: ${messages.length} mensajes totales en el evento.`);
-        const supabase = (await import('../config/supabase.mjs')).default;
+    // Helper: Sincronización de Agenda (Nombres + Avatares)
+    const syncContacts = async (contacts) => {
+        if (!redisClient || !contacts?.length) return;
+        try {
+            console.log(`[${clientSlug}] 📖 Sincronizando agenda (${contacts.length} contactos)...`);
 
-        const oneYearAgo = Math.floor(Date.now() / 1000) - (365 * 24 * 60 * 60);
+            // FASE 1: Guardar NOMBRES inteligentemente
+            for (const contact of contacts) {
+                if (!contact.id) continue;
+                const key = `contacts:${clientId}:${contact.id}`;
 
-        // Filtrar por fecha (último año) y limpiar nulos
-        const filteredMessages = messages.filter(msg => {
-            const timestamp = msg.messageTimestamp;
-            return timestamp && timestamp > oneYearAgo;
-        }).sort((a, b) => b.messageTimestamp - a.messageTimestamp);
+                // Intentamos rescatar lo que ya hay para no pisar nombres de agenda con pushnames
+                const existing = await redisClient.get(key);
+                const parsedExisting = existing ? JSON.parse(existing) : null;
 
-        console.log(`[${clientSlug}] 📂 Procesando ${filteredMessages.length} mensajes del último año...`);
+                const newName = contact.name || contact.notify || (parsedExisting ? parsedExisting.name : null);
 
-        const allEntries = [];
-        for (const msg of filteredMessages) {
-            const isSentByMe = msg.key.fromMe;
-            const senderId = msg.key.remoteJid;
-            if (senderId === 'status@broadcast') continue;
+                // Solo actualizamos si tenemos un nombre mejor o si no existía
+                // Si el existente tiene .name (agenda) y el nuevo solo tiene .notify (pushname), ignoramos el cambio de nombre
+                const contactData = {
+                    name: (parsedExisting?.name && !contact.name) ? parsedExisting.name : newName,
+                    avatar: parsedExisting?.avatar || null,
+                    updatedAt: Date.now()
+                };
 
-            let text = extractMessageContent(msg.message);
-            if (!text) continue;
-
-            allEntries.push({
-                client_id: clientId,
-                sender_role: isSentByMe ? 'user_sent' : (msg.pushName || 'Historial'),
-                content: text,
-                remote_id: senderId,
-                metadata: { historical: true, msgId: msg.key.id, pushName: msg.pushName },
-                created_at: new Date(msg.messageTimestamp * 1000).toISOString()
-            });
-        }
-
-        // Dividir en lotes de 500 para evitar saturar la conexión/CPU
-        const chunkSize = 500;
-        for (let i = 0; i < allEntries.length; i += chunkSize) {
-            const chunk = allEntries.slice(i, i + chunkSize);
-            try {
-                console.log(`[${clientSlug}] 🚚 Insertando lote de ${chunk.length} mensajes históricos (${i + 1}-${i + chunk.length})...`);
-                const { error: batchErr } = await supabase.from('raw_messages').insert(chunk);
-                if (batchErr) {
-                    console.warn(`[${clientSlug}] ⚠️ Posibles duplicados en lote histórico:`, batchErr.message);
-                }
-            } catch (e) {
-                console.error(`[${clientSlug}] ❌ Error crítico en inserción masiva:`, e.message);
+                await redisClient.set(key, JSON.stringify(contactData), { EX: 7 * 24 * 60 * 60 });
             }
-        }
 
-        if (isLatest) {
-            console.log(`[${clientSlug}] ✅ Historial sincronizado completamente (${filteredMessages.length} mensajes indexados).`);
-            await triggerMemoryTimer(clientId);
+            // FASE 2: Avatares en BACKGROUND
+            setTimeout(async () => {
+                let fetched = 0;
+                for (const contact of contacts) {
+                    if (!contact.id || !contact.id.endsWith('@s.whatsapp.net')) continue;
+                    try {
+                        const avatarUrl = await sock.profilePictureUrl(contact.id, 'image').catch(() => null);
+                        if (avatarUrl) {
+                            const key = `contacts:${clientId}:${contact.id}`;
+                            const existing = await redisClient.get(key);
+                            const parsed = existing ? JSON.parse(existing) : {};
+                            parsed.avatar = avatarUrl;
+                            await redisClient.set(key, JSON.stringify(parsed), { EX: 7 * 24 * 60 * 60 });
+                            fetched++;
+                        }
+                    } catch (e) { }
+                    await new Promise(r => setTimeout(r, 200));
+                }
+                if (fetched > 0) console.log(`[${clientSlug}] 📸 Avatares actualizados: ${fetched}/${contacts.length}`);
+            }, 20000);
+        } catch (e) {
+            console.warn(`[${clientSlug}] ⚠️ Error en syncContacts:`, e.message);
+        }
+    };
+
+    // 2.5 Sincronización de Agenda (Eventos Incrementales)
+    sock.ev.on('contacts.upsert', async (contacts) => {
+        await syncContacts(contacts);
+    });
+
+    // 3.1 Sincronización de Historial — Ahora extrae Agenda y Grupos pero ignora mensajes
+    sock.ev.on('messaging-history.set', async ({ messages, contacts, chats }) => {
+        try {
+            console.log(`[${clientSlug}] 📚 Historial recibido: ${messages?.length || 0} msgs, ${contacts?.length || 0} contactos, ${chats?.length || 0} chats.`);
+            if (chats?.length > 0) {
+                const unreadChats = chats.filter(c => c.unreadCount > 0);
+                console.log(`[${clientSlug}] 📂 Chats con no leídos: ${unreadChats.length} de ${chats.length}`);
+                if (unreadChats.length > 0) {
+                    console.log(`[${clientSlug}] 📝 JIDs no leídos: ${unreadChats.map(c => c.id).join(', ')}`);
+                }
+            }
+
+            // Sincronizar agenda inicial
+            if (contacts) await syncContacts(contacts);
+
+            // Sincronizar metadatos de grupos iniciales
+            if (chats && redisClient) {
+                for (const chat of chats) {
+                    if (chat.id.endsWith('@g.us')) {
+                        const groupCacheKey = `group_meta:${clientId}:${chat.id}`;
+                        const hasCachedMeta = await redisClient.get(groupCacheKey);
+                        if (!hasCachedMeta) {
+                            try {
+                                const metadata = await sock.groupMetadata(chat.id).catch(() => null);
+                                if (metadata) {
+                                    let groupAvatar = await sock.profilePictureUrl(chat.id, 'image').catch(() => null);
+                                    const simplifiedMeta = {
+                                        id: metadata.id,
+                                        subject: metadata.subject,
+                                        avatar: groupAvatar,
+                                        owner: metadata.owner || 'Unknown',
+                                        creation: metadata.creation ? new Date(metadata.creation * 1000).toISOString() : null,
+                                        desc: metadata.desc || 'No description',
+                                        participantsCount: metadata.participants?.length || 0
+                                    };
+                                    await redisClient.set(groupCacheKey, JSON.stringify(simplifiedMeta), { EX: 86400 });
+                                }
+                            } catch (e) { }
+                        }
+                    }
+                }
+            }
+
+            // --- 🚀 NOVEDAD: Ingesta Masiva de Historial (Memoria + Inbox) ---
+            console.log(`[${clientSlug}] 🔍 Evaluando ${chats.length} chats del historial masivo...`);
+            let totalHistorySaved = 0;
+            let unreadsTagged = 0;
+            let messagesToInsert = [];
+
+            for (const chat of chats) {
+                const chatMessages = (messages || []).filter(m => m.key.remoteJid === chat.id);
+                if (chatMessages.length === 0) continue;
+
+                // Ordenar por timestamp para procesar en orden cronológico
+                chatMessages.sort((a, b) => (a.messageTimestamp || 0) - (b.messageTimestamp || 0));
+
+                // Identificar cuáles mensajes son estrictamente los "no leídos" actuales
+                const unreadMsgs = chat.unreadCount > 0 ? chatMessages.slice(-chat.unreadCount) : [];
+                const unreadMsgIds = new Set(unreadMsgs.map(m => m.key.id));
+
+                for (const msg of chatMessages) {
+                    // Filtrar mensajes basura del protocolo de Meta (cifrado, sender keys)
+                    if (msg.message?.protocolMessage || msg.message?.senderKeyDistributionMessage) continue;
+
+                    const text = extractMessageContent(msg.message);
+                    if (!text && !msg.message?.imageMessage && !msg.message?.audioMessage && !msg.message?.videoMessage) continue;
+
+                    const isSentByMe = msg.key.fromMe;
+                    const isUnread = unreadMsgIds.has(msg.key.id);
+
+                    // 💎 Extracción de Metadatos Ricos para 10K History
+                    const quotedMessageId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId || null;
+                    const pushName = msg.pushName || null;
+
+                    let mediaPayload = null;
+                    if (msg.message?.imageMessage) mediaPayload = { imageMessage: msg.message.imageMessage };
+                    else if (msg.message?.audioMessage) mediaPayload = { audioMessage: msg.message.audioMessage };
+                    else if (msg.message?.videoMessage) mediaPayload = { videoMessage: msg.message.videoMessage };
+                    else if (msg.message?.documentMessage) mediaPayload = { documentMessage: msg.message.documentMessage };
+                    else if (msg.message?.stickerMessage) mediaPayload = { stickerMessage: msg.message.stickerMessage };
+
+                    messagesToInsert.push({
+                        client_id: clientId,
+                        remote_id: chat.id,
+                        sender_role: isSentByMe ? 'Usuario' : (pushName || 'Contacto'),
+                        content: text || (msg.message?.imageMessage ? `[Imagen: ${msg.key.id}]` : (msg.message?.videoMessage ? `[Video: ${msg.key.id}]` : `[Audio: ${msg.key.id}]`)),
+                        processed: false, // Forzar al worker a mirarlo para GraphRAG/Perfiles
+                        metadata: {
+                            msgId: msg.key.id,
+                            timestamp: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toISOString() : new Date().toISOString(),
+                            isHistory: true,
+                            is_new_unread: isUnread, // 🔑 ESTO LE DICE AL WORKER SI DEBE CREAR TARJETA DE INBOX O NO
+                            participantJid: chat.id.endsWith('@g.us') ? msg.key.participant : chat.id,
+                            status: isSentByMe ? 'read' : 'sent',
+                            quotedMessageId: quotedMessageId,
+                            pushName: pushName,
+                            mediaPayload: mediaPayload
+                        }
+                    });
+
+                    if (isUnread) unreadsTagged++;
+                }
+            }
+
+            // Inserción Masiva por Lotes (Batch Insert) para evitar congestionar la Base de Datos
+            if (messagesToInsert.length > 0) {
+                console.log(`[${clientSlug}] 🚀 Iniciando inyección masiva en DB de ${messagesToInsert.length} mensajes...`);
+
+                // Dividimos en lotes de 200 mensajes máximo por petición para evitar payload too large request limits de Supabase
+                const BATCH_SIZE = 200;
+                for (let i = 0; i < messagesToInsert.length; i += BATCH_SIZE) {
+                    const batch = messagesToInsert.slice(i, i + BATCH_SIZE);
+                    try {
+                        const res = await supabase.from('raw_messages').insert(batch);
+                        console.log(`[${clientSlug}] Lote ${i / BATCH_SIZE} Status: ${res.status} | Data: ${!!res.data} | Err: ${res.error?.message || 'none'}`);
+                        if (!res.error) {
+                            totalHistorySaved += batch.length;
+                        } else {
+                            console.error(`[${clientSlug}] ❌ Fallo fatal (Lote ${i / BATCH_SIZE}):`, res.error.message);
+                        }
+                    } catch (insertErr) {
+                        console.error(`[${clientSlug}] ❌ Excepción fatal (Lote ${i / BATCH_SIZE}):`, insertErr.message);
+                    }
+                }
+            }
+
+            if (totalHistorySaved > 0) {
+                console.log(`[${clientSlug}] 🎉 Ingesta completada: ${totalHistorySaved} mensajes históricos en total. ${unreadsTagged} marcados como Inbox unread.`);
+                await triggerMemoryTimer(clientId);
+            }
+        } catch (setErr) {
+            console.error(`[${clientSlug}] ❌ Error procesando messaging-history.set:`, setErr.message);
         }
     });
 
     // 3. El Tubo Neural: Escuchar mensajes y enviarlos a nuestro Cerebro Central
     sock.ev.on('messages.upsert', async (m) => {
-        try {
-            const msg = m.messages[0];
-            if (!msg.message) {
-                console.log(`[${clientSlug}] ℹ️ Mensaje sin cuerpo ignorado (Protocolo/Status/BaileysSync).`);
-                return;
-            }
+        console.log(`[${clientSlug}] 🔍 messages.upsert triggered. Type: ${m.type}, Count: ${m.messages?.length}`);
 
-            console.log(`📩 [${clientSlug}] msgId=${msg.key.id} RECEIVED`);
+        for (const msg of m.messages) {
+            try {
+                const textRaw = extractMessageContent(msg.message);
 
-            const isSentByMe = msg.key.fromMe;
-            const senderId = msg.key.remoteJid;
-            const msgContent = msg.message;
-            const pushName = msg.pushName || (isSentByMe ? 'Yo' : 'Contacto');
-            const isGroup = senderId.endsWith('@g.us');
+                // 🔑 CONTACT CACHING: Save sender's name to Redis when we see messages
+                if (redisClient && msg.key && msg.pushName && !msg.key.fromMe) {
+                    try {
+                        const senderJid = msg.key.participant || msg.key.remoteJid;
+                        if (senderJid && !senderJid.endsWith('@g.us') && !senderJid.endsWith('@broadcast')) {
+                            const contactKey = `contacts:${clientId}:${senderJid}`;
+                            const existing = await redisClient.get(contactKey);
+                            if (!existing) {
+                                const contactData = JSON.stringify({ name: msg.pushName, avatar: null });
+                                await redisClient.set(contactKey, contactData);
+                                console.log(`[${clientSlug}] 📇 Contacto cacheado desde mensaje: ${senderJid} -> "${msg.pushName}"`);
+                            }
+                        }
+                    } catch (cacheErr) { }
+                }
 
-            const hasImage = !!msgContent.imageMessage;
-            const hasAudio = !!(msgContent.audioMessage || msgContent.pttMessage);
-            const hasDocument = !!msgContent.documentMessage;
-            const hasVideo = !!msgContent.videoMessage;
-            const hasSticker = !!msgContent.stickerMessage;
+                if (!msg.message || (!textRaw && !msg.message.imageMessage && !msg.message.audioMessage && !msg.message.videoMessage)) {
+                    // Solo loguear si es el único mensaje o si es relevante
+                    if (m.messages.length === 1) console.log(`[${clientSlug}] ℹ️ Mensaje sin contenido útil ignorado (msgId=${msg.key.id}).`);
+                    continue;
+                }
 
-            // 🛡️ [ANTI-SPAM] Verificar Rate Limit
-            if (await checkRateLimit(clientId, senderId)) {
-                return; // Ignorar el mensaje silenciosamente (ahorra IA y DB)
-            }
+                console.log(`📩 [${clientSlug}] msgId=${msg.key.id} RECEIVED (Type: ${m.type})`);
 
-            // Novedad: Actualizar registro de actividad
-            lastActivity.set(sessionKey, Date.now());
+                const isSentByMe = msg.key.fromMe;
+                const senderId = msg.key.remoteJid;
+                const participantJid = msg.key.participant || senderId; // Participant en grupos, remoteJid en privado
+                const msgContent = msg.message;
+                const isGroup = senderId.endsWith('@g.us');
 
-            let text = extractMessageContent(msgContent);
-            let mediaDescription = '';
+                // EXTRAER NOMBRE REAL DE LA AGENDA (No el de WhatsApp público)
+                let contactIdentity = null;
+                if (!isSentByMe) {
+                    const targetJid = isGroup ? participantJid : senderId;
+                    contactIdentity = await resolveIdentity(clientId, targetJid, msg.pushName);
+                }
+                const pushName = contactIdentity?.name || msg.pushName || (isSentByMe ? 'Yo' : 'Contacto');
 
-            // Procesar Media (DELEGADO AL MEDIA WORKER)
-            if (hasImage || hasAudio || hasDocument) {
-                try {
-                    const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
-                    const crypto = await import('crypto');
-                    const fs = await import('fs/promises');
+                const hasImage = !!msgContent.imageMessage;
+                const hasAudio = !!(msgContent.audioMessage || msgContent.pttMessage);
+                const hasDocument = !!msgContent.documentMessage;
+                const hasVideo = !!msgContent.videoMessage;
+                const hasSticker = !!msgContent.stickerMessage;
 
-                    const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                    const type = hasImage ? 'image' : hasAudio ? 'audio' : 'document';
+                // 🛡️ [ANTI-SPAM] Only rate-limit real-time messages (type=notify), NOT history sync
+                if (m.type === 'notify' && await checkRateLimit(clientId, senderId)) {
+                    return; // Ignorar el mensaje silenciosamente (ahorra IA y DB)
+                }
 
-                    const ext = hasImage ? '.jpg' : hasAudio ? '.ogg' : '.ext';
-                    const tempFileName = `${clientId}_${crypto.randomBytes(4).toString('hex')}${ext}`;
-                    const tempFilePath = `./uploads/${tempFileName}`;
+                // [SKILL: WhatsApp Groups] Cacheo Eager de Metadatos de Grupos
+                if (isGroup && redisClient) {
+                    const groupCacheKey = `group_meta:${clientId}:${senderId}`; // Usamos group_meta para consistencia con la skill
+                    const hasCachedMeta = await redisClient.get(groupCacheKey);
 
-                    await fs.mkdir('./uploads', { recursive: true });
-                    await fs.writeFile(tempFilePath, buffer);
+                    if (!hasCachedMeta && sock) {
+                        try {
+                            console.log(`[${clientSlug}] 🌐 Solicitando metadata a WhatsApp para el grupo nuevo: ${senderId}`);
+                            const metadata = await sock.groupMetadata(senderId);
 
-                    console.log(`[Queue] 📸 Encolando media (${type}) a mediaProcessingQueue para ${clientSlug}...`);
-                    await mediaQueue.add('process_media', {
-                        clientId,
-                        clientSlug,
-                        senderId,
-                        isSentByMe,
+                            let groupAvatar = null;
+                            try {
+                                groupAvatar = await sock.profilePictureUrl(senderId, 'image').catch(() => null);
+                            } catch (e) { }
+
+                            const simplifiedMeta = {
+                                id: metadata.id,
+                                subject: metadata.subject,
+                                avatar: groupAvatar,
+                                owner: metadata.owner || 'Unknown',
+                                creation: metadata.creation ? new Date(metadata.creation * 1000).toISOString() : null,
+                                desc: metadata.desc || 'No description',
+                                participantsCount: metadata.participants?.length || 0
+                            };
+                            // Guardar en Redis por 24 horas
+                            await redisClient.set(groupCacheKey, JSON.stringify(simplifiedMeta), { EX: 86400 });
+                        } catch (gErr) {
+                            console.warn(`[${clientSlug}] ⚠️ Error obteniendo metadata del grupo:`, gErr.message);
+                        }
+                    }
+                }
+
+                // Novedad: Actualizar registro de actividad
+                lastActivity.set(sessionKey, Date.now());
+
+                let text = extractMessageContent(msgContent);
+                let mediaDescription = '';
+
+                // Procesar Media (DELEGADO AL MEDIA WORKER)
+                if (hasImage || hasAudio || hasDocument) {
+                    try {
+                        const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
+                        const crypto = await import('crypto');
+                        const fs = await import('fs/promises');
+
+                        const buffer = await downloadMediaMessage(msg, 'buffer', {});
+                        const type = hasImage ? 'image' : hasAudio ? 'audio' : 'document';
+
+                        const ext = hasImage ? '.jpg' : hasAudio ? '.ogg' : '.ext';
+                        const tempFileName = `${clientId}_${crypto.randomBytes(4).toString('hex')}${ext}`;
+                        const tempFilePath = `./uploads/${tempFileName}`;
+
+                        await fs.mkdir('./uploads', { recursive: true });
+                        await fs.writeFile(tempFilePath, buffer);
+
+                        console.log(`[Queue] 📸 Encolando media (${type}) a mediaProcessingQueue para ${clientSlug}...`);
+                        await mediaQueue.add('process_media', {
+                            clientId,
+                            clientSlug,
+                            senderId,
+                            participantJid,
+                            isSentByMe,
+                            pushName,
+                            isGroup,
+                            text: text || '',
+                            type,
+                            tempFilePath,
+                            mimetype: msgContent.imageMessage?.mimetype || msgContent.audioMessage?.mimetype || msgContent.documentMessage?.mimetype,
+                            filename: msgContent.documentMessage?.fileName || tempFileName
+                        }, { removeOnComplete: true });
+
+                        // El flujo de mensaje se detiene aquí para esta interacción.
+                        // El media_worker retomará la conversión a texto pura e impulsará a incomingQueue.
+                        return;
+
+                    } catch (e) {
+                        console.warn(`[${clientSlug}] ⚠️ Media Download Error:`, e.message);
+                        mediaDescription = '[Error descargando adjunto]';
+                    }
+                }
+
+                let finalText = [mediaDescription, text].filter(Boolean).join(' ');
+
+                // Fallback
+                if (!finalText) {
+                    if (hasImage) finalText = '[Imagen]';
+                    else if (hasAudio) finalText = '[Audio]';
+                    else if (hasVideo) finalText = '[Video]';
+                    else if (hasSticker) finalText = '[Sticker]';
+                    else if (isSentByMe) finalText = '[Mensaje del usuario]';
+                }
+
+                if (!finalText) {
+                    console.log(`[${clientSlug}] ℹ️ Mensaje vacío ignorado. Tipos presentes: ${Object.keys(msgContent).join(', ')}`);
+                    // Debug extra: si es protocolMessage, ver qué trae
+                    if (msgContent.protocolMessage) {
+                        console.log(`[${clientSlug}] 📂 Es ProtocolMessage type: ${msgContent.protocolMessage.type}`);
+                    }
+                    return;
+                }
+
+                console.log(`[${clientSlug} - ${isSentByMe ? 'Sent' : 'Recv'}]: ${finalText.slice(0, 50)}...`);
+
+                // 👤 Obtener Avatar URL (con caché de 1h)
+                let avatarUrl = null;
+                const cacheKey = `${sessionKey}_${senderId}`;
+                if (profilePicCache.has(cacheKey) && Date.now() - profilePicCache.get(cacheKey).time < 3600000) {
+                    avatarUrl = profilePicCache.get(cacheKey).url;
+                } else {
+                    try {
+                        avatarUrl = await sock.profilePictureUrl(senderId, 'image');
+                        profilePicCache.set(cacheKey, { url: avatarUrl, time: Date.now() });
+                    } catch (e) {
+                        profilePicCache.set(cacheKey, { url: null, time: Date.now() });
+                    }
+                }
+
+                // INSERTAR EN DB
+                const supabase = (await import('../config/supabase.mjs')).default;
+                const { error: dbErr, data: insertedRows } = await supabase.from('raw_messages').insert([{
+                    client_id: clientId,
+                    sender_role: isSentByMe ? 'user_sent' : pushName,
+                    content: finalText,
+                    remote_id: senderId, // This acts as conversation/group ID
+                    metadata: {
                         pushName,
                         isGroup,
-                        text: text || '',
-                        type,
-                        tempFilePath,
-                        mimetype: msgContent.imageMessage?.mimetype || msgContent.audioMessage?.mimetype || msgContent.documentMessage?.mimetype,
-                        filename: msgContent.documentMessage?.fileName || tempFileName
-                    }, { removeOnComplete: true });
+                        hasMedia: !!mediaDescription,
+                        historical: false,
+                        avatarUrl,
+                        participantJid,
+                        msgId: msg.key.id,
+                        status: isSentByMe ? 'sent' : 'read'
+                    }
+                }]).select('id, created_at');
 
-                    // El flujo de mensaje se detiene aquí para esta interacción.
-                    // El media_worker retomará la conversión a texto pura e impulsará a incomingQueue.
-                    return;
+                if (dbErr) {
+                    console.error(`[${clientSlug}] ❌ DB Insert Error:`, dbErr.message);
+                } else {
+                    console.log(`[${clientSlug}] ✅ Message stored in raw_messages`);
 
-                } catch (e) {
-                    console.warn(`[${clientSlug}] ⚠️ Media Download Error:`, e.message);
-                    mediaDescription = '[Error descargando adjunto]';
+                    // 🔴 BROADCAST: Real-time WebSocket event for the native clone
+                    if (global.__wss) {
+                        const insertedMsg = insertedRows?.[0];
+                        const wsPayload = JSON.stringify({
+                            type: 'new_message',
+                            data: {
+                                conversation_id: senderId,
+                                participant_jid: participantJid,
+                                id: msg.key.id, // Usamos el ID de Baileys para tracking en el front
+                                text: finalText,
+                                from_me: isSentByMe,
+                                timestamp: insertedMsg?.created_at || new Date().toISOString(),
+                                sender_name: isSentByMe ? 'Yo' : pushName,
+                                media_url: null,
+                                media_type: null,
+                                status: isSentByMe ? 'sent' : 'read'
+                            }
+                        });
+                        global.__wss.clients.forEach(ws => {
+                            if (ws.readyState === 1 && ws.userId === clientId) {
+                                ws.send(wsPayload);
+                            }
+                        });
+                    }
                 }
-            }
 
-            let finalText = [mediaDescription, text].filter(Boolean).join(' ');
+                // Notificar al worker de memoria (Amnesia Consolidator) en cada interacción
+                await triggerMemoryTimer(clientId);
 
-            // Fallback
-            if (!finalText) {
-                if (hasImage) finalText = '[Imagen]';
-                else if (hasAudio) finalText = '[Audio]';
-                else if (hasVideo) finalText = '[Video]';
-                else if (hasSticker) finalText = '[Sticker]';
-                else if (isSentByMe) finalText = '[Mensaje del usuario]';
-            }
-
-            if (!finalText) {
-                console.log(`[${clientSlug}] ℹ️ Mensaje vacío ignorado.`);
-                return;
-            }
-
-            console.log(`[${clientSlug} - ${isSentByMe ? 'Sent' : 'Recv'}]: ${finalText.slice(0, 50)}...`);
-
-            // 👤 Obtener Avatar URL (con caché de 1h)
-            let avatarUrl = null;
-            const cacheKey = `${sessionKey}_${senderId}`;
-            if (profilePicCache.has(cacheKey) && Date.now() - profilePicCache.get(cacheKey).time < 3600000) {
-                avatarUrl = profilePicCache.get(cacheKey).url;
-            } else {
-                try {
-                    avatarUrl = await sock.profilePictureUrl(senderId, 'image');
-                    profilePicCache.set(cacheKey, { url: avatarUrl, time: Date.now() });
-                } catch (e) {
-                    profilePicCache.set(cacheKey, { url: null, time: Date.now() });
+                if (!isSentByMe) {
+                    // Enviar el mensaje al Cortex (Cerebro) a través de la Cola de BullMQ para auto-respuesta
+                    console.log(`[Queue] 📬 Encolando mensaje a incomingMessagesQueue para ${clientSlug}...`);
+                    await incomingQueue.add('process_message', {
+                        clientId,
+                        clientSlug,
+                        channel: 'whatsapp',
+                        senderId,
+                        text: finalText,
+                        isSentByMe,
+                        metadata: { pushName, isGroup }
+                    }, {
+                        removeOnComplete: true,
+                        removeOnFail: 50 // Guardar los últimos 50 fallidos para debug
+                    });
                 }
+
+            } catch (handlerErr) {
+                console.error(`[${clientSlug}] 💀 CRITICAL HANDLER ERROR:`, handlerErr.message);
             }
+        } // Cierre del for loop
+    });
 
-            // INSERTAR EN DB
-            const supabase = (await import('../config/supabase.mjs')).default;
-            const { error: dbErr } = await supabase.from('raw_messages').insert([{
-                client_id: clientId,
-                sender_role: isSentByMe ? 'user_sent' : pushName,
-                content: finalText,
-                remote_id: senderId, // This acts as conversation/group ID
-                metadata: {
-                    pushName,
-                    isGroup,
-                    hasMedia: !!mediaDescription,
-                    historical: false,
-                    avatarUrl
-                }
-            }]);
+    // 3.5 Status Updates: Ticks azules y recibos de lectura
+    sock.ev.on('messages.update', async (updates) => {
+        for (const update of updates) {
+            if (update.update.status) {
+                const statusMap = {
+                    1: 'sent',      // PENDING/SENT (Reloj o un tick)
+                    2: 'sent',      // DELIVERED (Dos ticks grises)
+                    3: 'read',      // READ (Dos ticks azules)
+                    4: 'played',    // PLAYED (Audio escuchado)
+                };
+                const status = statusMap[update.update.status];
+                if (!status) continue;
 
-            if (dbErr) {
-                console.error(`[${clientSlug}] ❌ DB Insert Error:`, dbErr.message);
-            } else {
-                console.log(`[${clientSlug}] ✅ Message stored in raw_messages`);
-            }
+                console.log(`[${clientSlug}] 🏷️ Update status para ${update.key.id}: ${status}`);
 
-            // Notificar al worker de memoria (Amnesia Consolidator) en cada interacción
-            await triggerMemoryTimer(clientId);
-
-            if (!isSentByMe) {
-                // Enviar el mensaje al Cortex (Cerebro) a través de la Cola de BullMQ para auto-respuesta
-                console.log(`[Queue] 📬 Encolando mensaje a incomingMessagesQueue para ${clientSlug}...`);
-                await incomingQueue.add('process_message', {
-                    clientId,
-                    clientSlug,
-                    channel: 'whatsapp',
-                    senderId,
-                    text: finalText,
-                    isSentByMe,
-                    metadata: { pushName, isGroup }
-                }, {
-                    removeOnComplete: true,
-                    removeOnFail: 50 // Guardar los últimos 50 fallidos para debug
+                // 1. Actualizar DB (Búsqueda por el ID original de Baileys en metadata)
+                const { error } = await supabase.rpc('update_raw_message_status', {
+                    p_client_id: clientId,
+                    p_msg_id: update.key.id,
+                    p_status: status
                 });
-            }
 
-        } catch (handlerErr) {
-            console.error(`[${clientSlug}] 💀 CRITICAL HANDLER ERROR:`, handlerErr.message);
+                // Si la RPC falla (no existe), intentamos un update manual via select
+                if (error) {
+                    // console.warn(`[${clientSlug}] RAG update status error:`, error.message);
+                }
+
+                // 2. Notificar al front vía WebSocket
+                if (global.__wss) {
+                    const payload = JSON.stringify({
+                        type: 'message_status',
+                        data: {
+                            id: update.key.id,
+                            jid: update.key.remoteJid,
+                            status: status
+                        }
+                    });
+                    global.__wss.clients.forEach(ws => {
+                        if (ws.readyState === 1 && ws.userId === clientId) {
+                            ws.send(payload);
+                        }
+                    });
+                }
+            }
         }
     });
 
@@ -609,6 +936,70 @@ export async function logoutWhatsApp(clientId, clientSlug) {
     }
 
     return { success: true };
+}
+
+// ------------------------------------------------------------------
+// LAZY LOADING MEDIA (Historical Extraction)
+// ------------------------------------------------------------------
+export async function fetchHistoricalMedia(clientId, remoteJid, messageId) {
+    const sessionKey = String(clientId);
+    const sock = activeSessions.get(sessionKey);
+    if (!sock) throw new Error("WhatsApp socket not online for this client.");
+
+    try {
+        console.log(`[Lazy Media] 🔍 Buscando BD metadata histórica para ${messageId}...`);
+        
+        // 1. Obtener los metadatos y las llaves de desencriptado directamente de PostgreSQL
+        const { data: records, error } = await supabase
+            .from('raw_messages')
+            .select('metadata')
+            .eq('client_id', clientId)
+            .contains('metadata', { msgId: messageId })
+            .limit(1);
+
+        if (error || !records || records.length === 0) {
+            throw new Error(`Mensaje ${messageId} no encontrado en la base de datos local.`);
+        }
+
+        const metadata = records[0].metadata;
+        if (!metadata || !metadata.mediaPayload) {
+            throw new Error(`El mensaje ${messageId} no tiene mediaPayload almacenado (historial antiguo o texto puro).`);
+        }
+
+        const msgContent = metadata.mediaPayload;
+        
+        // 2. Reconstruir el objeto de mensaje que Baileys espera para desencriptar
+        const msgInfo = {
+            key: {
+                remoteJid: remoteJid,
+                id: messageId,
+                fromMe: metadata.status === 'read' || metadata.status === 'played'
+            },
+            message: msgContent
+        };
+
+        const isMedia = msgContent.imageMessage || msgContent.videoMessage || msgContent.audioMessage || msgContent.documentMessage || msgContent.stickerMessage;
+        if (!isMedia) throw new Error("El payload reconstruido no contiene una estructura multimedia válida.");
+
+        const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
+        console.log(`[Lazy Media] 📥 Descargando e inyectando buffer multimedia histórico desde Meta (Lazy-Load)...`);
+        
+        // 3. Descarga y decodifica sobre la marcha sin necesidad de Store en RAM
+        const buffer = await downloadMediaMessage(msgInfo, 'buffer', {}, { logger: sock.logger, reuploadRequest: sock.updateMediaMessage });
+
+        let mediaType = 'unknown';
+        let mimeType = '';
+        if (msgContent.imageMessage) { mediaType = 'image'; mimeType = msgContent.imageMessage.mimetype; }
+        else if (msgContent.audioMessage) { mediaType = 'audio'; mimeType = msgContent.audioMessage.mimetype; }
+        else if (msgContent.videoMessage) { mediaType = 'video'; mimeType = msgContent.videoMessage.mimetype; }
+        else if (msgContent.documentMessage) { mediaType = 'document'; mimeType = msgContent.documentMessage.mimetype; }
+        else if (msgContent.stickerMessage) { mediaType = 'sticker'; mimeType = msgContent.stickerMessage.mimetype; }
+        
+        return { buffer, mediaType, mimeType };
+    } catch (e) {
+        console.error(`[Lazy Media] Error buscando/descargando media para ${messageId}:`, e.message);
+        throw e;
+    }
 }
 
 // ------------------------------------------------------------------

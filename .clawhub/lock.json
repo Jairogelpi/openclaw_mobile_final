@@ -8,6 +8,18 @@
     "youtube-watcher": {
       "version": "1.0.0",
       "installedAt": 1772302328422
+    },
+    "whatsapp-common-groups": {
+      "version": "1.0.0",
+      "installedAt": 1772563212392
+    },
+    "whatsapp-chats": {
+      "version": "1.0.0",
+      "installedAt": 1772563317749
+    },
+    "whatsapp-group-admin": {
+      "version": "1.0.0",
+      "installedAt": 1772563928326
     }
   }
 }

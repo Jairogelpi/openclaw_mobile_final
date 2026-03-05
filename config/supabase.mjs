@@ -5,6 +5,10 @@ let supabase;
 try {
     const supabaseUrl = process.env.SUPABASE_URL || '';
     const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
+
+    console.log('[Supabase Init] URL:', supabaseUrl);
+    console.log('[Supabase Init] Key starts with:', supabaseKey ? supabaseKey.substring(0, 15) : 'MISSING');
+
     if (!supabaseUrl.startsWith('http')) throw new Error('Invalid Supabase URL');
     supabase = createClient(supabaseUrl, supabaseKey);
 } catch (err) {

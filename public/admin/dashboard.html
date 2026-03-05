@@ -9,7 +9,7 @@
         href="https://fonts.googleapis.com/css2?family=Inter:wght@400;700;800&family=JetBrains+Mono:wght@500;700&display=swap"
         rel="stylesheet">
     <link rel="stylesheet" href="dashboard.css">
-    <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
+    <!-- QR rendering handled inline via img tag -->
 </head>
 
 <body>
@@ -92,6 +92,23 @@
                     <div class="messages" id="neural-chat">
                         <div class="message message-ai">Conexión establecida. Esperando selección de identidad...</div>
                     </div>
+
+                    <!-- Semantic Cache Console -->
+                    <div id="cache-console"
+                        style="background: rgba(0,0,0,0.1); border-top: 1px solid rgba(255,255,255,0.06); padding: 15px; display: none;">
+                        <div
+                            style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+                            <div
+                                style="font-size: 11px; font-weight: 800; color: var(--secondary); letter-spacing: 1px;">
+                                ⚡ SEMANTIC CACHE (LAST 5)</div>
+                            <button class="btn btn-danger" style="padding: 2px 10px; font-size: 10px;"
+                                onclick="clearSemanticCache()">PURGE CACHE</button>
+                        </div>
+                        <div id="cache-list" style="display: flex; flex-direction: column; gap: 6px;">
+                            <!-- JS Injected -->
+                        </div>
+                    </div>
+
                     <div class="chat-input-container">
                         <input type="text" id="neural-input" placeholder="Comando neural..." disabled>
                         <button class="btn btn-primary" id="btn-send-neural" onclick="sendNeural()"
@@ -100,25 +117,90 @@
                 </div>
             </div>
         </div>
+
+        <!-- RAG INTELLIGENCE PANEL -->
+        <div class="panel" style="grid-column: span 2;">
+            <div class="panel-header">
+                <div class="panel-title">🧠 RAG Intelligence Analytics</div>
+                <button class="btn btn-ghost" onclick="refreshRagMetrics()">Refresh</button>
+            </div>
+            <div id="rag-metrics-content" style="padding: 20px;">
+                <div style="color: var(--text-dim); text-align: center;">Cargando métricas RAG...</div>
+            </div>
+        </div>
+
+        <!-- CONFIG TUNER PANEL -->
+        <div class="panel" style="grid-column: span 2;">
+            <div class="panel-header">
+                <div class="panel-title">⚙️ Config Tuner (Live Fine-Tuning)</div>
+                <div style="display: flex; gap: 8px;">
+                    <button class="btn btn-ghost" onclick="loadConfig()">Refresh</button>
+                </div>
+            </div>
+            <div id="config-editor" style="padding: 20px;">
+                <div style="color: var(--text-dim); text-align: center;">Cargando configuración...</div>
+            </div>
+        </div>
     </div>
 
-    <!-- Soul Inspector Modal -->
+    <!-- Cloud Inspector / Memory Explorer Modal -->
     <div id="modal-overlay"
         style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.85); backdrop-filter: blur(10px); display: none; justify-content: center; align-items: center; z-index: 1000;"
         onclick="closeModal()">
-        <div class="panel" style="width: 800px; max-height: 80vh;" onclick="event.stopPropagation()">
+        <div class="panel" style="width: 1000px; height: 85vh; display: flex; flex-direction: column;"
+            onclick="event.stopPropagation()">
             <div class="panel-header">
-                <div class="panel-title" id="modal-title">Soul Inspector</div>
+                <div class="panel-title" id="modal-title">Memory Explorer</div>
                 <button class="btn btn-ghost" onclick="closeModal()">X</button>
             </div>
-            <div class="scroll-area">
-                <div id="modal-body-content">
+            <div style="flex: 1; display: flex; overflow: hidden;">
+                <!-- Sidebar: File List -->
+                <div id="file-sidebar"
+                    style="width: 250px; border-right: 1px solid rgba(255,255,255,0.06); padding: 15px; overflow-y: auto; background: rgba(0,0,0,0.2);">
+                    <div
+                        style="font-size: 11px; color: var(--text-dim); margin-bottom: 15px; letter-spacing: 1px; font-weight: 700;">
+                        FILES (.MD)</div>
+                    <div id="file-list-container" style="display: flex; flex-direction: column; gap: 5px;">
+                        <!-- JS Injected -->
+                    </div>
+                </div>
+                <!-- Content Area -->
+                <div class="scroll-area" style="flex: 1; padding: 0; display: flex; flex-direction: column;">
+                    <div
+                        style="background: rgba(255,255,255,0.03); padding: 10px 20px; border-bottom: 1px solid rgba(255,255,255,0.06); display: flex; justify-content: space-between; align-items: center;">
+                        <span id="current-file-name"
+                            style="font-size: 12px; color: var(--text-dim); font-family: 'JetBrains Mono';">...</span>
+                        <div id="editor-actions" style="display: none;">
+                            <button class="btn btn-ghost" style="padding: 4px 12px; font-size: 11px; color: #0df;"
+                                onclick="toggleEditor()">🔪 SURGEON MODE</button>
+                            <button id="btn-save-file" class="btn btn-primary"
+                                style="padding: 4px 12px; font-size: 11px; display: none;"
+                                onclick="saveCurrentFile()">💾 SAVE CHANGES</button>
+                        </div>
+                    </div>
                     <pre id="modal-content"
-                        style="font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--primary); padding: 20px; background: rgba(0,0,0,0.3); border-radius: 12px; white-space: pre-wrap;"></pre>
+                        style="font-family: 'JetBrains Mono', monospace; font-size: 13px; color: var(--primary); padding: 30px; border-radius: 0; white-space: pre-wrap; margin: 0; flex: 1;"></pre>
+                    <textarea id="modal-editor"
+                        style="display: none; font-family: 'JetBrains Mono', monospace; font-size: 13px; color: #fff; background: #050505; border: none; padding: 30px; flex: 1; outline: none; resize: none; line-height: 1.6;"></textarea>
                 </div>
             </div>
         </div>
     </div>
+    </div>
+
+    <!-- 3D Neural Graph Modal -->
+    <div id="graph-overlay"
+        style="position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: #000; display: none; flex-direction: column; z-index: 2000;">
+        <div
+            style="padding: 15px 25px; background: rgba(0,255,255,0.05); display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid rgba(0,255,255,0.2);">
+            <div style="font-size: 14px; font-weight: 800; color: #0df; letter-spacing: 2px;">NEURAL MAP <span
+                    id="graph-client-slug" style="color: #fff; margin-left: 10px;"></span></div>
+            <button class="btn btn-ghost" style="color: #0df; border-color: #0df;" onclick="closeGraphModal()">✕ CLOSE
+                NEURAL LINK</button>
+        </div>
+        <iframe id="graph-iframe" src="" style="flex: 1; border: none; background: #000010;"></iframe>
+    </div>
+
 
     <!-- Integration Config Modal -->
     <div id="config-overlay"
@@ -135,13 +217,34 @@
                     style="width: 100%; display: flex; flex-direction: column; align-items: center; gap: 20px;">
                     <div id="wa-status-badge" class="status-pill">DESCONECTADO</div>
                     <div id="qrcode-container"
-                        style="background: white; padding: 20px; border-radius: 12px; display: none;">
+                        style="background: white; padding: 20px; border-radius: 12px; display: none; box-shadow: 0 0 20px rgba(255,255,255,0.1);">
                         <canvas id="qrcode-canvas"></canvas>
                     </div>
+
+                    <!-- Pairing Code Display -->
+                    <div id="pairing-code-container"
+                        style="display: none; text-align: center; background: rgba(0,255,255,0.05); border: 1px solid var(--primary); padding: 15px; border-radius: 10px; width: 100%;">
+                        <div style="font-size: 10px; color: var(--text-dim); margin-bottom: 8px; letter-spacing: 1px;">
+                            CÓDIGO DE VINCULACIÓN</div>
+                        <div id="pairing-code-display"
+                            style="font-size: 28px; font-weight: 800; font-family: 'JetBrains Mono'; color: var(--primary); letter-spacing: 4px;">
+                            ---- ----</div>
+                    </div>
+
                     <p id="wa-info-text" style="color: var(--text-dim); text-align: center; font-size: 14px;">Iniciando
                         WhatsApp...</p>
-                    <div style="display: flex; gap: 10px; width: 100%;">
-                        <button class="btn btn-primary" style="flex: 1;" onclick="relinkWhatsApp()">Re-vincular</button>
+
+                    <div id="pairing-input-area"
+                        style="width: 100%; display: none; flex-direction: column; gap: 10px; margin-top: 10px;">
+                        <input type="text" id="phone-number-input" placeholder="Ej: 34600111222"
+                            style="background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.1); color: #fff; padding: 10px; border-radius: 8px; text-align: center; font-family: 'JetBrains Mono';">
+                        <button class="btn btn-ghost" onclick="requestPairingCode()" style="font-size: 12px;">Vincular
+                            con Código</button>
+                    </div>
+
+                    <div style="display: flex; gap: 10px; width: 100%; margin-top: 10px;">
+                        <button class="btn btn-primary" style="flex: 1;" onclick="relinkWhatsApp()">Re-vincular
+                            (QR)</button>
                         <button class="btn btn-danger" style="flex: 1;" onclick="logoutWhatsApp()">Cerrar
                             Sesión</button>
                     </div>
@@ -170,8 +273,14 @@
     </div>
 
     <script>
-        const urlParams = new URLSearchParams(window.location.search);
-        const ADMIN_TOKEN = urlParams.get('token');
+        // Token extraction: MUST use raw regex because URLSearchParams
+        // silently truncates tokens with special chars like @ (e.g. Gusano2001@.)
+        function extractToken() {
+            const match = window.location.href.match(/[?&]token=([^#]*)/);
+            if (match) return match[1]; // Raw value, no decoding needed since it's used as-is
+            return null;
+        }
+        const ADMIN_TOKEN = extractToken();
         let currentClientId = null;
         let currentSlug = null;
         let clientsData = [];
@@ -185,7 +294,7 @@
 
         async function refreshData() {
             try {
-                const res = await fetch(`/admin/api/stats?token=${ADMIN_TOKEN}`);
+                const res = await fetch(`/admin/api/stats?token=${encodeURIComponent(ADMIN_TOKEN)}`);
                 const data = await res.json();
                 clientsData = data.clients;
 
@@ -226,12 +335,16 @@
                             </div>
                             <span style="font-size:12px; font-weight:700;">${c.identity_score || 0}%</span>
                         </div>
+                        <div style="font-size: 9px; color: var(--secondary); margin-top: 4px; font-family: 'JetBrains Mono'; text-transform: uppercase; letter-spacing: 0.5px;">
+                            ${c.worker_status || 'Cerebro en reposo'}
+                        </div>
                     </td>
                     <td>
                         <div style="display:flex; gap:8px;">
                             <button class="btn btn-ghost" style="padding:5px 10px" title="Logs" onclick="viewLogs('${c.slug}')">λ</button>
                             <button class="btn btn-ghost" style="padding:5px 10px" onclick="openConfig('${c.client_id}', '${c.slug}')">Config</button>
                             <button class="btn btn-ghost" style="padding:5px 10px" onclick="selectForChat('${c.client_id}', '${c.slug}')">Chat</button>
+                            <button class="btn btn-ghost" style="padding:5px 10px; color:#0df; border-color: rgba(0,255,255,0.2);" title="Neural Map" onclick="openGraph('${c.client_id}', '${c.slug}')">🕸</button>
                             <button class="btn btn-ghost" style="padding:5px 10px" onclick="inspectSoul('${c.slug}')">Soul</button>
                             <button class="btn btn-danger" style="padding:5px 10px" title="Reiniciar" onclick="restartClient('${c.slug}')">⟳</button>
                             <button class="btn btn-danger" style="padding:5px 10px; background: #ff0055; border-color: #ff0055;" title="ELIMINAR" onclick="deleteClient('${c.slug}')">🗑</button>
@@ -288,36 +401,76 @@
             const qrContainer = document.getElementById('qrcode-container');
             const infoText = document.getElementById('wa-info-text');
 
+            const pairingContainer = document.getElementById('pairing-code-container');
+            const pairingDisplay = document.getElementById('pairing-code-display');
+            const pairingInputArea = document.getElementById('pairing-input-area');
+
+            // Reset visibility
+            qrContainer.style.display = 'none';
+            pairingContainer.style.display = 'none';
+            pairingInputArea.style.display = 'none';
+
             if (client.whatsapp.connected) {
                 badge.className = 'status-pill status-online';
                 badge.textContent = 'CONECTADO';
-                qrContainer.style.display = 'none';
                 infoText.textContent = 'WhatsApp está vinculado y funcionando correctamente.';
             } else if (client.whatsapp.has_qr) {
                 badge.className = 'status-pill status-warning';
                 badge.textContent = 'ESPERANDO QR';
                 qrContainer.style.display = 'block';
-                infoText.textContent = 'Escanea este código QR con tu WhatsApp para vincular la cuenta.';
-                // Render QR
-                QRCode.toCanvas(document.getElementById('qrcode-canvas'), client.whatsapp.qr, {
-                    width: 250,
-                    margin: 0,
-                    color: {
-                        dark: '#000000',
-                        light: '#ffffff'
-                    }
-                });
+                pairingInputArea.style.display = 'flex'; // Allow switching to pairing code
+                infoText.textContent = 'Escanea el QR o solicita un código de vinculación.';
+                // Render QR using img tag (no external JS dependency)
+                const qrCanvas = document.getElementById('qrcode-canvas');
+                qrCanvas.style.display = 'none'; // Hide canvas, use img
+                let qrImg = document.getElementById('qrcode-img');
+                if (!qrImg) {
+                    qrImg = document.createElement('img');
+                    qrImg.id = 'qrcode-img';
+                    qrImg.style.cssText = 'width:220px;height:220px;border-radius:8px;background:#fff;';
+                    qrCanvas.parentNode.insertBefore(qrImg, qrCanvas);
+                }
+                const qrData = encodeURIComponent(client.whatsapp.qr);
+                qrImg.src = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${qrData}`;
+            } else if (client.whatsapp.pairing_code) {
+                badge.className = 'status-pill status-warning';
+                badge.textContent = 'CÓDIGO LISTO';
+                pairingContainer.style.display = 'block';
+                pairingDisplay.textContent = client.whatsapp.pairing_code;
+                infoText.textContent = 'Introduce este código en tu teléfono (Dispositivos vinculados > Vincular con número).';
             } else {
                 badge.className = 'status-pill status-offline';
                 badge.textContent = 'DESCONECTADO';
-                qrContainer.style.display = 'none';
-                infoText.textContent = 'WhatsApp no está iniciado o configurado. Haz clic en Re-vincular para generar un nuevo QR.';
+                pairingInputArea.style.display = 'flex';
+                infoText.textContent = 'WhatsApp no está iniciado. Usa Re-vincular para QR o introduce tu número.';
+            }
+        }
+
+        async function requestPairingCode() {
+            const phone = document.getElementById('phone-number-input').value.trim();
+            if (!phone) return alert("Introduce un número (ej: 34600111222)");
+
+            try {
+                const res = await fetch(`/admin/api/whatsapp/pair/${currentSlug}?token=${encodeURIComponent(ADMIN_TOKEN)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ phoneNumber: phone })
+                });
+                const data = await res.json();
+                if (data.status === 'pairing_code') {
+                    alert("¡Código generado!");
+                    refreshData().then(() => updateConfigModal());
+                } else {
+                    alert("Estado: " + (data.message || data.status));
+                }
+            } catch (e) {
+                alert("Error: " + e.message);
             }
         }
 
         async function relinkWhatsApp() {
             try {
-                await fetch(`/admin/restart/${currentSlug}?token=${ADMIN_TOKEN}`, { method: 'POST' });
+                await fetch(`/admin/restart/${currentSlug}?token=${encodeURIComponent(ADMIN_TOKEN)}`, { method: 'POST' });
                 refreshData().then(() => updateConfigModal());
                 alert("Solicitando nuevo QR. Por favor espera a que se genere...");
             } catch (e) {
@@ -328,7 +481,7 @@
         async function logoutWhatsApp() {
             if (!confirm("¿Cerrar sesión de WhatsApp por completo?")) return;
             try {
-                const res = await fetch(`/admin/api/whatsapp/logout/${currentSlug}?token=${ADMIN_TOKEN}`, { method: 'POST' });
+                const res = await fetch(`/admin/api/whatsapp/logout/${currentSlug}?token=${encodeURIComponent(ADMIN_TOKEN)}`, { method: 'POST' });
                 const data = await res.json();
                 if (data.success) {
                     alert(data.message);
@@ -356,7 +509,7 @@
             const fetchLogs = async () => {
                 try {
                     const endpoint = isContainer ? `/admin/api/container/logs/${name}` : `/admin/api/logs/${name}`;
-                    const res = await fetch(`${endpoint}?token=${ADMIN_TOKEN}`);
+                    const res = await fetch(`${endpoint}?token=${encodeURIComponent(ADMIN_TOKEN)}`);
                     const data = await res.json();
 
                     // Colorize logs a bit
@@ -390,7 +543,7 @@
         async function controlContainer(action, name) {
             if (!confirm(`Confirm ${action} on ${name}?`)) return;
             try {
-                const res = await fetch(`/admin/api/container/${action}/${name}?token=${ADMIN_TOKEN}`, { method: 'POST' });
+                const res = await fetch(`/admin/api/container/${action}/${name}?token=${encodeURIComponent(ADMIN_TOKEN)}`, { method: 'POST' });
                 const data = await res.json();
                 if (data.success) {
                     console.log(data.message);
@@ -410,9 +563,41 @@
             document.getElementById('btn-send-neural').disabled = false;
             document.getElementById('neural-input').placeholder = `Querying: ${slug}...`;
 
+            // Mostramos la consola de caché y la poblamos
+            document.getElementById('cache-console').style.display = 'block';
+            refreshCacheList();
+
             const chat = document.getElementById('neural-chat');
             chat.innerHTML += `<div class="message message-ai" style="border-color:var(--primary); background:rgba(0, 242, 255, 0.05)"><b>[SYSTEM]</b> LINK ESTABLISHED WITH ${slug.toUpperCase()}</div>`;
             chat.scrollTop = chat.scrollHeight;
+        }
+
+        async function refreshCacheList() {
+            if (!currentClientId) return;
+            try {
+                const res = await fetch(`/admin/api/cache/${currentClientId}?token=${encodeURIComponent(ADMIN_TOKEN)}`);
+                const data = await res.json();
+                const list = document.getElementById('cache-list');
+                list.innerHTML = data.map(e => `
+                    <div style="font-size: 10px; border-left: 2px solid var(--secondary); padding-left: 8px; margin-bottom: 4px;">
+                        <div style="color: #fff; opacity: 0.7; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;">💡 ${e.query}</div>
+                        <div style="color: var(--secondary); font-size: 9px;">${new Date(e.timestamp).toLocaleTimeString()}</div>
+                    </div>
+                `).join('') || '<div style="color: var(--text-dim); font-size: 10px;">Caché vacía o sin registros de consultas.</div>';
+            } catch (e) {
+                console.error("Cache fetch failed:", e);
+            }
+        }
+
+        async function clearSemanticCache() {
+            if (!currentClientId) return;
+            if (!confirm("¿Purgar TODA la caché semántica de este cliente?")) return;
+            try {
+                await fetch(`/admin/api/cache/${currentClientId}?token=${encodeURIComponent(ADMIN_TOKEN)}`, { method: 'DELETE' });
+                refreshCacheList();
+            } catch (e) {
+                alert("Error: " + e.message);
+            }
         }
 
         async function sendNeural() {
@@ -425,13 +610,13 @@
             input.disabled = true;
 
             try {
-                const res = await fetch(`/admin/api/neural_chat?token=${ADMIN_TOKEN}`, {
+                const res = await fetch(`/admin/api/neural_chat?token=${encodeURIComponent(ADMIN_TOKEN)}`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ clientId: currentClientId, text: text })
                 });
                 const data = await res.json();
-                appendMsg('ai', data.reply);
+                appendMsg('ai', data.reply, data.trace);
             } catch (e) {
                 appendMsg('ai', `COMMUNICATION ERROR: ${e.message}`);
             } finally {
@@ -440,28 +625,194 @@
             }
         }
 
-        function appendMsg(role, text) {
+        function appendMsg(role, text, trace = null) {
             const chat = document.getElementById('neural-chat');
-            chat.innerHTML += `<div class="message message-${role}">${text}</div>`;
+            let traceHtml = '';
+
+            if (trace) {
+                const confColor = trace.confidence_level === 'HIGH' ? 'var(--success)' : (trace.confidence_level === 'LOW' ? '#ffaa00' : '#ff0055');
+                traceHtml = `
+                <div class="trace-bubble" style="margin-top: 10px; padding: 12px; background: rgba(0,0,0,0.3); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; font-family: 'JetBrains Mono', monospace; font-size: 11px;">
+                    <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
+                        <span style="color: var(--text-dim);">[RAG TRACE]</span>
+                        <span><b style="color: ${confColor}">${trace.confidence_level}</b> | ${trace.total_latency_ms}ms</span>
+                    </div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.06); padding-bottom: 8px;">
+                        <div>HOPS: <b style="color:var(--secondary)">${trace.agentic_iterations}</b></div>
+                        <div>SOURCES: <b style="color:var(--primary)">${trace.unique_candidates}</b></div>
+                    </div>
+                    <div style="color: #888; font-size: 10px; max-height: 100px; overflow-y: auto; margin-bottom: 10px;">
+                        ${(trace.metadata?.top_sources || []).map(s => {
+                    let actionBtn = '';
+                    if (s.remote_id && s.source === 'HYBRID') {
+                        const phoneNum = s.remote_id.split('@')[0];
+                        actionBtn = `<button onclick="window.open('https://web.whatsapp.com/send?phone=${phoneNum}', '_blank')" style="background: none; border: 1px solid rgba(255,255,255,0.2); color: #fff; cursor: pointer; border-radius: 4px; padding: 2px 6px; font-size: 9px; margin-left: 8px;">💬 Abrir Chat</button>`;
+                    }
+                    return `
+                            <div style="margin-bottom: 4px; border-left: 2px solid var(--primary); padding-left: 6px;">
+                                <div style="display: flex; justify-content: space-between; align-items: center;">
+                                    <div>
+                                        <span style="color: var(--primary); text-transform: uppercase;">${s.source}</span>
+                                        ${actionBtn}
+                                    </div>
+                                    <span>${(s.score * 100).toFixed(1)}%</span>
+                                </div>
+                                <div style="font-style: italic; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; margin-top: 4px;">${s.preview}</div>
+                            </div>
+                            `;
+                }).join('') || '<div style="color: #ff0055;">No references found (Potential Hallucination Risk)</div>'}
+                    </div>
+                    <div id="vote-${trace.id}" style="display: flex; gap: 8px; justify-content: flex-end; border-top: 1px solid rgba(255,255,255,0.06); padding-top: 8px;">
+                        <button class="btn btn-ghost" style="padding: 2px 8px; font-size: 14px;" onclick="submitFeedback('${trace.id}', 'good')">👍</button>
+                        <button class="btn btn-ghost" style="padding: 2px 8px; font-size: 14px;" onclick="submitFeedback('${trace.id}', 'bad')">👎</button>
+                    </div>
+                </div>
+                `;
+            }
+
+            chat.innerHTML += `
+                <div class="message message-${role}">
+                    ${text}
+                    ${traceHtml}
+                </div>
+            `;
             chat.scrollTop = chat.scrollHeight;
         }
 
+        async function submitFeedback(traceId, feedback) {
+            try {
+                const res = await fetch(`/admin/api/feedback?token=${encodeURIComponent(ADMIN_TOKEN)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ traceId, feedback })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    const container = document.getElementById(`vote-${traceId}`);
+                    container.innerHTML = `<span style="color: var(--success); font-size: 10px; font-weight: 700;">GRACIAS POR TU FEEDBACK</span>`;
+                }
+            } catch (e) {
+                console.error("Feedback failed:", e);
+            }
+        }
+
+        let currentClientFiles = {};
         async function inspectSoul(slug) {
             try {
-                const res = await fetch(`/admin/api/soul/${slug}?token=${ADMIN_TOKEN}`);
+                const res = await fetch(`/admin/api/soul/${slug}?token=${encodeURIComponent(ADMIN_TOKEN)}`);
                 const data = await res.json();
-                document.getElementById('modal-title').textContent = `SOUL DECRYPTED: ${slug.toUpperCase()}`;
-                document.getElementById('modal-content').textContent = JSON.stringify(JSON.parse(data.soul || '{}'), null, 4);
+                currentClientFiles = data.files || {};
+
+                document.getElementById('modal-title').textContent = `MEMORY DISK: ${slug.toUpperCase()}`;
+
+                // Surgeon Reset
+                isEditorMode = false;
+                document.getElementById('editor-actions').style.display = 'block';
+                document.getElementById('modal-content').style.display = 'block';
+                document.getElementById('modal-editor').style.display = 'none';
+                document.getElementById('btn-save-file').style.display = 'none';
+
+                // Build Sidebar
+                const sidebar = document.getElementById('file-list-container');
+                sidebar.innerHTML = Object.keys(currentClientFiles).map(filename => `
+                    <button class="btn btn-ghost" style="width: 100%; text-align: left; padding: 8px 12px; font-size: 12px; margin-bottom: 2px;" onclick="showFileContent('${filename}')">
+                        📄 ${filename}
+                    </button>
+                `).join('');
+
+                // Show first file by default
+                const firstFile = Object.keys(currentClientFiles)[0];
+                if (firstFile) showFileContent(firstFile);
+
                 document.getElementById('modal-overlay').style.display = 'flex';
             } catch (e) {
                 alert("DECRYPTION FAILED: " + e.message);
             }
         }
 
+        let isEditorMode = false;
+        let currentEditingFile = null;
+
+        function showFileContent(filename) {
+            currentEditingFile = filename;
+            document.getElementById('current-file-name').textContent = `FILE: ${filename}`;
+            const content = currentClientFiles[filename];
+
+            // Si estamos en editor, actualizamos el textarea
+            if (isEditorMode) {
+                document.getElementById('modal-editor').value = content;
+            } else {
+                const pre = document.getElementById('modal-content');
+                // Highlight specific files differently if needed (like JSON inside MD)
+                if (filename.includes('SOUL') || filename.includes('USER')) {
+                    try {
+                        const jsonMatch = content.match(/```json\n([\s\S]*?)\n```/);
+                        if (jsonMatch) {
+                            pre.textContent = JSON.stringify(JSON.parse(jsonMatch[1]), null, 4);
+                            return;
+                        }
+                    } catch (e) { }
+                }
+                pre.textContent = content;
+            }
+        }
+
+        function toggleEditor() {
+            isEditorMode = !isEditorMode;
+            const pre = document.getElementById('modal-content');
+            const area = document.getElementById('modal-editor');
+            const saveBtn = document.getElementById('btn-save-file');
+
+            if (isEditorMode) {
+                pre.style.display = 'none';
+                area.style.display = 'block';
+                saveBtn.style.display = 'block';
+                area.value = currentClientFiles[currentEditingFile];
+            } else {
+                pre.style.display = 'block';
+                area.style.display = 'none';
+                saveBtn.style.display = 'none';
+                showFileContent(currentEditingFile);
+            }
+        }
+
+        async function saveCurrentFile() {
+            if (!confirm(`¿Guardar cambios en ${currentEditingFile}? Se cifrarán de nuevo.`)) return;
+            const newContent = document.getElementById('modal-editor').value;
+            try {
+                const res = await fetch(`/admin/api/soul/save/${currentSlug}/${currentEditingFile}?token=${encodeURIComponent(ADMIN_TOKEN)}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ content: newContent })
+                });
+                const data = await res.json();
+                if (data.success) {
+                    currentClientFiles[currentEditingFile] = newContent;
+                    alert("ARCHIVO ACTUALIZADO.");
+                    toggleEditor(); // Salir a vista lectura
+                } else {
+                    alert("ERROR: " + data.error);
+                }
+            } catch (e) {
+                alert("Fallo al guardar: " + e.message);
+            }
+        }
+
+        function openGraph(clientId, slug) {
+            document.getElementById('graph-client-slug').textContent = `> ${slug.toUpperCase()}`;
+            document.getElementById('graph-iframe').src = `/graph/${clientId}?token=${encodeURIComponent(ADMIN_TOKEN)}`;
+            document.getElementById('graph-overlay').style.display = 'flex';
+        }
+
+        function closeGraphModal() {
+            document.getElementById('graph-overlay').style.display = 'none';
+            document.getElementById('graph-iframe').src = '';
+        }
+
         async function restartClient(slug) {
             if (!confirm(`¿REINICIAR SESIÓN PARA ${slug}?`)) return;
             try {
-                await fetch(`/admin/restart/${slug}?token=${ADMIN_TOKEN}`, { method: 'POST' });
+                await fetch(`/admin/restart/${slug}?token=${encodeURIComponent(ADMIN_TOKEN)}`, { method: 'POST' });
                 refreshData();
                 alert(`Reinicio solicitado para ${slug}`);
             } catch (e) {
@@ -472,7 +823,7 @@
         async function deleteClient(slug) {
             if (!confirm(`⚠️ ALERTA NUCLEAR: ¿Eliminar permanentemente a ${slug} y TODOS sus datos (memoria, chats, configuración)? Esta acción es irreversible.`)) return;
             try {
-                const res = await fetch(`/admin/api/client/delete/${slug}?token=${ADMIN_TOKEN}`, { method: 'POST' });
+                const res = await fetch(`/admin/api/client/delete/${slug}?token=${encodeURIComponent(ADMIN_TOKEN)}`, { method: 'POST' });
                 const data = await res.json();
                 if (data.success) {
                     alert(data.message);
@@ -503,8 +854,157 @@
             }, 100);
         }
 
+        async function refreshRagMetrics() {
+            try {
+                const res = await fetch(`/admin/api/rag-metrics?token=${encodeURIComponent(ADMIN_TOKEN)}`);
+                const m = await res.json();
+                if (!m || m.total_queries === 0) {
+                    document.getElementById('rag-metrics-content').innerHTML = '<div style="color: var(--text-dim); text-align: center; padding: 30px;">Sin datos de métricas aún. Las métricas aparecerán al procesar mensajes.</div>';
+                    return;
+                }
+                const confColor = m.confidence_hit_rate > 70 ? 'var(--success)' : m.confidence_hit_rate > 40 ? '#ffaa00' : '#ff0055';
+                const latColor = m.avg_latency_ms < 3000 ? 'var(--success)' : m.avg_latency_ms < 6000 ? '#ffaa00' : '#ff0055';
+                document.getElementById('rag-metrics-content').innerHTML = `
+                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px;">
+                        <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 16px; text-align: center;">
+                            <div style="font-size: 10px; color: var(--text-dim); letter-spacing: 1px; margin-bottom: 6px;">AVG LATENCY</div>
+                            <div style="font-size: 24px; font-weight: 800; color: ${latColor}; font-family: 'JetBrains Mono', monospace;">${m.avg_latency_ms}ms</div>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 16px; text-align: center;">
+                            <div style="font-size: 10px; color: var(--text-dim); letter-spacing: 1px; margin-bottom: 6px;">CACHE HIT RATE</div>
+                            <div style="font-size: 24px; font-weight: 800; color: var(--primary); font-family: 'JetBrains Mono', monospace;">${m.cache_hit_rate}%</div>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 16px; text-align: center;">
+                            <div style="font-size: 10px; color: var(--text-dim); letter-spacing: 1px; margin-bottom: 6px;">CONFIDENCE HIT</div>
+                            <div style="font-size: 24px; font-weight: 800; color: ${confColor}; font-family: 'JetBrains Mono', monospace;">${m.confidence_hit_rate}%</div>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 16px; text-align: center;">
+                            <div style="font-size: 10px; color: var(--text-dim); letter-spacing: 1px; margin-bottom: 6px;">TOTAL QUERIES</div>
+                            <div style="font-size: 24px; font-weight: 800; color: var(--secondary); font-family: 'JetBrains Mono', monospace;">${m.total_queries}</div>
+                        </div>
+                    </div>
+                    <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px;">
+                        <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 14px; text-align: center;">
+                            <div style="font-size: 10px; color: var(--text-dim); letter-spacing: 1px; margin-bottom: 4px;">AVG HOPS</div>
+                            <div style="font-size: 18px; font-weight: 700; color: var(--text);">${(m.avg_llm_calls_per_query || 0).toFixed(1)}</div>
+                            <div style="font-size: 9px; color: var(--text-dim);">LLM Calls/Query</div>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 14px; text-align: center;">
+                            <div style="font-size: 10px; color: var(--text-dim); letter-spacing: 1px; margin-bottom: 4px;">REFLECTION</div>
+                            <div style="font-size: 18px; font-weight: 700; color: var(--text);">${m.avg_reflection_score}/10</div>
+                            <div style="font-size: 9px; color: var(--text-dim);">Avg Score</div>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 14px; text-align: center;">
+                            <div style="font-size: 10px; color: var(--text-dim); letter-spacing: 1px; margin-bottom: 4px;">WEB SEARCH</div>
+                            <div style="font-size: 18px; font-weight: 700; color: var(--text);">${m.web_search_rate}%</div>
+                            <div style="font-size: 9px; color: var(--text-dim);">Usage Rate</div>
+                        </div>
+                        <div style="background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.06); border-radius: 12px; padding: 14px; text-align: center;">
+                            <div style="font-size: 10px; color: var(--text-dim); letter-spacing: 1px; margin-bottom: 4px;">CONFLICTS</div>
+                            <div style="font-size: 18px; font-weight: 700; color: ${m.conflict_rate > 5 ? '#ff0055' : 'var(--success)'};">${m.conflict_rate}%</div>
+                            <div style="font-size: 9px; color: var(--text-dim);">Axiom Violations</div>
+                        </div>
+                    </div>
+                    <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 16px;">
+                        <div>
+                            <div style="font-size: 11px; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 8px;">CONFIDENCE BREAKDOWN</div>
+                            <div style="display: flex; gap: 4px; height: 8px; border-radius: 4px; overflow: hidden;">
+                                <div style="flex: ${m.confidence_breakdown?.HIGH || 0}; background: var(--success);" title="HIGH: ${m.confidence_breakdown?.HIGH || 0}"></div>
+                                <div style="flex: ${m.confidence_breakdown?.LOW || 0}; background: #ffaa00;" title="LOW: ${m.confidence_breakdown?.LOW || 0}"></div>
+                                <div style="flex: ${m.confidence_breakdown?.NONE || 0}; background: #ff0055;" title="NONE: ${m.confidence_breakdown?.NONE || 0}"></div>
+                            </div>
+                            <div style="display: flex; justify-content: space-between; margin-top: 6px; font-size: 10px; color: var(--text-dim);">
+                                <span style="color: var(--success);">● HIGH ${m.confidence_breakdown?.HIGH || 0}</span>
+                                <span style="color: #ffaa00;">● LOW ${m.confidence_breakdown?.LOW || 0}</span>
+                                <span style="color: #ff0055;">● NONE ${m.confidence_breakdown?.NONE || 0}</span>
+                            </div>
+                        </div>
+                        <div>
+                            <div style="font-size: 11px; letter-spacing: 1px; color: var(--text-dim); margin-bottom: 8px;">SOURCE MIX (AVG/QUERY)</div>
+                            <div style="font-family: 'JetBrains Mono', monospace; font-size: 12px; display: flex; gap: 20px;">
+                                <span>Hybrid: <b style="color: var(--primary);">${m.source_breakdown?.avg_hybrid || 0}</b></span>
+                                <span>Graph: <b style="color: var(--secondary);">${m.source_breakdown?.avg_graph || 0}</b></span>
+                                <span>Unique: <b>${m.source_breakdown?.avg_unique || 0}</b></span>
+                            </div>
+                        </div>
+                    </div>
+                    ${m.worst_queries?.length > 0 ? `
+                    <div style="margin-top: 16px;">
+                        <div style="font-size: 11px; letter-spacing: 1px; color: #ff0055; margin-bottom: 8px;">⚠️ WORST QUERIES (NEEDS ATTENTION)</div>
+                        <div style="background: rgba(255,0,85,0.05); border: 1px solid rgba(255,0,85,0.15); border-radius: 8px; padding: 12px; font-family: 'JetBrains Mono', monospace; font-size: 11px;">
+                            ${m.worst_queries.map(wq => `<div style="margin-bottom: 6px;">"${wq.query}" → <span style="color:#ff0055">${wq.confidence}</span> | ${wq.latency_ms}ms</div>`).join('')}
+                        </div>
+                    </div>` : ''}
+                `;
+            } catch (e) {
+                document.getElementById('rag-metrics-content').innerHTML = '<div style="color: #ff0055; text-align: center;">Error cargando métricas: ' + e.message + '</div>';
+            }
+        }
+
+        async function loadConfig() {
+            try {
+                const res = await fetch(`/admin/api/config?token=${encodeURIComponent(ADMIN_TOKEN)}`);
+                const cfg = await res.json();
+                const configDescriptions = {
+                    'rag_confidence_threshold': { label: 'Confidence Threshold', desc: 'Auto-stop investigation above this score', type: 'range', min: 0.5, max: 1.0, step: 0.05 },
+                    'max_investigation_hops': { label: 'Max Investigation Hops', desc: 'Maximum multi-hop search iterations', type: 'range', min: 1, max: 6, step: 1 },
+                    'reflection_min_chars': { label: 'Reflection Min Chars', desc: 'Skip deep reflection for messages shorter than this', type: 'range', min: 20, max: 200, step: 10 },
+                    'reflection_enabled': { label: 'Reflection Loop', desc: 'Enable Draft → Critique → Refine loop', type: 'toggle' },
+                    'semantic_cache_enabled': { label: 'Semantic Cache', desc: 'Return cached answers for similar queries', type: 'toggle' },
+                    'anti_hallucination_gate': { label: 'Anti-Hallucination Gate', desc: 'Block LLM from fabricating when no context found', type: 'toggle' },
+                    'entity_disambiguation_enabled': { label: 'Entity Disambiguation', desc: 'LLM checks if same-name entities are truly the same', type: 'toggle' },
+                    'community_detection_enabled': { label: 'Community Detection', desc: 'Group knowledge nodes into thematic communities', type: 'toggle' },
+                    'noise_filter_min_words': { label: 'Noise Filter (Min Words)', desc: 'Min words before triggering 8B noise filter', type: 'range', min: 5, max: 30, step: 1 },
+                };
+                const html = Object.entries(configDescriptions).map(([key, meta]) => {
+                    const val = cfg[key] !== undefined ? cfg[key] : '';
+                    if (meta.type === 'toggle') {
+                        return `<div style="display:flex; justify-content:space-between; align-items:center; padding:12px 16px; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:10px; margin-bottom:8px;">
+                            <div><div style="font-weight:700; font-size:13px;">${meta.label}</div><div style="font-size:10px; color:var(--text-dim);">${meta.desc}</div></div>
+                            <label style="position:relative; width:48px; height:26px; cursor:pointer;">
+                                <input type="checkbox" ${val ? 'checked' : ''} onchange="saveConfig('${key}', this.checked)" style="opacity:0; width:0; height:0;">
+                                <span style="position:absolute; inset:0; background:${val ? 'var(--success)' : 'rgba(255,255,255,0.1)'}; border-radius:13px; transition:0.3s;"></span>
+                                <span style="position:absolute; top:3px; left:${val ? '25px' : '3px'}; width:20px; height:20px; background:white; border-radius:50%; transition:0.3s;"></span>
+                            </label>
+                        </div>`;
+                    } else {
+                        return `<div style="padding:12px 16px; background:rgba(255,255,255,0.02); border:1px solid rgba(255,255,255,0.06); border-radius:10px; margin-bottom:8px;">
+                            <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
+                                <div><div style="font-weight:700; font-size:13px;">${meta.label}</div><div style="font-size:10px; color:var(--text-dim);">${meta.desc}</div></div>
+                                <span id="val-${key}" style="font-family:'JetBrains Mono',monospace; font-size:16px; font-weight:800; color:var(--primary);">${val}</span>
+                            </div>
+                            <input type="range" min="${meta.min}" max="${meta.max}" step="${meta.step}" value="${val}"
+                                style="width:100%; accent-color:var(--primary); cursor:pointer;"
+                                oninput="document.getElementById('val-${key}').textContent=this.value"
+                                onchange="saveConfig('${key}', parseFloat(this.value))">
+                        </div>`;
+                    }
+                }).join('');
+                document.getElementById('config-editor').innerHTML = html;
+            } catch (e) {
+                document.getElementById('config-editor').innerHTML = '<div style="color:#ff0055;text-align:center;">Error: ' + e.message + '</div>';
+            }
+        }
+
+        async function saveConfig(key, value) {
+            try {
+                await fetch(`/admin/api/config?token=${encodeURIComponent(ADMIN_TOKEN)}`, {
+                    method: 'POST', headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ key, value })
+                });
+                console.log(`✅ Config saved: ${key} = ${value}`);
+                // Brief visual feedback
+                setTimeout(() => loadConfig(), 300);
+            } catch (e) {
+                alert('Error guardando config: ' + e.message);
+            }
+        }
+
         setInterval(refreshData, 5000);
+        setInterval(refreshRagMetrics, 10000);
         refreshData();
+        refreshRagMetrics();
+        loadConfig();
     </script>
 
 </body>

@@ -24,7 +24,7 @@ export async function transcribeAudio(filePath) {
             model: 'whisper-large-v3',
             response_format: 'json',
             language: 'es',
-        }, { timeout: 30000 });
+        }, { timeout: 120000 }); // Aumentado a 2 minutos para audios largos
 
         console.log(`[Media-Audio] ✅ Éxito: "${transcription.text.substring(0, 30)}..."`);
         return transcription.text;
@@ -45,17 +45,27 @@ export async function analyzeImage(filePath) {
         console.log(`[Media-Vision] 🖼️ Analizando imagen: ${filePath}`);
 
         const response = await groq.chat.completions.create({
-            model: 'meta-llama/llama-4-scout-17b-16e-instruct',
+            model: 'llama-3.2-11b-vision-preview',
             messages: [
                 {
                     role: 'user',
                     content: [
-                        { type: 'text', text: "Describe esta imagen de forma concisa pero detallada en español (objetos, personas, texto, contexto). Máximo 3 frases." },
+                        {
+                            type: 'text',
+                            text: `Describe esta imagen detalladamente para un sistema de memoria a largo plazo. 
+                            Incluye:
+                            1. Objetos y personas presentes.
+                            2. Texto legible (OCR), números o fechas.
+                            3. Contexto aparente (es una factura, una foto familiar, un pantallazo de chat, un esquema técnico).
+                            4. Colores y ambiente.
+                            Responde en español, de forma estructurada pero fluida.`
+                        },
                         { type: 'image_url', image_url: { url: `data:image/jpeg;base64,${data}` } }
                     ]
                 }
             ],
-            max_tokens: 256
+            max_tokens: 512,
+            temperature: 0.2
         });
 
         const description = response.choices[0].message.content;

@@ -71,31 +71,89 @@ export const useSupabaseAuthState = async (clientId) => {
             keys: {
                 get: async (type, ids) => {
                     const data = {};
-                    await Promise.all(
-                        ids.map(async (id) => {
-                            let value = await readData(type, id);
-                            if (type === 'app-state-sync-key' && value) {
-                                value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                    try {
+                        const CHUNK_SIZE = 100;
+                        for (let i = 0; i < ids.length; i += CHUNK_SIZE) {
+                            const chunk = ids.slice(i, i + CHUNK_SIZE);
+                            const { data: results, error } = await supabase
+                                .from('whatsapp_sessions')
+                                .select('data_id, data_json')
+                                .eq('client_id', clientId)
+                                .eq('data_type', type)
+                                .in('data_id', chunk);
+
+                            if (error) {
+                                console.error(`[DB-Auth] Bulk read error for ${type}:`, error.message);
                             }
-                            data[id] = value;
-                        })
-                    );
+
+                            if (results) {
+                                for (const row of results) {
+                                    let value = JSON.parse(JSON.stringify(row.data_json), BufferJSON.reviver);
+                                    if (type === 'app-state-sync-key' && value) {
+                                        value = proto.Message.AppStateSyncKeyData.fromObject(value);
+                                    }
+                                    data[row.data_id] = value;
+                                }
+                            }
+                        }
+                        
+                        // Ensure all requested keys exist, even if null
+                        for (const id of ids) {
+                            if (data[id] === undefined) data[id] = null;
+                        }
+                    } catch (e) {
+                        console.error(`[DB-Auth] Bulk read crashed for ${type}:`, e.message);
+                        for (const id of ids) data[id] = null;
+                    }
                     return data;
                 },
                 set: async (data) => {
-                    const tasks = [];
+                    const upserts = [];
+                    const deletes = [];
+
                     for (const category in data) {
                         for (const id in data[category]) {
                             const value = data[category][id];
-                            const category_id = id;
                             if (value) {
-                                tasks.push(writeData(category, category_id, value));
+                                upserts.push({
+                                    client_id: clientId,
+                                    data_type: category,
+                                    data_id: id,
+                                    data_json: JSON.parse(JSON.stringify(value, BufferJSON.replacer)),
+                                    updated_at: new Date().toISOString()
+                                });
                             } else {
-                                tasks.push(removeData(category, category_id));
+                                deletes.push({ type: category, id });
                             }
                         }
                     }
-                    await Promise.all(tasks);
+
+                    try {
+                        // Bulk Upsert in chunks to respect Supabase payload limits
+                        const CHUNK_SIZE = 500;
+                        for (let i = 0; i < upserts.length; i += CHUNK_SIZE) {
+                            const chunk = upserts.slice(i, i + CHUNK_SIZE);
+                            const { error } = await supabase
+                                .from('whatsapp_sessions')
+                                .upsert(chunk, { onConflict: 'client_id, data_type, data_id' });
+                            
+                            if (error) console.error(`[DB-Auth] Bulk upsert error:`, error.message);
+                        }
+
+                        // Execute deletes
+                        if (deletes.length > 0) {
+                            const tasks = deletes.map(d => 
+                                supabase.from('whatsapp_sessions')
+                                        .delete()
+                                        .eq('client_id', clientId)
+                                        .eq('data_type', d.type)
+                                        .eq('data_id', d.id)
+                            );
+                            await Promise.all(tasks);
+                        }
+                    } catch(e) {
+                        console.error(`[DB-Auth] Bulk set crashed:`, e.message);
+                    }
                 },
             },
         },

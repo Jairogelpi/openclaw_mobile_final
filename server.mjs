@@ -19,16 +19,16 @@ process.on('uncaughtException', (err) => {
 });
 
 import { encrypt, decrypt } from './security.mjs';
-import { startWhatsAppClient, qrCodes, activeSessions, getWhatsAppStatus, logoutWhatsApp, sendHumanLikeMessage } from './channels/whatsapp.mjs';
+import { startWhatsAppClient, qrCodes, pairingCodes, activeSessions, getWhatsAppStatus, logoutWhatsApp, sendHumanLikeMessage, fetchHistoricalMedia } from './channels/whatsapp.mjs';
 import supabase from './config/supabase.mjs';
 import redisClient from './config/redis.mjs';
 import { getClientSlug } from './utils/helpers.mjs';
 import { transcribeAudio, extractFileText } from './utils/media.mjs';
 import { authRegister, authLogin } from './controllers/auth.controller.mjs';
 import { onboardingChat } from './controllers/onboarding.controller.mjs';
-import { getInboxSummaries, getInboxHistory, generateSmartReply } from './controllers/inbox.controller.mjs';
+import { getInboxSummaries, getInboxHistory, generateSmartReply, markAsRead, getWhatsAppMetadata } from './controllers/inbox.controller.mjs';
 import { handleSupabaseWebhook } from './controllers/webhook.controller.mjs';
-import { adminHealthDashboard, adminRestartClient, adminLogoutWhatsApp, adminApiDeleteClient, adminDeleteClient, adminViewLogs, adminGetStats, adminGetSoul, adminNeuralChat, adminGetLogs, adminControlContainer } from './controllers/admin.controller.mjs';
+import { adminHealthDashboard, adminRestartClient, adminLogoutWhatsApp, adminApiDeleteClient, adminDeleteClient, adminViewLogs, adminGetStats, adminNeuralChat, adminGetLogs, adminControlContainer, adminGetRagMetrics, adminGetConfig, adminSetConfig, adminPostFeedback, adminGetClientFiles, adminGetCache, adminClearCache, adminSaveClientFile } from './controllers/admin.controller.mjs';
 import { handleWhatsAppPair, handleWhatsAppStatus, handleWhatsAppLogout, handleWhatsAppProxyMethod } from './controllers/whatsapp.controller.mjs';
 import { handleSoulGet, handleSoulRefine } from './controllers/soul.controller.mjs';
 import { handleUpdateSettings } from './controllers/settings.controller.mjs';
@@ -59,6 +59,7 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 app.use(express.static(path.join(process.cwd(), 'public')));
+app.use('/uploads', express.static(path.join(process.cwd(), 'uploads'))); // Serve media files (images, audio, docs)
 
 const PORT = 3000;
 const GATEWAY_TOKEN = process.env.OPENCLAW_GATEWAY_TOKEN || '';
@@ -85,40 +86,93 @@ app.get('/api/graph-data/:clientId', async (req, res) => {
     try {
         const { clientId } = req.params;
 
-        // Fetch Nodes
-        const { data: nodesData, error: nodesErr } = await supabase
-            .from('knowledge_nodes')
-            .select('entity_name, entity_type, description')
-            .eq('client_id', clientId);
+        // --- 1. Fetch ALL Nodes (Paginated) ---
+        let allNodes = [];
+        let fromNode = 0;
+        let hasMoreNodes = true;
+        while (hasMoreNodes) {
+            const { data, error } = await supabase
+                .from('knowledge_nodes')
+                .select('entity_name, entity_type, description, created_at')
+                .eq('client_id', clientId)
+                .range(fromNode, fromNode + 999);
 
-        // Fetch Edges
-        const { data: edgesData, error: edgesErr } = await supabase
-            .from('knowledge_edges')
-            .select('source_node, target_node, relation_type')
-            .eq('client_id', clientId);
-
-        if (nodesErr || edgesErr) {
-            console.error('[Graph-API] DB Error:', nodesErr || edgesErr);
-            return res.status(500).json({ error: 'DB Error' });
+            if (error) throw error;
+            allNodes = [...allNodes, ...data];
+            fromNode += 1000;
+            if (data.length < 1000) hasMoreNodes = false;
+            if (fromNode >= 10000) hasMoreNodes = false; // Safety cap
         }
 
-        // Format for 3d-force-graph
-        const graphData = {
-            nodes: (nodesData || []).map(n => ({
-                id: n.entity_name,
-                name: n.entity_name,
-                type: n.entity_type,
-                description: n.description
-            })),
-            links: (edgesData || []).map(e => ({
-                source: e.source_node,
-                target: e.target_node,
-                name: e.relation_type
-            }))
-        };
+        // --- 2. Fetch ALL Edges (Paginated) ---
+        let allEdges = [];
+        let fromEdge = 0;
+        let hasMoreEdges = true;
+        while (hasMoreEdges) {
+            const { data, error } = await supabase
+                .from('knowledge_edges')
+                .select('source_node, target_node, relation_type, weight, context, cognitive_flags, created_at, last_seen')
+                .eq('client_id', clientId)
+                .range(fromEdge, fromEdge + 999);
 
-        res.json(graphData);
+            if (error) throw error;
+            allEdges = [...allEdges, ...data];
+            fromEdge += 1000;
+            if (data.length < 1000) hasMoreEdges = false;
+            if (fromEdge >= 10000) hasMoreEdges = false; // Safety cap
+        }
+
+        // --- 3. Fetch Client Info for Biography ---
+        const { data: clientData } = await supabase
+            .from('user_souls')
+            .select('soul_json')
+            .eq('client_id', clientId)
+            .single();
+
+        const ownerName = clientData?.soul_json?.nombre || "Usuario";
+        const bio = clientData?.soul_json?.resumen_narrativo || "Dueño de esta red neuronal.";
+
+        // --- 4. Format for 3D Visualizer ---
+        const nodeSet = new Set(allNodes.map(n => n.entity_name));
+        const finalNodes = allNodes.map(n => ({
+            id: n.entity_name,
+            name: n.entity_name,
+            type: n.entity_type,
+            description: (n.entity_name === ownerName || n.entity_name === 'Usuario') ? bio : n.description,
+            created_at: n.created_at
+        }));
+
+        const finalLinks = allEdges.map(e => ({
+            source: e.source_node,
+            target: e.target_node,
+            relation: e.relation_type,
+            weight: (e.weight || 0) + 1,
+            context: e.context,
+            flags: e.cognitive_flags,
+            created_at: e.created_at,
+            last_seen: e.last_seen
+        }));
+
+        // Ghost Node Protection: ensure all links have valid nodes
+        finalLinks.forEach(link => {
+            if (!nodeSet.has(link.source)) {
+                finalNodes.push({ id: link.source, name: link.source, type: 'ENTITY', description: 'Referencia automática.' });
+                nodeSet.add(link.source);
+            }
+            if (!nodeSet.has(link.target)) {
+                finalNodes.push({ id: link.target, name: link.target, type: 'ENTITY', description: 'Referencia automática.' });
+                nodeSet.add(link.target);
+            }
+        });
+
+        // Ensure owner exists if not already present
+        if (!nodeSet.has(ownerName)) {
+            finalNodes.push({ id: ownerName, name: ownerName, type: 'PERSONA', description: bio });
+        }
+
+        res.json({ nodes: finalNodes, links: finalLinks, ownerName });
     } catch (err) {
+        console.error('[Graph-API] Fatal Error:', err);
         res.status(500).json({ error: err.message });
     }
 });
@@ -144,25 +198,34 @@ app.post('/rpc', async (req, res) => {
         // --- 2. MÉTODOS PROTEGIDOS ---
         // Requieren autenticación
         try {
-            const authHeader = req.headers.authorization;
-            if (!authHeader) {
-                console.warn(`[Bridge] Missing Authorization header for ${method}`);
-                throw new Error('Missing Authorization header');
-            }
+            // EXCEPCIÓN INTERNA: whatsapp.fetchMedia es llamado locamente por la IA sin token
+            if (method !== 'whatsapp.fetchMedia') {
+                const authHeader = req.headers.authorization;
+                if (!authHeader) {
+                    console.warn(`[Bridge] Missing Authorization header for ${method}`);
+                    throw new Error('Missing Authorization header');
+                }
 
-            let token = authHeader.split(' ')[1];
-            if (!token || token === 'null' || token === 'undefined') {
-                return res.status(401).json({ error: { message: 'Tu sesión ha expirado o es inválida (token nulo). Por favor, ve a ajustes, cierra sesión y vuelve a iniciarla.' }, id });
-            }
-            token = token.replace(/['"]/g, ''); // Fix malformed tokens with quotes
-            const { data: { user }, error } = await supabase.auth.getUser(token);
-            if (error || !user) {
-                console.error(`[Bridge] Auth failed for ${method}:`, error?.message || 'Invalid user');
-                return res.status(401).json({ error: { message: 'Token expirado o inválido. Cierra sesión y vuelve a entrar.' }, id });
-            }
+                let token = authHeader.split(' ')[1];
+                if (!token || token === 'null' || token === 'undefined') {
+                    return res.status(401).json({ error: { message: 'Tu sesión ha expirado o es inválida (token nulo). Por favor, ve a ajustes, cierra sesión y vuelve a iniciarla.' }, id });
+                }
+                token = token.replace(/['"]/g, ''); // Fix malformed tokens with quotes
+                const { data: { user }, error } = await supabase.auth.getUser(token);
+                if (error || !user) {
+                    console.error(`[Bridge] Auth failed for ${method}:`, error?.message || 'Invalid user');
+                    return res.status(401).json({ error: { message: 'Token expirado o inválido. Cierra sesión y vuelve a entrar.' }, id });
+                }
 
-            req.user = user;
-            req.clientId = user.id;
+                req.user = user;
+                req.clientId = user.id;
+                req.user.clientId = user.id; // Compatibility for other controllers
+            } else {
+                // Mock req.clientId for internal fetchMedia skill call based on params
+                req.clientId = params.clientId;
+                if (!req.clientId) throw new Error("Missing clientId in internal fetchMedia params");
+                req.user = { email: 'internal-skill@openclaw.local', id: req.clientId, clientId: req.clientId };
+            }
         } catch (authError) {
             return res.status(401).json({ error: { message: authError.message }, id });
         }
@@ -314,7 +377,22 @@ app.post('/rpc', async (req, res) => {
             }
         }
 
-        // B.7) WHATSAPP: REACT TO MESSAGE (real emoji reaction via Baileys)
+        // B.7) WHATSAPP: FETCH HISTORICAL MEDIA (LAZY LOADING)
+        if (method === 'whatsapp.fetchMedia') {
+            const sock = activeSessions.get(clientId);
+            if (!sock) return res.json({ error: { message: 'WhatsApp no conectado' }, id });
+            try {
+                const { remoteJid, messageId } = params;
+                const { buffer, mediaType, mimeType } = await fetchHistoricalMedia(clientId, remoteJid, messageId);
+                // Return buffer as base64 for processing over bridge
+                const base64Data = buffer.toString('base64');
+                return res.json({ result: { mediaType, mimeType, data: base64Data }, id });
+            } catch (e) {
+                return res.json({ error: { message: e.message }, id });
+            }
+        }
+
+        // B.8) WHATSAPP: REACT TO MESSAGE (real emoji reaction via Baileys)
         if (method === 'whatsapp.react') {
             const sock = activeSessions.get(clientId);
             if (!sock) return res.json({ error: { message: 'WhatsApp no conectado' }, id });
@@ -472,8 +550,9 @@ app.get('/health', async (req, res) => {
 // --- INBOX & SUMMARIES ---
 app.get('/inbox', authenticateToken, getInboxSummaries);
 app.get('/inbox/history/:remoteId', authenticateToken, getInboxHistory);
-
+app.post('/inbox/mark-read/:jid', authenticateToken, markAsRead);
 app.post('/inbox/smart-reply', authenticateToken, generateSmartReply);
+app.get('/whatsapp/metadata/:jid', authenticateToken, getWhatsAppMetadata);
 
 
 // === ADMIN HEALTH DASHBOARD ===
@@ -483,11 +562,69 @@ app.post('/admin/delete/:slug', (req, res) => adminDeleteClient(req, res, active
 app.get('/admin/logs/:slug', (req, res) => adminViewLogs(req, res));
 
 // --- NUEVAS RUTAS DASHBOARD (Phase 12) ---
-app.get('/admin/api/stats', (req, res) => adminGetStats(req, res, activeSessions, qrCodes));
-app.get('/admin/api/soul/:slug', (req, res) => adminGetSoul(req, res));
+app.get('/admin/api/stats', (req, res) => adminGetStats(req, res, activeSessions, qrCodes, pairingCodes));
+app.get('/admin/api/soul/:slug', (req, res) => adminGetClientFiles(req, res));
+app.post('/admin/api/soul/save/:slug/:filename', (req, res) => adminSaveClientFile(req, res));
+app.get('/admin/api/cache/:clientId', (req, res) => adminGetCache(req, res));
+app.delete('/admin/api/cache/:clientId', (req, res) => adminClearCache(req, res));
 app.get('/admin/api/logs/:slug', (req, res) => adminGetLogs(req, res));
 app.post('/admin/api/neural_chat', (req, res) => adminNeuralChat(req, res));
+app.get('/admin/api/rag-metrics', (req, res) => adminGetRagMetrics(req, res));
+app.get('/admin/api/config', (req, res) => adminGetConfig(req, res));
+app.post('/admin/api/config', (req, res) => adminSetConfig(req, res));
+app.post('/admin/api/feedback', (req, res) => adminPostFeedback(req, res));
 app.post('/admin/api/whatsapp/logout/:slug', (req, res) => adminLogoutWhatsApp(req, res, activeSessions));
+
+// --- WhatsApp Session Management from Dashboard ---
+app.post('/admin/api/whatsapp/pair/:slug', async (req, res) => {
+    try {
+        const slug = req.params.slug;
+        const phoneNumber = req.body?.phoneNumber;
+        const { data: client } = await supabase.from('user_souls').select('client_id').eq('slug', slug).single();
+        if (!client) return res.status(404).json({ error: 'Client not found' });
+
+        const waRes = await startWhatsAppClient(client.client_id, slug, phoneNumber || null);
+        if (waRes.status === 'pairing_code') {
+            return res.json({ status: 'pairing_code', pairingCode: waRes.code });
+        }
+        const qr = qrCodes.get(client.client_id);
+        return res.json({ status: qr ? 'qr_ready' : 'starting', qr: qr || null, message: waRes.message || 'Iniciando...' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.get('/admin/api/whatsapp/status/:slug', async (req, res) => {
+    try {
+        const slug = req.params.slug;
+        const { data: client } = await supabase.from('user_souls').select('client_id').eq('slug', slug).single();
+        if (!client) return res.status(404).json({ error: 'Client not found' });
+
+        const isActive = activeSessions.has(client.client_id);
+        const qr = qrCodes.get(client.client_id);
+        const status = isActive ? 'connected' : (qr ? 'qr_ready' : 'disconnected');
+        return res.json({ status, qr: qr || null, clientId: client.client_id });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
+
+app.post('/admin/api/whatsapp/reconnect/:slug', async (req, res) => {
+    try {
+        const slug = req.params.slug;
+        const { data: client } = await supabase.from('user_souls').select('client_id').eq('slug', slug).single();
+        if (!client) return res.status(404).json({ error: 'Client not found' });
+
+        // Force disconnect then reconnect
+        const existing = activeSessions.get(client.client_id);
+        if (existing) { try { existing.end(undefined); } catch (e) { } activeSessions.delete(client.client_id); }
+
+        const waRes = await startWhatsAppClient(client.client_id, slug, null);
+        return res.json({ status: 'reconnecting', message: 'Session restarted. History sync will trigger automatically.' });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+});
 app.post('/admin/api/client/delete/:slug', (req, res) => adminApiDeleteClient(req, res, activeSessions));
 app.post('/admin/api/container/:action/:containerName', (req, res) => adminControlContainer(req, res));
 app.get('/admin/api/container/logs/:containerName', (req, res) => {
@@ -543,14 +680,21 @@ httpServer.on('upgrade', async (request, socket, head) => {
 httpServer.listen(PORT, '0.0.0.0', async () => {
     console.log(`🚀 SaaS Bridge listening on http://0.0.0.0:${PORT}`);
 
-    // DEBUG: Auto-start Jairo Gelpi client for ingestion verification
-    const debugClientId = '4b817c0c-bb1b-47d6-b5b1-4367af9403ff';
-    const debugClientSlug = 'gelpierreape-4b817';
-    console.log(`[Debug] 🚀 Auto-starting ${debugClientSlug}...`);
+    // --- 🚀 AUTO-RECONNECT WHATSAPP CLIENTS ---
     try {
-        await startWhatsAppClient(debugClientId, debugClientSlug);
+        const { data: souls } = await supabase.from('user_souls').select('client_id, slug');
+        if (souls && souls.length > 0) {
+            console.log(`[Boot] Intentando reconectar ${souls.length} sesiones de WhatsApp...`);
+            for (const soul of souls) {
+                if (soul.client_id && soul.slug) {
+                    startWhatsAppClient(soul.client_id, soul.slug).catch(e => {
+                        console.error(`[Boot] Fallo al iniciar cliente ${soul.slug}:`, e.message);
+                    });
+                }
+            }
+        }
     } catch (e) {
-        console.error(`[Debug] ❌ Failed to start ${debugClientSlug}:`, e.message);
+        console.error('[Boot] Error al auto-conectar WhatsApp:', e.message);
     }
 
     // --- 🧹 GARBAGE COLLECTOR (Self-Healing) ---

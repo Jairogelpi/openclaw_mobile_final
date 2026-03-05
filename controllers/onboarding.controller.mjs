@@ -347,6 +347,9 @@ Ignora tu intento de despedida. Actúa con tu personalidad elegida y haz una sol
                 const contextMd = `# Contexto Actual\n - Fecha de creación: ${new Date().toLocaleDateString()}\n - Plataforma: OpenClaw SaaS App\n - Estado inicial: Configurado vía Génesis Onboarding.`;
                 await fs.writeFile(`${clientDir}/CONTEXT.md`, encrypt(contextMd));
 
+                const agentMd = `# Directrices de Agente (Axiomas e Instrucciones Core)\n- Núcleo Inicializado. A la espera de correcciones de usuario y directivas personalizadas.\n${(soulJson.personal_directives || []).map(d => `- [DIRECTIVA]: ${d}`).join('\n')}\n${(soulJson.axiomas_filosoficos || []).map(a => `- [AXIOMA] ${a}`).join('\n')}`;
+                await fs.writeFile(`${clientDir}/AGENT.md`, encrypt(agentMd));
+
                 console.log('[Baptism] ✅ All physical files (except gateway which is DB) written.');
 
                 completed = true;

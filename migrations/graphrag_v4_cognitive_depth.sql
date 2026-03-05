@@ -14,7 +14,7 @@ CREATE INDEX IF NOT EXISTS idx_knowledge_edges_weight ON public.knowledge_edges(
 -- 3. Función atómica para el Upsert de Relaciones con Incremento de Peso
 -- Esto permite que si una relación se detecta varias veces, su "importancia" suba.
 CREATE OR REPLACE FUNCTION upsert_knowledge_edge_v4(
-    p_client_id text,
+    p_client_id uuid,
     p_source_node text,
     p_target_node text,
     p_relation_type text,

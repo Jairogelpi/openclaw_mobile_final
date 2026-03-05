@@ -3,8 +3,11 @@ import { exec } from 'child_process';
 import util from 'util';
 import path from 'path';
 import supabase from '../config/supabase.mjs';
-import { decrypt } from '../security.mjs';
+import { encrypt, decrypt } from '../security.mjs';
+import redisClient from '../config/redis.mjs';
 import { processMessage } from '../core_engine.mjs';
+import { getAggregatedMetrics } from '../services/rag_metrics.mjs';
+import { getAllConfig, setConfig } from '../services/config.service.mjs';
 
 const execPromise = util.promisify(exec);
 
@@ -94,21 +97,26 @@ export async function adminRestartClient(req, res, activeSessions, startWhatsApp
 
         // Si ya había una sesión, cerramos la conexión de Baileys
         if (activeSessions.has(soul.client_id)) {
-            const sessionData = activeSessions.get(soul.client_id);
-            if (sessionData && sessionData.sock && typeof sessionData.sock.logout === 'function') {
-                try { await sessionData.sock.logout(); } catch (e) {
-                    // Ignoramos errores de logout
-                }
+            const session = activeSessions.get(soul.client_id);
+            if (session && session.sock && typeof session.sock.logout === 'function') {
+                try { await session.sock.logout(); } catch (e) { }
             }
             activeSessions.delete(soul.client_id);
         }
 
+        // Borramos de Supabase para forzar re-vinculación limpia
+        await supabase
+            .from('whatsapp_sessions')
+            .delete()
+            .eq('client_id', soul.client_id);
+
         const clientDir = `./clients/${slug}`;
 
-        // Borramos la carpeta Baileys auth para forzar nuevo QR/Pair
-        try {
-            await fs.rm(`${clientDir}/baileys_auth_info`, { recursive: true, force: true });
-        } catch (e) { }
+        // Borramos carpetas Baileys auth locales por si acaso
+        await Promise.all([
+            fs.rm(`${clientDir}/baileys_auth_info`, { recursive: true, force: true }).catch(() => { }),
+            fs.rm(`./clients_sessions/${slug}`, { recursive: true, force: true }).catch(() => { })
+        ]);
 
         // Incrementamos contador
         await supabase.rpc('increment_restart', { p_client_id: soul.client_id });
@@ -140,21 +148,31 @@ export async function adminLogoutWhatsApp(req, res, activeSessions) {
         console.log(`🔌 [Admin] Cerrando sesión (Logout) para ${slug}...`);
 
         if (activeSessions.has(soul.client_id)) {
-            const sock = activeSessions.get(soul.client_id);
-            if (sock && typeof sock.logout === 'function') {
-                await sock.logout().catch(() => { });
+            const session = activeSessions.get(soul.client_id);
+            if (session && session.sock && typeof session.sock.logout === 'function') {
+                await session.sock.logout().catch(() => { });
             }
             activeSessions.delete(soul.client_id);
         }
 
-        // También borramos los archivos locales de sesión de Baileys
+        // 1. Borrar de Supabase (MANDATORIO ya que usamos useSupabaseAuthState)
+        const { error: dbError } = await supabase
+            .from('whatsapp_sessions')
+            .delete()
+            .eq('client_id', soul.client_id);
+
+        if (dbError) console.error(`[Admin-Logout] Error DB:`, dbError.message);
+
+        // 2. También borramos los archivos locales (Legacy o cache)
         const sessionDir = `./clients_sessions/${slug}`;
-        await fs.rm(sessionDir, { recursive: true, force: true }).catch(() => { });
+        const clientAuthDir = `./clients/${slug}/baileys_auth_info`;
 
-        // El directorio del cliente (config) por si acaso guardara algo ahí
-        await fs.rm(`./clients/${slug}/baileys_auth_info`, { recursive: true, force: true }).catch(() => { });
+        await Promise.all([
+            fs.rm(sessionDir, { recursive: true, force: true }).catch(() => { }),
+            fs.rm(clientAuthDir, { recursive: true, force: true }).catch(() => { })
+        ]);
 
-        res.json({ success: true, message: `Sesión de ${slug} cerrada correctamente.` });
+        res.json({ success: true, message: `Sesión de ${slug} CERRADA y ELIMINADA (DB + Local).` });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -349,13 +367,14 @@ export async function adminGetLogs(req, res) {
 /**
  * API: Retorna estadísticas base para el dashboard SPA
  */
-export async function adminGetStats(req, res, activeSessions, qrCodes) {
+export async function adminGetStats(req, res, activeSessions, qrCodes, pairingCodes) {
     if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
 
     try {
+        // Fetch clients with stability fallback
         const { data: clients, error: clientError } = await supabase
             .from('user_souls')
-            .select('client_id, slug, port, last_active, restart_count');
+            .select('client_id, slug, port, last_active, restart_count, is_processing, worker_status, soul_json');
 
         if (clientError) {
             console.error('[AdminStats] Supabase client fetch error:', clientError);
@@ -366,7 +385,7 @@ export async function adminGetStats(req, res, activeSessions, qrCodes) {
         // Get Docker containers info
         let dockerContainers = [];
         try {
-            const { stdout } = await execPromise('docker ps -a --format "{{.Names}}\t{{.Status}}\t{{.Image}}"');
+            const { stdout } = await execPromise('docker ps -a --format "{{.Names}}\\t{{.Status}}\\t{{.Image}}"');
             dockerContainers = stdout.trim().split('\n').filter(Boolean).map(line => {
                 const [name, status, image] = line.split('\t');
                 return { name, status, image };
@@ -394,15 +413,31 @@ export async function adminGetStats(req, res, activeSessions, qrCodes) {
                 uptime: process.uptime(),
                 sessions_active: activeSessions.size
             },
-            clients: (clients || []).map(c => ({
-                ...c,
-                is_online: activeSessions.has(c.client_id),
-                whatsapp: {
-                    connected: activeSessions.has(c.client_id) && activeSessions.get(c.client_id)?.user ? true : false,
-                    has_qr: qrCodes ? qrCodes.has(c.client_id) : false,
-                    qr: qrCodes ? qrCodes.get(c.client_id) : null
-                }
-            })),
+            clients: (clients || []).map(c => {
+                // Calculate dynamic identity score based on soul_json completion
+                const soul = c.soul_json || {};
+                const criticalFields = ['nombre', 'bio', 'profile', 'network', 'goals', 'playbook', 'axiomas_filosoficos'];
+                const completedFields = criticalFields.filter(f => soul[f] && (typeof soul[f] === 'object' ? Object.keys(soul[f]).length > 0 : soul[f].length > 0));
+                const identityScore = Math.min(100, Math.round((completedFields.length / criticalFields.length) * 100));
+
+                return {
+                    client_id: c.client_id,
+                    slug: c.slug,
+                    port: c.port,
+                    last_active: c.last_active,
+                    restart_count: c.restart_count,
+                    is_processing: c.is_processing,
+                    worker_status: c.worker_status || (c.is_processing ? '🧠 Procesando...' : '○ Cerebro en reposo'),
+                    identity_score: identityScore || (soul.is_onboarded ? 85 : 10), // Base score if onboarded
+                    is_online: activeSessions.has(c.client_id),
+                    whatsapp: {
+                        connected: activeSessions.has(c.client_id) && activeSessions.get(c.client_id)?.user ? true : false,
+                        has_qr: qrCodes ? qrCodes.has(c.client_id) : false,
+                        qr: qrCodes ? qrCodes.get(c.client_id) : null,
+                        pairing_code: pairingCodes ? pairingCodes.get(c.client_id) : null
+                    }
+                };
+            }),
             containers: dockerContainers.map(ct => ({
                 ...ct,
                 resources: dockerStats[ct.name] || { cpu: '0%', mem: '0B / 0B', memPerc: '0%' }
@@ -451,31 +486,31 @@ export async function adminControlContainer(req, res) {
 }
 
 /**
- * API: Obtiene y descifra el SOUL de un cliente
+ * API: Obtiene y descifra todos los archivos de memoria (.md) de un cliente
  */
-export async function adminGetSoul(req, res) {
+export async function adminGetClientFiles(req, res) {
     if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
     const { slug } = req.params;
 
     try {
         const clientDir = path.resolve(`./clients/${slug}`);
-        const soulPath = path.join(clientDir, 'SOUL.md');
-        const userPath = path.join(clientDir, 'USER.md');
+        const files = await fs.readdir(clientDir);
+        const mdFiles = files.filter(f => f.endsWith('.md'));
 
-        const soulEnc = await fs.readFile(soulPath, 'utf8');
-        const userEnc = await fs.readFile(userPath, 'utf8');
+        const result = {};
+        for (const file of mdFiles) {
+            const content = await fs.readFile(path.join(clientDir, file), 'utf8');
+            result[file] = decrypt(content);
+        }
 
-        res.json({
-            soul: decrypt(soulEnc),
-            user: decrypt(userEnc)
-        });
+        res.json({ files: result });
     } catch (err) {
         res.status(500).json({ error: `Error leyendo archivos de ${slug}: ${err.message}` });
     }
 }
 
 /**
- * API: Neural Terminal - Prueba el cerebro directamente
+ * API: Neural Terminal - Prueba el cerebro directamente (con RAG Trace)
  */
 export async function adminNeuralChat(req, res) {
     if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
@@ -484,16 +519,177 @@ export async function adminNeuralChat(req, res) {
     if (!clientId || !text) return res.status(400).json({ error: 'Faltan parámetros' });
 
     try {
-        console.log(`🧠 [Neural Terminal] Testing for ${clientId}: "${text.slice(0, 30)}..."`);
+        // Fetch slug for the client
+        const { data: soul } = await supabase.from('user_souls').select('slug').eq('client_id', clientId).single();
+        const clientSlug = soul?.slug || 'unknown';
+
+        console.log(`🧠 [Neural Terminal] Testing for ${clientId} (${clientSlug}): "${text.slice(0, 30)}..."`);
         const reply = await processMessage({
             clientId,
+            clientSlug,
             text,
             senderId: remoteId || 'terminal-admin',
-            pushName: 'Admin Debugger'
+            pushName: 'Admin Debugger',
+            channel: 'terminal'
         });
 
-        res.json({ reply });
+        // Fetch latest RAG trace for this client to show in the dashboard
+        let trace = null;
+        try {
+            const { data } = await supabase
+                .from('rag_metrics')
+                .select('*')
+                .eq('client_id', clientId)
+                .order('created_at', { ascending: false })
+                .limit(1);
+            if (data?.[0]) trace = data[0];
+        } catch (e) { /* non-critical */ }
+
+        res.json({ reply, trace });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
 }
+
+/**
+ * API: RAG Quality Metrics — Métricas de calidad del pipeline cognitivo
+ */
+export async function adminGetRagMetrics(req, res) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { clientId, days } = req.query;
+
+    try {
+        const metrics = await getAggregatedMetrics(clientId || null, parseInt(days) || 7);
+        res.json(metrics);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * API: Get all system config (for dashboard editor)
+ */
+export async function adminGetConfig(req, res) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    try {
+        const config = await getAllConfig();
+        res.json(config);
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * API: Update a system config value
+ */
+export async function adminSetConfig(req, res) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { key, value } = req.body;
+    if (!key) return res.status(400).json({ error: 'Falta key' });
+    try {
+        await setConfig(key, value);
+        res.json({ success: true, key, value });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+/**
+ * API: Post feedback for a RAG response
+ */
+export async function adminPostFeedback(req, res) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { traceId, feedback } = req.body;
+
+    if (!traceId || !feedback) return res.status(400).json({ error: 'Faltan parámetros' });
+
+    try {
+        const { data: trace } = await supabase.from('rag_metrics').select('metadata').eq('id', traceId).single();
+        if (!trace) throw new Error("Trace no encontrado");
+
+        const updatedMetadata = { ...trace.metadata, user_feedback: feedback };
+
+        const { error } = await supabase
+            .from('rag_metrics')
+            .update({ metadata: updatedMetadata })
+            .eq('id', traceId);
+
+        if (error) throw error;
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * API: Obtiene las últimas 5 entradas de caché semántica de un cliente
+ */
+export async function adminGetCache(req, res) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { clientId } = req.params;
+
+    try {
+        const cacheKey = `semcache:${clientId}`;
+        const rawCache = await redisClient.get(cacheKey);
+        const entries = rawCache ? JSON.parse(rawCache) : [];
+        // Devolvemos solo lo relevante para el dashboard
+        res.json(entries.slice(0, 5).map(e => ({
+            query: e.query || "Query no registrada (Legacy)",
+            reply: e.reply,
+            timestamp: e.timestamp
+        })));
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * API: Limpia la caché semántica de un cliente
+ */
+export async function adminClearCache(req, res) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { clientId } = req.params;
+
+    try {
+        const cacheKey = `semcache:${clientId}`;
+        await redisClient.del(cacheKey);
+        res.json({ success: true, message: "Caché semántica purgada." });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * API: Guarda un archivo (.md) editado por el administrador
+ */
+export async function adminSaveClientFile(req, res) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { slug, filename } = req.params;
+    const { content } = req.body;
+
+    if (!content) return res.status(400).json({ error: 'Falta el contenido' });
+
+    try {
+        const clientDir = path.resolve(`./clients/${slug}`);
+        const filePath = path.join(clientDir, filename);
+
+        // Seguridad: Verificar que el archivo existe y es .md
+        if (!filename.endsWith('.md')) throw new Error("Solo archivos .md permitidos");
+
+        await fs.access(filePath); // Asegurar que existe
+
+        // Cifrar y guardar
+        const encryptedContent = encrypt(content);
+        await fs.writeFile(filePath, encryptedContent, 'utf8');
+
+        // Log
+        await supabase.from('system_logs').insert({
+            level: 'warn',
+            message: `Edición manual "Cirujano" en ${filename} para cliente ${slug}.`
+        });
+
+        res.json({ success: true, message: `${filename} actualizado y cifrado.` });
+    } catch (err) {
+        res.status(500).json({ error: `Error guardando archivo: ${err.message}` });
+    }
+}
+
