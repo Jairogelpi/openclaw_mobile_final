@@ -123,6 +123,24 @@ function getEventTimestamp(row) {
     return row?.metadata?.dateStart || row?.metadata?.date || row?.timestamp || row?.created_at || null;
 }
 
+function extractRequestedMediaTerms(queryText = '') {
+    const normalized = normalizeComparableText(queryText);
+    const terms = [];
+    if (normalized.includes('audio') || normalized.includes('nota de voz') || normalized.includes('voz')) {
+        terms.push('audio', 'nota de voz', 'voz', 'voice');
+    }
+    if (normalized.includes('foto') || normalized.includes('imagen')) {
+        terms.push('foto', 'imagen', 'image');
+    }
+    if (normalized.includes('video')) {
+        terms.push('video', 'clip');
+    }
+    if (normalized.includes('documento') || normalized.includes('pdf') || normalized.includes('archivo')) {
+        terms.push('documento', 'pdf', 'archivo');
+    }
+    return [...new Set(terms)];
+}
+
 function isMeaningfulAlias(alias) {
     const value = String(alias || '').trim();
     if (!value) return false;
@@ -645,23 +663,8 @@ export async function temporalMemorySearch(clientId, temporalWindow, entityNames
 export async function mediaMemorySearch(clientId, entityNames = [], queryText = '', matchCount = 12) {
     const lookup = await buildEntityLookupContext(clientId, entityNames);
     const rowsPerPass = Math.max(matchCount * 80, 1200);
-    const mediaTerms = [...new Set([
-        'audio',
-        'nota de voz',
-        'voz',
-        'voice',
-        'foto',
-        'imagen',
-        'image',
-        'video',
-        'clip',
-        'documento',
-        'pdf',
-        ...String(queryText || '')
-            .split(/\s+/)
-            .map(token => normalizeComparableText(token))
-            .filter(Boolean)
-    ])];
+    const mediaTerms = extractRequestedMediaTerms(queryText);
+    const fallbackMediaTerms = mediaTerms.length ? mediaTerms : ['audio', 'nota de voz', 'voz', 'voice', 'foto', 'imagen', 'image', 'video', 'clip', 'documento', 'pdf', 'archivo'];
 
     try {
         const { data: rows, error } = await supabase
@@ -675,7 +678,13 @@ export async function mediaMemorySearch(clientId, entityNames = [], queryText = 
 
         const remoteIdSet = new Set(lookup.remoteIdList);
         return (rows || [])
-            .filter(row => {
+            .map(row => {
+                const remoteId = row.metadata?.remoteId || row.metadata?.remote_id || row.metadata?.participantJid || null;
+                const senderHaystack = normalizeComparableText([
+                    row.sender,
+                    row.metadata?.contactName,
+                    row.metadata?.canonicalSenderName
+                ].filter(Boolean).join(' '));
                 const haystack = normalizeComparableText([
                     row.sender,
                     row.content,
@@ -688,24 +697,40 @@ export async function mediaMemorySearch(clientId, entityNames = [], queryText = 
                 ].filter(Boolean).join(' '));
 
                 if (!haystack) return false;
-                const hasMediaSignal = mediaTerms.some(term => term && haystack.includes(term));
-                if (!hasMediaSignal) return false;
+                const matchedTerms = fallbackMediaTerms.filter(term => term && haystack.includes(term));
+                if (!matchedTerms.length) return null;
 
-                if (!lookup.aliasList.length && !remoteIdSet.size) return true;
+                let entityMatched = !lookup.aliasList.length && !remoteIdSet.size;
 
-                const remoteId = row.metadata?.remoteId || row.metadata?.remote_id || row.metadata?.participantJid || null;
-                if (remoteIdSet.has(remoteId)) return true;
+                if (remoteIdSet.has(remoteId)) entityMatched = true;
 
-                return [...lookup.normalizedAliases].some(alias => haystack.includes(alias));
+                if (remoteIdSet.size > 0) {
+                    entityMatched = entityMatched || [...lookup.normalizedAliases].some(alias => senderHaystack.includes(alias));
+                } else {
+                    entityMatched = entityMatched || [...lookup.normalizedAliases].some(alias => haystack.includes(alias));
+                }
+
+                if (!entityMatched) return null;
+
+                const contentNormalized = normalizeComparableText(row.content || '');
+                const exactPhraseBoost = /(escuchaste mi audio|audio de|nota de voz|audio llor)/i.test(contentNormalized) ? 3 : 0;
+                const senderBoost = [...lookup.normalizedAliases].some(alias => senderHaystack.includes(alias)) ? 2 : 0;
+                const remoteBoost = remoteIdSet.has(remoteId) ? 3 : 0;
+                return {
+                    row,
+                    mediaScore: matchedTerms.length + exactPhraseBoost + senderBoost + remoteBoost
+                };
             })
+            .filter(Boolean)
+            .sort((a, b) => b.mediaScore - a.mediaScore || new Date(getEventTimestamp(b.row)).getTime() - new Date(getEventTimestamp(a.row)).getTime())
             .slice(0, matchCount)
-            .map(row => toMemoryEvidenceCandidate({
+            .map(({ row, mediaScore }) => toMemoryEvidenceCandidate({
                 ...row,
                 remote_id: row.metadata?.remoteId || null,
                 timestamp: getEventTimestamp(row),
-                score_vector: 0.78,
+                score_vector: 0.78 + Math.min(mediaScore * 0.02, 0.12),
                 score_fts: 0.92,
-                recall_score: 0.94
+                recall_score: 0.94 + Math.min(mediaScore * 0.01, 0.05)
             }, { source: 'MEDIA_MEMORY' }));
     } catch (error) {
         console.warn('[Graph Service] mediaMemorySearch skipped:', error.message);

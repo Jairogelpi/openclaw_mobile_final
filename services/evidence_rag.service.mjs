@@ -293,11 +293,13 @@ function fallbackIntent(queryText) {
     return 'exploratory';
 }
 
-function isSimpleExactLookup(queryText, identityMatches = []) {
+function isSimpleExactLookup(queryText, identityMatches = [], inferredEntities = []) {
     const q = normalizeComparableText(queryText);
-    if (!q || !identityMatches.length) return false;
+    if (!q) return false;
+    const hasEntityAnchor = Boolean(identityMatches.length || inferredEntities.length);
+    if (!hasEntityAnchor) return false;
     if (hasTemporalSignal(queryText) || relationFromQueryV2(queryText)) return false;
-    return SIMPLE_IDENTITY_INTENT_REGEX.test(q) || SIMPLE_FACT_INTENT_REGEX.test(q);
+    return SIMPLE_IDENTITY_INTENT_REGEX.test(q) || SIMPLE_FACT_INTENT_REGEX.test(q) || SIMPLE_MEDIA_INTENT_REGEX.test(q);
 }
 
 function determineFallbackIntent(queryText, identityMatches = []) {
@@ -488,6 +490,7 @@ export async function buildRagQueryPlan(clientId, userQuery, trace = null) {
     await hydrateContactIdentities(clientId).catch(() => null);
 
     const identityMatches = await detectIdentityMatchesFromQueryFast(clientId, userQuery);
+    const inferredEntities = inferRawEntitiesFromQuery(userQuery);
     const identityHints = identityMatches
         .slice(0, 8)
         .map(match => `${match.canonical_name} (${match.remote_id})`)
@@ -534,17 +537,17 @@ Responde solo con el JSON del plan.`;
         intent: determineFallbackIntentV2(userQuery, identityMatches),
         entities: [...new Set([
             ...identityMatches.map(match => match.canonical_name),
-            ...inferRawEntitiesFromQuery(userQuery)
+            ...inferredEntities
         ])].slice(0, 3),
         temporal_window: inferTemporalWindowStable(userQuery) || inferTemporalWindow(userQuery),
         relation_filter: relationFromQueryV2(userQuery),
-        need_exact_entity_match: identityMatches.length > 0 || inferRawEntitiesFromQuery(userQuery).length > 0,
+        need_exact_entity_match: identityMatches.length > 0 || inferredEntities.length > 0,
         allow_graph_hops: !hasMediaSignal(userQuery),
         allow_web: false
     };
 
     let plan = null;
-    if (!isSimpleExactLookup(userQuery, identityMatches)) {
+    if (!isSimpleExactLookup(userQuery, identityMatches, inferredEntities)) {
         try {
             plan = await groqJsonWithTimeout({ systemPrompt, userPrompt }, trace, { temperature: 0, timeoutMs: 8_000 });
         } catch (error) {
@@ -571,11 +574,14 @@ Responde solo con el JSON del plan.`;
         nextPlan.entities = identityMatches.map(match => match.canonical_name).slice(0, 3);
     }
     if ((!nextPlan.entities || !nextPlan.entities.length)) {
-        nextPlan.entities = inferRawEntitiesFromQuery(userQuery).slice(0, 3);
+        nextPlan.entities = inferredEntities.slice(0, 3);
     }
     nextPlan.need_exact_entity_match = Boolean(nextPlan.need_exact_entity_match || nextPlan.entities?.length || identityMatches.length);
-    if (isSimpleExactLookup(userQuery, identityMatches)) {
-        nextPlan.intent = SIMPLE_FACT_INTENT_REGEX.test(normalizeComparableText(userQuery)) ? 'fact_lookup' : 'identity_lookup';
+    if (isSimpleExactLookup(userQuery, identityMatches, inferredEntities)) {
+        const normalizedQuery = normalizeComparableText(userQuery);
+        nextPlan.intent = SIMPLE_MEDIA_INTENT_REGEX.test(normalizedQuery)
+            ? 'media_lookup'
+            : (SIMPLE_FACT_INTENT_REGEX.test(normalizedQuery) ? 'fact_lookup' : 'identity_lookup');
         nextPlan.allow_graph_hops = false;
     }
     if (hasMediaSignal(userQuery)) {
@@ -682,6 +688,25 @@ export async function collectEvidenceCandidates(clientId, queryText, queryVector
         rawEntityMatches.length === 0 &&
         entities.every(entity => isGhostName(entity))
     );
+    if (ghostOnlyExactLookup) {
+        trace?.logRetrieval?.({
+            hybridMemories: [],
+            graphKnowledge: [],
+            uniqueCandidates: [],
+            top7: [],
+            confidenceLevel: 'NONE',
+            avgScore: 0,
+            elapsedMs: Date.now() - retrievalStart
+        });
+        trace?.setCandidateSummary?.({
+            total: 0,
+            direct: 0,
+            derived: 0,
+            beforeRerank: [],
+            afterRerank: []
+        });
+        return [];
+    }
     const rawFactCandidates = plan.need_exact_entity_match && entities.length
         ? await exactEntityFactSearch(clientId, entities, Math.min(ragMaxCandidates, 12)).catch(() => [])
         : [];
@@ -705,12 +730,31 @@ export async function collectEvidenceCandidates(clientId, queryText, queryVector
     const fastPathRelationship = plan.intent === 'relationship_lookup' && relationshipCandidates.some(candidate => candidate.directness === 'direct');
     const fastPathMedia = plan.intent === 'media_lookup' && mediaCandidates.some(candidate => candidate.directness === 'direct');
     const strictRelationshipLookup = Boolean(plan.intent === 'relationship_lookup' && entities.length >= 2);
+    if (strictUnknownExactLookup && !factCandidates.length && !mediaCandidates.length && !temporalCandidates.length) {
+        trace?.logRetrieval?.({
+            hybridMemories: [],
+            graphKnowledge: [],
+            uniqueCandidates: [],
+            top7: [],
+            confidenceLevel: 'NONE',
+            avgScore: 0,
+            elapsedMs: Date.now() - retrievalStart
+        });
+        trace?.setCandidateSummary?.({
+            total: 0,
+            direct: 0,
+            derived: 0,
+            beforeRerank: [],
+            afterRerank: []
+        });
+        return [];
+    }
     const queryVariants = (queryExpansionEnabled && !fastPathStructured && !fastPathTemporal && !fastPathRelationship && !fastPathMedia && !ghostOnlyExactLookup && !strictUnknownExactLookup && !strictRelationshipLookup)
         ? buildRetrievalQueries(queryText, plan, maxQueryVariants)
         : buildRetrievalQueries(queryText, plan, 2);
     const perVariantCount = Math.max(5, Math.ceil(ragMaxCandidates / Math.max(queryVariants.length, 1)) + 1);
 
-    const exactCandidates = (!fastPathStructured && !fastPathTemporal && !fastPathRelationship && !fastPathMedia && !ghostOnlyExactLookup && plan.need_exact_entity_match && entities.length)
+    const exactCandidates = (!fastPathStructured && !fastPathTemporal && !fastPathRelationship && !fastPathMedia && !ghostOnlyExactLookup && !strictUnknownExactLookup && plan.need_exact_entity_match && entities.length)
         ? await exactEntityMemorySearch(clientId, entities, ragMaxCandidates).catch(() => [])
         : [];
 
@@ -786,26 +830,45 @@ export async function collectEvidenceCandidates(clientId, queryText, queryVector
         elapsedMs: Date.now() - retrievalStart
     });
 
-    trace?.setCandidateSummary?.({
-        total: ranked.length,
-        direct: ranked.filter(candidate => candidate.directness === 'direct').length,
-        derived: ranked.filter(candidate => candidate.directness !== 'direct').length,
-        beforeRerank: merged.slice(0, 12).map(candidate => ({
-            source_id: candidate.source_id,
-            source_kind: candidate.source_kind,
-            directness: candidate.directness,
-            recall_score: candidate.recall_score,
-            evidence_text: String(candidate.evidence_text || '').slice(0, 140)
-        })),
-        afterRerank: ranked.slice(0, 12).map(candidate => ({
-            citation_label: candidate.citation_label,
-            source_id: candidate.source_id,
-            source_kind: candidate.source_kind,
-            directness: candidate.directness,
-            final_score: candidate.final_score,
-            evidence_text: String(candidate.evidence_text || '').slice(0, 140)
-        }))
-    });
+    trace?.setCandidateSummary?.(
+        plan.intent === 'media_lookup'
+            ? {
+                total: ranked.length,
+                direct: ranked.filter(candidate => candidate.directness === 'direct').length,
+                derived: ranked.filter(candidate => candidate.directness !== 'direct').length,
+                beforeRerank: merged.slice(0, 6).map(candidate => ({
+                    source_id: candidate.source_id,
+                    source_kind: candidate.source_kind,
+                    recall_score: candidate.recall_score
+                })),
+                afterRerank: ranked.slice(0, 6).map(candidate => ({
+                    citation_label: candidate.citation_label,
+                    source_id: candidate.source_id,
+                    source_kind: candidate.source_kind,
+                    final_score: candidate.final_score
+                }))
+            }
+            : {
+                total: ranked.length,
+                direct: ranked.filter(candidate => candidate.directness === 'direct').length,
+                derived: ranked.filter(candidate => candidate.directness !== 'direct').length,
+                beforeRerank: merged.slice(0, 12).map(candidate => ({
+                    source_id: candidate.source_id,
+                    source_kind: candidate.source_kind,
+                    directness: candidate.directness,
+                    recall_score: candidate.recall_score,
+                    evidence_text: String(candidate.evidence_text || '').slice(0, 140)
+                })),
+                afterRerank: ranked.slice(0, 12).map(candidate => ({
+                    citation_label: candidate.citation_label,
+                    source_id: candidate.source_id,
+                    source_kind: candidate.source_kind,
+                    directness: candidate.directness,
+                    final_score: candidate.final_score,
+                    evidence_text: String(candidate.evidence_text || '').slice(0, 140)
+                }))
+            }
+    );
 
     return ranked;
 }
@@ -847,6 +910,18 @@ function extractMemorySnippet(text, speaker = null, maxLength = 180) {
     return snippet;
 }
 
+function extractMediaSnippet(text, speaker = null, maxLength = 180) {
+    const lines = String(text || '')
+        .split('\n')
+        .map(line => line.replace(/\[[^\]]+\]/g, '').trim())
+        .filter(Boolean);
+    const mediaLine = lines.find(line => /\b(audio|nota de voz|voz|foto|imagen|video|documento|pdf|archivo)\b/i.test(line));
+    if (mediaLine) {
+        return extractMemorySnippet(mediaLine, speaker, maxLength);
+    }
+    return extractMemorySnippet(text, speaker, maxLength);
+}
+
 function buildDeterministicClaims(plan, directCandidates) {
     const preferred = (directCandidates || [])
         .slice()
@@ -883,6 +958,20 @@ function buildDeterministicClaims(plan, directCandidates) {
             };
             return candidatePriority(a) - candidatePriority(b) || Number(b.final_score || 0) - Number(a.final_score || 0);
         });
+
+    if (plan.intent === 'media_lookup') {
+        const mediaCandidates = preferred.filter(candidate => candidate.source_kind === 'memory_chunk').slice(0, 3);
+        if (mediaCandidates.length) {
+            const citationLabels = [...new Set(mediaCandidates.map(candidate => candidate.citation_label))].slice(0, 2);
+            const lead = mediaCandidates[0];
+            const snippet = extractMediaSnippet(lead.evidence_text, lead.speaker, 160);
+            const prefix = lead.timestamp ? `${String(lead.timestamp).slice(0, 10)}: ` : '';
+            return [{
+                text: normalizeSentence(`${prefix}${snippet}`, 180),
+                citations: citationLabels
+            }];
+        }
+    }
 
     const claims = [];
     const seen = new Set();
@@ -996,8 +1085,10 @@ ${buildEvidenceBlock(directCandidates)}`;
     const forceDeterministicIdentity = plan.intent === 'identity_lookup' &&
         directCandidates.some(candidate => candidate.source_kind === 'fact' &&
             (candidate.metadata?.owner_identity || candidate.metadata?.fact_type === 'contact_identity'));
+    const forceDeterministicMedia = plan.intent === 'media_lookup' && deterministicClaims.length > 0;
+    const forceDeterministicRelationship = plan.intent === 'relationship_lookup' && deterministicClaims.length > 0;
 
-    if (forceDeterministicIdentity && deterministicClaims.length) {
+    if ((forceDeterministicIdentity || forceDeterministicMedia || forceDeterministicRelationship) && deterministicClaims.length) {
         return {
             verdict: 'answer',
             answer: '',
@@ -1144,6 +1235,17 @@ function composeFinalReply(verification) {
     return `Segun tus recuerdos:\n${claims.map(claim => `- ${claim.text} ${claim.citations.map(label => `[${label}]`).join(' ')}`).join('\n')}`;
 }
 
+function compactSupportedClaims(plan, claims = []) {
+    const maxClaims = plan?.intent === 'relationship_lookup' ? 2 : 1;
+    const maxCitations = plan?.intent === 'media_lookup' ? 2 : 3;
+    return (claims || [])
+        .slice(0, maxClaims)
+        .map(claim => ({
+            ...claim,
+            citations: [...new Set((claim.citations || []).filter(Boolean))].slice(0, maxCitations)
+        }));
+}
+
 export async function runEvidenceFirstRag({ clientId, queryText, queryVector, trace = null, precomputedPlan = null }) {
     const plan = precomputedPlan || await buildRagQueryPlan(clientId, queryText, trace);
     const claimVerifierEnabled = await getConfig('rag_claim_verifier_enabled');
@@ -1151,19 +1253,25 @@ export async function runEvidenceFirstRag({ clientId, queryText, queryVector, tr
     trace?.setQueryPlan?.(plan);
     const candidates = await collectEvidenceCandidates(clientId, queryText, queryVector, plan, trace);
     const draft = await draftEvidenceAnswer(queryText, plan, candidates, trace);
-    const verification = claimVerifierEnabled
+    const bypassClaimVerifier = ['media_lookup', 'relationship_lookup'].includes(plan.intent);
+    const verification = (claimVerifierEnabled && !bypassClaimVerifier)
         ? await verifyDraftedClaims(queryText, draft, candidates, trace)
         : {
             verdict: draft.verdict || 'abstain',
             supportedClaims: (draft.claims || []).filter(claim => Array.isArray(claim.citations) && claim.citations.length > 0),
             citationCoverage: (draft.claims || []).length ? 1 : 0
         };
-    const reply = composeFinalReply(verification);
+    const compactClaims = compactSupportedClaims(plan, verification.supportedClaims || []);
+    const finalVerification = {
+        ...verification,
+        supportedClaims: compactClaims
+    };
+    const reply = composeFinalReply(finalVerification);
 
     trace?.setAnswerVerdict?.({
         verdict: verification.verdict || draft.verdict || 'abstain',
         citationCoverage: verification.citationCoverage || 0,
-        supportedClaims: verification.supportedClaims || []
+        supportedClaims: compactClaims
     });
 
     return {
@@ -1171,7 +1279,7 @@ export async function runEvidenceFirstRag({ clientId, queryText, queryVector, tr
         plan,
         candidates,
         draft,
-        verification,
+        verification: finalVerification,
         verdict: verification.verdict || draft.verdict || 'abstain',
         cacheEligible: !plan.need_exact_entity_match && !plan.temporal_window && !plan.relation_filter && !plan.entities?.length && plan.intent === 'exploratory',
         citationCoverage: verification.citationCoverage || 0
