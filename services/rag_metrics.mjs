@@ -1,9 +1,14 @@
 import supabase from '../config/supabase.mjs';
 
 function sanitizeString(value) {
-    return String(value || '')
-        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' ')
-        .trim();
+    const raw = String(value || '').replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, ' ');
+    const safe = Array.from(raw)
+        .filter(char => {
+            const code = char.codePointAt(0);
+            return !(code >= 0xD800 && code <= 0xDFFF);
+        })
+        .join('');
+    return safe.trim();
 }
 
 function sanitizeJsonValue(value, depth = 0) {
@@ -193,23 +198,6 @@ export function startRagTrace(clientId, query) {
                 }
 
                 console.warn('[RAG Metrics] Error persistiendo metricas:', error.message);
-                if ((error.message || '').toLowerCase().includes('invalid json') || (error.message || '').toLowerCase().includes('empty')) {
-                    const degradedRow = {
-                        ...row,
-                        metadata: sanitizeJsonValue({
-                            mode: this.mode,
-                            answer_verdict: this.answer_verdict,
-                            citation_coverage: this.citation_coverage,
-                            response_preview: sanitizeString(response).slice(0, 120)
-                        })
-                    };
-                    const retry = await supabase.from('rag_metrics').insert(degradedRow).select();
-                    if (!retry.error) {
-                        console.log('[RAG Metrics] Trace guardado en modo degradado.');
-                        return retry.data?.[0] || degradedRow;
-                    }
-                    console.warn('[RAG Metrics] Retry degradado fallo:', retry.error.message);
-                }
             } catch (error) {
                 console.warn('[RAG Metrics] Error no critico:', error.message);
             }

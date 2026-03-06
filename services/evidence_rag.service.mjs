@@ -922,6 +922,23 @@ function extractMediaSnippet(text, speaker = null, maxLength = 180) {
     return extractMemorySnippet(text, speaker, maxLength);
 }
 
+function humanizeRelationType(relationType) {
+    const normalized = normalizeComparableText(String(relationType || '').replace(/[\[\]]/g, ' '));
+    if (!normalized) return 'tiene relacion con';
+    if (normalized.includes('amor')) return 'expresa afecto hacia';
+    if (normalized.includes('felicidad')) return 'expresa felicidad con';
+    if (normalized.includes('tranquilidad')) return 'expresa tranquilidad con';
+    if (normalized.includes('estabilidad')) return 'expresa estabilidad con';
+    if (normalized.includes('gusto')) return 'muestra gusto por';
+    if (normalized.includes('dependencia')) return 'expresa dependencia hacia';
+    if (normalized.includes('familia')) return 'tiene un vinculo familiar con';
+    if (normalized.includes('amistad')) return 'muestra amistad con';
+    if (normalized.includes('trabaja')) return 'trabaja con';
+    if (normalized.includes('vive')) return 'vive con';
+    if (normalized.includes('estudia')) return 'estudia con';
+    return 'tiene relacion con';
+}
+
 function buildDeterministicClaims(plan, directCandidates) {
     const preferred = (directCandidates || [])
         .slice()
@@ -959,17 +976,17 @@ function buildDeterministicClaims(plan, directCandidates) {
             return candidatePriority(a) - candidatePriority(b) || Number(b.final_score || 0) - Number(a.final_score || 0);
         });
 
-    if (plan.intent === 'media_lookup') {
-        const mediaCandidates = preferred.filter(candidate => candidate.source_kind === 'memory_chunk').slice(0, 3);
-        if (mediaCandidates.length) {
-            const citationLabels = [...new Set(mediaCandidates.map(candidate => candidate.citation_label))].slice(0, 2);
-            const lead = mediaCandidates[0];
-            const snippet = extractMediaSnippet(lead.evidence_text, lead.speaker, 160);
-            const prefix = lead.timestamp ? `${String(lead.timestamp).slice(0, 10)}: ` : '';
-            return [{
-                text: normalizeSentence(`${prefix}${snippet}`, 180),
-                citations: citationLabels
-            }];
+        if (plan.intent === 'media_lookup') {
+            const mediaCandidates = preferred.filter(candidate => candidate.source_kind === 'memory_chunk').slice(0, 3);
+            if (mediaCandidates.length) {
+                const citationLabels = [...new Set(mediaCandidates.map(candidate => candidate.citation_label))].slice(0, 2);
+                const lead = mediaCandidates[0];
+                const snippet = String(lead.metadata?.mediaSnippet || '').trim() || extractMediaSnippet(lead.evidence_text, lead.speaker, 160);
+                const prefix = lead.timestamp ? `${String(lead.timestamp).slice(0, 10)}: ` : '';
+                return [{
+                    text: normalizeSentence(`${prefix}${snippet}`, 180),
+                    citations: citationLabels
+                }];
         }
     }
 
@@ -980,14 +997,18 @@ function buildDeterministicClaims(plan, directCandidates) {
         let text = null;
 
         if (candidate.source_kind === 'fact') {
-            text = normalizeSentence(candidate.evidence_text);
+            if (plan.intent === 'relationship_lookup' && candidate.metadata?.source_node && candidate.metadata?.target_node && candidate.metadata?.relation_type) {
+                text = `${candidate.metadata.source_node} ${humanizeRelationType(candidate.metadata.relation_type)} ${candidate.metadata.target_node}.`;
+            } else {
+                text = normalizeSentence(candidate.evidence_text);
+            }
         } else if (
             candidate.source_kind === 'graph_edge' &&
             candidate.metadata?.source_node &&
             candidate.metadata?.target_node &&
             candidate.metadata?.relation_type
         ) {
-            text = `${candidate.metadata.source_node} tiene relacion ${candidate.metadata.relation_type} con ${candidate.metadata.target_node}.`;
+            text = `${candidate.metadata.source_node} ${humanizeRelationType(candidate.metadata.relation_type)} ${candidate.metadata.target_node}.`;
         } else if (candidate.source_kind === 'graph_node' && candidate.metadata?.context && candidate.metadata?.entity_name) {
             text = normalizeSentence(`${candidate.metadata.entity_name}: ${candidate.metadata.context}`);
         } else if (plan.temporal_window && candidate.source_kind === 'memory_chunk') {

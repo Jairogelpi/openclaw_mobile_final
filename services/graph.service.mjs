@@ -123,6 +123,35 @@ function getEventTimestamp(row) {
     return row?.metadata?.dateStart || row?.metadata?.date || row?.timestamp || row?.created_at || null;
 }
 
+function extractMediaSnippetFromContent(content = '', matchedTerms = [], speaker = null) {
+    const normalizedTerms = [...new Set((matchedTerms || []).map(term => normalizeComparableText(term)).filter(Boolean))];
+    const lines = String(content || '')
+        .split('\n')
+        .map(line => line.replace(/\[[^\]]+\]/g, '').trim())
+        .filter(Boolean);
+
+    const mediaIndex = lines.findIndex(line => {
+        const haystack = normalizeComparableText(line);
+        return normalizedTerms.some(term => haystack.includes(term));
+    });
+
+    const snippetLines = mediaIndex >= 0
+        ? lines.slice(Math.max(0, mediaIndex - 1), Math.min(lines.length, mediaIndex + 2))
+        : lines.slice(0, 2);
+
+    let snippet = snippetLines.join(' ');
+    if (speaker) {
+        const speakerName = String(speaker || '').trim();
+        const firstToken = speakerName.split(/\s+/)[0];
+        const speakerPattern = new RegExp(`^${firstToken}\\s*:`, 'i');
+        if (speakerPattern.test(snippet) && !new RegExp(`^${speakerName}\\s*:`, 'i').test(snippet)) {
+            snippet = snippet.replace(speakerPattern, `${speakerName}:`);
+        }
+    }
+
+    return snippet.trim().slice(0, 220);
+}
+
 function extractRequestedMediaTerms(queryText = '') {
     const normalized = normalizeComparableText(queryText);
     const terms = [];
@@ -728,6 +757,15 @@ export async function mediaMemorySearch(clientId, entityNames = [], queryText = 
                 ...row,
                 remote_id: row.metadata?.remoteId || null,
                 timestamp: getEventTimestamp(row),
+                metadata: {
+                    ...(row.metadata || {}),
+                    mediaMatchedTerms: fallbackMediaTerms.filter(term => normalizeComparableText(row.content || '').includes(term)),
+                    mediaSnippet: extractMediaSnippetFromContent(
+                        row.content || '',
+                        fallbackMediaTerms.filter(term => normalizeComparableText(row.content || '').includes(term)),
+                        row.sender || row.metadata?.contactName || row.metadata?.canonicalSenderName || null
+                    )
+                },
                 score_vector: 0.78 + Math.min(mediaScore * 0.02, 0.12),
                 score_fts: 0.92,
                 recall_score: 0.94 + Math.min(mediaScore * 0.01, 0.05)
