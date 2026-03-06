@@ -397,13 +397,15 @@ INSTRUCCIONES DE ÉLITE (V4.2):
 2. CONCIENCIA TEMPORAL: Si la pregunta menciona tiempo (ayer, hoy, enero, etc.), INCLUYE el término temporal en tus queries (Ej: "Víctor ayer", "Reunión martes").
 3. BÚSQUEDA CRUZADA: Si ya sabes un nombre (ej: "Mireya"), busca sus conexiones: "Mireya relación", "Mireya vínculo".
 4. NO SUPONGAS: Si el grafo no tiene la respuesta tras 2 saltos, termina y admite que no tienes ese dato específico.
-5. WEB SEARCH: SOLO conocimiento general/noticias. NUNCA para datos personales.
+5. WEB SEARCH: Úsala para temas generales, noticias o validación de hechos públicos. Actívala poniendo "use_web_search: true".
 
 Responde JSON:
 {
   "investigation_complete": boolean,
   "reasoning": "Breve cadena de pensamiento",
   "optimized_queries": ["query_1", "query_2"],
+  "use_web_search": boolean,
+  "web_search_query": "Búsqueda optimizada para internet",
   "confidence_score": 0.0 a 1.0
 }`;
 
@@ -417,6 +419,9 @@ Responde JSON:
                 const decision = parseLLMJson(agenticRaw, {
                     investigation_complete: false,
                     reasoning: 'Fallback reasoning due to JSON parse failure',
+                    optimized_queries: [],
+                    use_web_search: false,
+                    web_search_query: '',
                     confidence_score: 0.1
                 });
                 console.log(`🕵️ [Hop ${iterations}/${maxIterations}] Razón: ${decision.reasoning}`);
@@ -429,10 +434,10 @@ Responde JSON:
                 }
 
                 // INVESTIGATION COMPLETE: El detective tiene suficiente info
-                if (decision.investigation_complete && accumulatedContext) {
+                if (decision.investigation_complete && (accumulatedContext || decision.use_web_search)) {
                     console.log(`✅ [Investigador] Caso cerrado en ${iterations} saltos. Confianza: ${decision.confidence_score}`);
                     searchIsDone = true;
-                    break;
+                    if (!decision.use_web_search) break;
                 }
 
                 // --- EJECUTAR SKILLS ANTES DE RAG (Prioridad) ---
@@ -581,6 +586,53 @@ Responde JSON:
                     accumulatedContext += `\n\n[CONEXIONES COMUNES ENCONTRADAS]:\n${JSON.stringify(common)}`;
                 }
             } catch (err) { console.warn(`[Social Discovery] RPC Fail: ${err.message}`); }
+        }
+
+        // 🧠 PHASE 5: COGNITIVE SYNTHESIS (Self-Updating Soul)
+        // Solo si hay contexto sustancial y no es una charla trivial.
+        if (accumulatedContext && accumulatedContext.length > 200 && !searchIsDone) {
+            console.log(`🧠 [Cognitive Synthesis] Analizando hallazgos para actualizar identidad permanente...`);
+            const synthesisPrompt = `Eres el NÚCLEO DE SÍNTESIS de OpenClaw. Tu misión es detectar hechos de IDENTIDAD CLAVE que deban ser recordados permanentemente en el Soul.
+
+CONTEXTO RECIENTE ENCONTRADO:
+${accumulatedContext}
+
+DATOS ACTUALES EN EL SOUL (key_facts):
+${JSON.stringify(soulJson.key_facts || [])}
+
+TAREA:
+1. Identifica hechos de ALTA CONFIANZA sobre el usuario o sus relaciones (ej: "Mireya es la novia", "Su madre se llama X").
+2. Si un hecho NO está en los key_facts actuales o contradice uno viejo, genera una actualización.
+3. Sé extremadamente selectivo. Solo datos estructurales o hitos emocionales.
+
+Responde JSON:
+{
+  "new_facts": [
+    { "fact": "Descripción breve", "confidence": 0.0 to 1.0, "type": "identity|relationship|milestone" }
+  ],
+  "reasoning": "Por qué estos cambios son vitales"
+}`;
+            try {
+                trace.addLLMCall();
+                const synthesisRaw = await groqChat('llama-3.1-8b-instant', [
+                    { role: 'system', content: synthesisPrompt }
+                ], { temperature: 0.1, response_format: { type: 'json_object' } });
+
+                const synthesis = parseLLMJson(synthesisRaw, { new_facts: [] });
+                const highConfFacts = synthesis.new_facts.filter(f => f.confidence > 0.85);
+
+                if (highConfFacts.length > 0) {
+                    console.log(`✨ [Cognitive Synthesis] ${highConfFacts.length} nuevos hechos clave detectados.`);
+                    const improvementSkill = await import('./skills/self_improvement.mjs');
+                    for (const f of highConfFacts) {
+                        await improvementSkill.default.execute(
+                            { correction_type: 'fact', new_info: f.fact, reasoning: synthesis.reasoning },
+                            { clientId, clientSlug }
+                        );
+                    }
+                    soulWasUpdated = true;
+                }
+            } catch (err) { console.warn(`[Cognitive Synthesis] Falló: ${err.message}`); }
         }
 
         console.log(`🕵️ [Investigador] Investigación completada en ${iterations} saltos. Cadena: ${investigationLog.map(l => l.strategy).join(' → ')}`);
