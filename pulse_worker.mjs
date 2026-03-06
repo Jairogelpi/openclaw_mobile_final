@@ -102,7 +102,11 @@ Responde JSON:
                     const sock = activeSessions.get(clientId);
                     if (sock) {
                         console.log(`🚀 [Pulse] Enviando mensaje proactivo a ${conv.conversation_id}...`);
-                        await sendHumanLikeMessage(clientId, conv.conversation_id, { text: decision.suggested_message });
+                        const sent = await sendHumanLikeMessage(clientId, conv.conversation_id, { text: decision.suggested_message }, {}, {
+                            excludeFromMemory: true,
+                            generatedBy: 'pulse_worker',
+                            logicalText: decision.suggested_message
+                        });
 
                         // Registrar en raw_messages como 'assistant' (proactivo)
                         await supabase.from('raw_messages').insert({
@@ -110,7 +114,15 @@ Responde JSON:
                             sender_role: 'assistant',
                             content: decision.suggested_message,
                             remote_id: conv.conversation_id,
-                            metadata: { proactive: true, reasoning: decision.reasoning }
+                            processed: true,
+                            metadata: {
+                                proactive: true,
+                                reasoning: decision.reasoning,
+                                channel: 'whatsapp',
+                                generated_by: 'pulse_worker',
+                                exclude_from_memory: true,
+                                msgId: sent?.key?.id || null
+                            }
                         });
                     } else {
                         console.log(`⚠️ [Pulse] Sesión no activa para ${clientId}. No se pudo enviar el pulso.`);

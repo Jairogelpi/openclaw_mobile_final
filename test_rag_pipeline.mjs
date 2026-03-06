@@ -18,11 +18,10 @@ async function test() {
         const vector = await generateEmbedding(query);
 
         const graph = await traverseGraph(activeClientId, query, vector, 5);
-        console.log("Graph Nodes Size:", graph.length);
-        if (graph.length > 0) {
-            console.log("Top node:", graph[0]);
-        }
+        console.log("Graph Nodes:", graph);
 
+        const hybrid = await hybridSearch(activeClientId, query, vector, 5);
+        console.log("Hybrid Memories:", JSON.stringify(hybrid, null, 2));
     } catch (e) {
         console.error("Test failed:", e);
     }

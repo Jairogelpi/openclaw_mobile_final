@@ -9,6 +9,8 @@
 import 'dotenv/config';
 import supabase from './config/supabase.mjs';
 import { activeSessions } from './channels/whatsapp.mjs';
+import { resolveIdentity } from './skills/whatsapp_contacts.mjs';
+import { fallbackNameFromRemoteId, pickBestHumanName } from './utils/message_guard.mjs';
 
 const CID = 'cc2afceb-4db2-4c1e-81e3-9adf8d6eaad6';
 const SLUG = 'jairogelpi-cc2af';
@@ -61,6 +63,7 @@ async function main() {
 
     let totalFetched = 0;
     let totalInserted = 0;
+    const identityCache = new Map();
 
     for (const chatId of chats) {
         try {
@@ -85,18 +88,39 @@ async function main() {
             for (const msg of messages) {
                 const text = extractText(msg.message);
                 if (!text && !msg.message?.imageMessage && !msg.message?.audioMessage) continue;
-                
+
+                const participantJid = msg.key.participant || chatId;
+                const cacheKey = `${participantJid}::${msg.pushName || ''}`;
+                let canonicalSenderName = identityCache.get(cacheKey);
+                if (canonicalSenderName === undefined) {
+                    const identity = msg.key.fromMe
+                        ? null
+                        : await resolveIdentity(CID, participantJid, msg.pushName || null).catch(() => null);
+                    canonicalSenderName = pickBestHumanName(
+                        identity?.name,
+                        msg.pushName,
+                        fallbackNameFromRemoteId(participantJid)
+                    ) || null;
+                    identityCache.set(cacheKey, canonicalSenderName);
+                }
+                 
                 batch.push({
                     client_id: CID,
                     remote_id: chatId,
-                    sender_role: msg.key.fromMe ? 'user_sent' : 'Historial',
+                    sender_role: msg.key.fromMe
+                        ? 'user_sent'
+                        : (canonicalSenderName || fallbackNameFromRemoteId(participantJid) || 'Contacto'),
                     content: text || '[Media]',
                     processed: false,
                     metadata: {
                         msgId: msg.key.id,
                         timestamp: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toISOString() : new Date().toISOString(),
                         isHistory: true,
-                        is_new_unread: false
+                        is_new_unread: false,
+                        channel: 'whatsapp',
+                        participantJid,
+                        pushName: msg.pushName || null,
+                        canonicalSenderName: msg.key.fromMe ? 'Yo' : (canonicalSenderName || fallbackNameFromRemoteId(participantJid) || null)
                     }
                 });
             }

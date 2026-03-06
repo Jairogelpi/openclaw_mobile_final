@@ -9,7 +9,11 @@
         "start:all": "pm2 start ecosystem.config.cjs",
         "memory": "node memory_cron.mjs",
         "worker": "node memory_worker.mjs",
-        "backup": "node backup.mjs"
+        "backup": "node backup.mjs",
+        "migrate:evidence-rag": "node scripts/apply_evidence_first_rag.mjs",
+        "seed:evidence-rag": "node scripts/build_rag_eval_cases.mjs",
+        "eval:evidence-rag": "node scripts/eval_evidence_rag.mjs",
+        "repair:owner-identity": "node scripts/repair_owner_identity.mjs"
     },
     "dependencies": {
         "@huggingface/transformers": "^3.8.1",

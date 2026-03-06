@@ -16,6 +16,7 @@ export function startRagTrace(clientId, query) {
         _startTime: Date.now(),
         client_id: clientId,
         query: (query || '').slice(0, 500),
+        mode: 'legacy',
 
         // Retrieval Metrics
         hybrid_count: 0,
@@ -34,6 +35,13 @@ export function startRagTrace(clientId, query) {
 
         // Cache
         cache_hit: false,
+
+        // Evidence-first metadata
+        query_plan: null,
+        candidate_summary: null,
+        citation_coverage: 0,
+        answer_verdict: null,
+        supported_claims: [],
 
         // Reflection Loop Metrics
         reflection_attempts: 0,
@@ -118,6 +126,26 @@ export function startRagTrace(clientId, query) {
             this.cache_hit = true;
         },
 
+        setMode(mode) {
+            this.mode = mode || 'legacy';
+        },
+
+        setQueryPlan(plan) {
+            this.query_plan = plan || null;
+        },
+
+        setCandidateSummary(summary) {
+            this.candidate_summary = summary || null;
+        },
+
+        setAnswerVerdict(verdict) {
+            this.answer_verdict = verdict?.verdict || null;
+            this.citation_coverage = Number(verdict?.citationCoverage || 0);
+            this.supported_claims = Array.isArray(verdict?.supportedClaims)
+                ? verdict.supportedClaims.slice(0, 8)
+                : [];
+        },
+
         /** Finalize and persist the trace to Supabase */
         async finish(response) {
             this.timing.total = Date.now() - this._startTime;
@@ -125,6 +153,7 @@ export function startRagTrace(clientId, query) {
             const row = {
                 client_id: this.client_id,
                 query: this.query,
+                mode: this.mode,
                 hybrid_count: this.hybrid_count,
                 graph_count: this.graph_count,
                 unique_candidates: this.unique_candidates,
@@ -141,6 +170,12 @@ export function startRagTrace(clientId, query) {
                 total_latency_ms: this.timing.total,
                 llm_calls_count: this.llm_calls_count,
                 metadata: {
+                    mode: this.mode,
+                    query_plan: this.query_plan,
+                    candidate_summary: this.candidate_summary,
+                    citation_coverage: this.citation_coverage,
+                    answer_verdict: this.answer_verdict,
+                    supported_claims: this.supported_claims,
                     top_sources: this.top_sources,
                     agentic_queries: this.agentic_queries,
                     conflict_details: this.conflict_details,

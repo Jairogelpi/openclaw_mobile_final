@@ -5,6 +5,7 @@ import groq from './services/groq.mjs';
 import process from 'node:process';
 import path from 'node:path';
 import fs from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { exec } from 'child_process';
 import util from 'util';
 const execPromise = util.promisify(exec);
@@ -15,8 +16,26 @@ import redisClient from './config/redis.mjs';
 import { upsertKnowledgeNode, upsertKnowledgeEdge } from './services/graph.service.mjs';
 import { detectAndSaveCommunities } from './services/community.service.mjs';
 import { resolveIdentity } from "./skills/whatsapp_contacts.mjs";
+import { discoverWhatsAppGroup } from './skills/whatsapp_groups.mjs';
 import { processAttachment } from "./utils/media.mjs";
+import {
+    deriveOwnerNameFromSlug,
+    dominantExternalSpeaker,
+    fallbackNameFromRemoteId,
+    isMemoryEligibleRawMessage,
+    looksLikeWhatsAppRemoteId,
+    normalizeComparableText,
+    pickBestHumanName,
+    renderConversationLine,
+    resolveStoredSpeakerName
+} from './utils/message_guard.mjs';
+import {
+    extractSpeakersFromLines,
+    validateGroundedGraph
+} from './utils/knowledge_guard.mjs';
 import cron from 'node-cron';
+
+const ENABLE_DREAM_CYCLE = String(process.env.OPENCLAW_ENABLE_DREAM_CYCLE || '').toLowerCase() === 'true';
 
 // === HYPER-ROBUST HELPERS ===
 function cleanJSON(text) {
@@ -60,6 +79,10 @@ const sanitizeInput = (text, maxLength = 2000) => {
  * 2026 Grounded Extraction: Semántica Cuádruple + Temporal + Thematic (GraphRAG Level 4)
  */
 async function processConversationDepth(clientId, remoteId, userName, contactName, messages, senderRole, chunkText, timestamp) {
+    return processConversationDepthStrict(clientId, remoteId, userName, contactName, messages, {
+        isGroup: String(remoteId || '').endsWith('@g.us'),
+        speakers: extractSpeakersFromLines(messages || [])
+    });
     try {
         const prompt = `### INSTRUCCIONES DE HIPER-EXTRACCIÓN CÍBORYG (GraphRAG Nivel 5) ###
 CONTEXTO: Conversación entre "${userName}" (tú/usuario) y "${contactName}" (identidad remota).
@@ -131,22 +154,188 @@ Analiza y responde ÚNICAMENTE en JSON ESTRICTO.`;
     }
 }
 
+function buildGroundedExtractionPrompt(userName, contactName, remoteId, { isGroup = false, speakers = [] } = {}) {
+    const scope = isGroup
+        ? `Chat grupal "${contactName}" con participantes visibles: ${speakers.join(', ') || userName}.`
+        : `Chat privado entre "${userName}" y "${contactName}".`;
+
+    return `Eres un extractor de hechos observables para un grafo de memoria personal.
+
+CONTEXTO:
+- ${scope}
+- Titular del sistema: "${userName}".
+- Identificador remoto: "${remoteId}".
+
+OBJETIVO:
+- Extraer SOLO hechos explicitamente observables en el texto.
+- Si no hay evidencia literal suficiente, devuelve arrays vacios.
+
+REGLAS DURAS:
+1. Nunca inventes rasgos, miedos, metas, emociones, secretos ni relaciones implicitas.
+2. Nunca conectes entidades solo por co-ocurrencia.
+3. Nunca uses nodos genericos como "Usuario", "Contacto", "Persona", "Interlocutor" o "Anonimo".
+4. Nunca extraigas formatos de media, placeholders ni mensajes del sistema como entidades.
+5. En grupos, no atribuyas lo que dice un participante al grupo ni a otro participante.
+6. Cada entidad y cada relacion DEBE llevar un campo "evidence" con un fragmento literal del texto.
+7. Si una relacion no queda sostenida por una cita textual, no la devuelvas.
+8. No crees nodos de fecha suelta salvo que el texto describa un evento con nombre propio.
+
+TIPOS DE ENTIDAD PERMITIDOS:
+- PERSONA, ORGANIZACION, LUGAR, PROYECTO, TEMA, EVENTO, GRUPO, OBJETO, ENTITY
+
+TIPOS DE RELACION PERMITIDOS:
+- [RELACIONADO_CON], [HABLA_DE], [CONOCE_A], [FAMILIA_DE], [PAREJA_DE], [AMISTAD],
+  [TRABAJA_EN], [VIVE_EN], [ESTUDIA_EN], [USA], [POSEE], [PLANEA], [PREFIERE],
+  [EVITA], [EVENTO_CON]
+
+FORMATO JSON ESTRICTO:
+{
+  "entities": [
+    { "name": "string", "type": "PERSONA|ORGANIZACION|LUGAR|PROYECTO|TEMA|EVENTO|GRUPO|OBJETO|ENTITY", "desc": "string corto", "evidence": "cita literal" }
+  ],
+  "relationships": [
+    { "source": "string", "target": "string", "type": "[RELACIONADO_CON]", "weight": 1-10, "context": "string corto", "evidence": "cita literal" }
+  ]
+}`;
+}
+
+async function processConversationDepthStrict(clientId, remoteId, userName, contactName, lines, options = {}) {
+    try {
+        const chunkText = (lines || []).join('\n');
+        if (!chunkText) return;
+
+        const prompt = buildGroundedExtractionPrompt(userName, contactName, remoteId, options);
+        const response = await groq.chat.completions.create({
+            model: 'llama-3.1-8b-instant',
+            messages: [
+                { role: 'system', content: prompt },
+                { role: 'user', content: chunkText }
+            ],
+            response_format: { type: 'json_object' },
+            temperature: 0.0
+        });
+
+        const extractedGraph = parseLLMJson(response.choices[0].message.content);
+        if (!extractedGraph) return;
+
+        const groundedGraph = validateGroundedGraph({
+            entities: extractedGraph.entities,
+            relationships: extractedGraph.relationships,
+            chunkText,
+            ownerName: userName,
+            contactName,
+            remoteId,
+            isGroup: options.isGroup,
+            speakers: options.speakers
+        });
+
+        let entityCount = 0;
+        let relationshipCount = 0;
+
+        for (const entity of groundedGraph.entities) {
+            const nodeId = await upsertKnowledgeNode(clientId, entity.name, entity.type || 'ENTITY', entity.desc || '');
+            if (nodeId) entityCount++;
+        }
+
+        for (const relationship of groundedGraph.relationships) {
+            const saved = await upsertKnowledgeEdge(
+                clientId,
+                relationship.source,
+                relationship.target,
+                relationship.type,
+                relationship.weight,
+                relationship.context
+            );
+            if (saved) relationshipCount++;
+        }
+
+        console.log(`[Grounded Graph] ${entityCount} entidades + ${relationshipCount} relaciones validadas.`);
+    } catch (e) {
+        console.warn(`[GraphRAG] Error en extractor grounded: ${e.message}`);
+    }
+}
+
+async function resolveOwnerName(clientId, soulData) {
+    const soulName = pickBestHumanName(soulData?.soul_json?.nombre);
+    if (soulName) return soulName;
+
+    try {
+        const { data: clientRow } = await supabase
+            .from('clients')
+            .select('name')
+            .eq('user_id', clientId)
+            .maybeSingle();
+
+        const clientName = pickBestHumanName(clientRow?.name);
+        if (clientName) return clientName;
+    } catch (e) { }
+
+    return deriveOwnerNameFromSlug(soulData?.slug) || 'Titular';
+}
+
+async function resolveConversationName(clientId, remoteId, messages) {
+    const metadataLabels = [
+        ...messages.map(message => message.metadata?.conversationName),
+        ...messages.map(message => message.metadata?.pushName)
+    ].filter(value => value && !looksLikeWhatsAppRemoteId(value));
+
+    const metadataName = pickBestHumanName(...metadataLabels);
+    if (metadataName) return metadataName;
+
+    if (String(remoteId || '').endsWith('@g.us')) {
+        try {
+            const groupMeta = await discoverWhatsAppGroup(clientId, remoteId);
+            const groupName = pickBestHumanName(groupMeta?.subject);
+            if (groupName) return groupName;
+        } catch (e) { }
+    }
+
+    try {
+        const identity = await resolveIdentity(clientId, remoteId, metadataName);
+        const resolved = pickBestHumanName(identity?.name, metadataName);
+        if (resolved) return resolved;
+    } catch (e) { }
+
+    return fallbackNameFromRemoteId(remoteId) || remoteId;
+}
+
+function buildConversationLines(messages, ownerName, contactName) {
+    return messages
+        .map(message => renderConversationLine(message, ownerName, contactName))
+        .filter(Boolean);
+}
+
+function selectOwnerAuthoredMessages(messages, ownerName) {
+    const ownerKey = normalizeComparableText(ownerName);
+    return (messages || []).filter(message => {
+        const speaker = resolveStoredSpeakerName(message, ownerName, null);
+        return normalizeComparableText(speaker) === ownerKey;
+    });
+}
+
 // === AUTONOMOUS KNOWLEDGE DISTILLATION (AUTO-SOUL) ===
-async function autonomousDistillation(clientId, clientSlug, messages) {
+async function autonomousDistillation(clientId, clientSlug, messages, ownerName) {
     if (!messages?.length) return;
     try {
         const { data: soulRow } = await supabase.from('user_souls').select('soul_json').eq('client_id', clientId).single();
         const currentSoul = soulRow?.soul_json || {};
+        const ownerMessages = selectOwnerAuthoredMessages(messages, ownerName);
+        if (!ownerMessages.length) return;
+
+        const renderedConversation = buildConversationLines(ownerMessages, ownerName, null).join('\n');
         const response = await groq.chat.completions.create({
             model: 'llama-3.1-8b-instant',
-            messages: [{ role: 'system', content: `Update Soul JSON based on conversation. Accumulate info.\nCURRENT SOUL: ${JSON.stringify(currentSoul)} \nCONVERSATION: \n${messages.map(m => `${m.sender_role}: ${m.content}`).join('\n')} ` }],
+            messages: [{
+                role: 'system',
+                content: `Update Soul JSON using only explicit self-reported facts written by "${ownerName}". Ignore claims made by other speakers, quoted text and assumptions. If a field is not explicit in these self messages, do not add it. Return only the fields that should change.\nCURRENT SOUL: ${JSON.stringify(currentSoul)}\nSELF MESSAGES:\n${renderedConversation}`
+            }],
             response_format: { type: 'json_object' }
         });
         const result = cleanJSON(response.choices[0].message.content);
         if (result) {
             const updatedSoul = { ...currentSoul, ...result };
             await supabase.from('user_souls').update({ soul_json: updatedSoul }).eq('client_id', clientId);
-            await upsertKnowledgeNode(clientId, updatedSoul.nombre || 'Usuario', 'PERSONA', `[ALMA] ${updatedSoul.bio || ''} `);
+            await upsertKnowledgeNode(clientId, pickBestHumanName(updatedSoul.nombre, ownerName) || ownerName, 'PERSONA', `[ALMA] ${updatedSoul.bio || ''} `);
 
             // --- SYNC PHYSICAL MD FILES ---
             try {
@@ -226,6 +415,7 @@ export async function distillAndVectorize(clientId) {
     const { data: soulData } = await supabase.from('user_souls').select('slug, soul_json').eq('client_id', clientId).single();
     if (!soulData) return;
     const clientSlug = soulData.slug;
+    const ownerName = await resolveOwnerName(clientId, soulData);
 
     // Acquire lock (Temporarily disabled for Antigravity debugging)
     /*
@@ -252,9 +442,16 @@ export async function distillAndVectorize(clientId) {
 
             console.log(`🧠[Process] Lote de ${messages.length} mensajes(Acumulado: ${totalProcessedThisRun}) para ${clientSlug} `);
 
+            const eligibleMessages = [];
+
+            for (const message of messages) {
+                message.content = sanitizeInput(message.content);
+                if (!isMemoryEligibleRawMessage(message)) continue;
+                eligibleMessages.push(message);
+            }
+
             // --- Multimedia Pre-processing ---
-            for (const m of messages) {
-                m.content = sanitizeInput(m.content);
+            for (const m of eligibleMessages) {
                 const attachments = m.metadata?.attachments || [];
                 if (attachments.length > 0) {
                     console.log(`[Worker] 📎 Procesando ${attachments.length} adjuntos para mensaje ${m.id}`);
@@ -274,7 +471,7 @@ export async function distillAndVectorize(clientId) {
             }
 
             const conversations = {};
-            messages.forEach(m => {
+            eligibleMessages.forEach(m => {
                 if (!conversations[m.remote_id]) {
                     conversations[m.remote_id] = { raw: [], firstMessageTime: m.created_at };
                 }
@@ -282,14 +479,9 @@ export async function distillAndVectorize(clientId) {
             });
 
             for (const [remoteId, conv] of Object.entries(conversations)) {
-                // Identity Resolution
-                let contactName = remoteId;
-                try {
-                    const identity = await resolveIdentity(clientId, remoteId, null);
-                    if (identity?.name) contactName = identity.name;
-                } catch (e) { }
-
-                const userName = soulData?.soul_json?.nombre || "Usuario Principal";
+                const contactName = await resolveConversationName(clientId, remoteId, conv.raw);
+                const userName = ownerName;
+                const isGroupConversation = String(remoteId || '').endsWith('@g.us');
 
                 const CHUNK_SIZE = 50;
                 const msgCount = conv.raw.length;
@@ -309,15 +501,12 @@ export async function distillAndVectorize(clientId) {
                     const batchChunks = allChunks.slice(b, b + CONCURRENCY_LIMIT);
 
                     await Promise.all(batchChunks.map(async ({ chunk, startIndex: i }) => {
-                        // Identity Resolution for the chunk (using conversation-level resolution)
-                        const { remoteId: chunkRemoteId, userName: chunkUserName, contactName: chunkContactName } = { remoteId, userName, contactName };
-
-                        const chunkText = chunk.map(m => {
-                            // Filter out untranscribed media placeholders to avoid "Audio" entities in Graph
-                            let cleanContent = m.content.replace(/\[Audio:.*?\]/g, '').replace(/\[Imagen:.*?\]/g, '').replace(/\[Video:.*?\]/g, '').trim();
-                            if (!cleanContent) return null; // Skip if only media
-                            return `${m.sender_role}: ${cleanContent}`;
-                        }).filter(Boolean).join('\n');
+                        const chunkRemoteId = remoteId;
+                        const chunkUserName = userName;
+                        const chunkContactName = contactName;
+                        const chunkLines = buildConversationLines(chunk, chunkUserName, chunkContactName);
+                        const chunkSpeakers = extractSpeakersFromLines(chunkLines);
+                        const chunkText = chunkLines.join('\n');
 
                         if (!chunkText) {
                             console.log(`[Worker] ⏩ [Conv: ${chunkRemoteId}] Chunk ${i / CHUNK_SIZE} saltado (solo contenía media sin transcribir).`);
@@ -327,7 +516,10 @@ export async function distillAndVectorize(clientId) {
                         try {
                             // 1. GraphRAG Extraction (entities & relations)
                             console.log(`[Worker] 🕸️ [Conv: ${chunkRemoteId}] Extrayendo grafo para chunk ${i / CHUNK_SIZE}...`);
-                            await processConversationDepth(clientId, chunkRemoteId, chunkUserName, chunkContactName, [chunkText], null, null, null);
+                            await processConversationDepthStrict(clientId, chunkRemoteId, chunkUserName, chunkContactName, chunkLines, {
+                                isGroup: isGroupConversation,
+                                speakers: chunkSpeakers
+                            });
 
                             // 2. Cognitive Depth (Soul Update & Insights) - MOVED OUTSIDE CHUNK LOOP OR CONSOLIDATED
                             // For massive re-processing, we will do this once per conversation group in the next block to save LLM calls
@@ -342,8 +534,18 @@ export async function distillAndVectorize(clientId) {
                             const enrichedText = chunkHeader + chunkText;
                             const holographicEmbedding = await generateEmbedding(enrichedText);
                             await supabase.from('user_memories').insert({
-                                client_id: clientId, content: enrichedText, sender: 'system_vectorization',
-                                embedding: holographicEmbedding, metadata: { remoteId: chunkRemoteId, contactName: chunkContactName, holographic: true, chunkIndex: i / CHUNK_SIZE, date: chunk[0]?.created_at }
+                                client_id: clientId,
+                                content: enrichedText,
+                                sender: dominantExternalSpeaker(chunk, chunkUserName, chunkContactName),
+                                embedding: holographicEmbedding,
+                                metadata: {
+                                    remoteId: chunkRemoteId,
+                                    contactName: chunkContactName,
+                                    holographic: true,
+                                    chunkIndex: i / CHUNK_SIZE,
+                                    date: chunk[0]?.created_at,
+                                    speakers: [...new Set(chunkLines.map(line => line.split(':')[0]).filter(Boolean))]
+                                }
                             });
                         } catch (embErr) { }
                     }));
@@ -352,8 +554,11 @@ export async function distillAndVectorize(clientId) {
                 // 2. Consolidated Cognitive Depth (Once per conversation per batch)
                 try {
                     console.log(`[Worker] 🧠 [Conv: ${contactName}] Actualizando profundidad cognitiva consolidada (${msgCount} msgs)...`);
-                    const fullConvText = conv.raw.map(m => `${m.sender_role}: ${m.content}`).join('\n');
-                    await processConversationDepth(clientId, remoteId, userName, contactName, conv.raw.map(m => `${m.sender_role}: ${m.content}`), conv.raw[msgCount - 1].sender_role, fullConvText, conv.raw[msgCount - 1].created_at);
+                    const fullConversationLines = buildConversationLines(conv.raw, userName, contactName);
+                    await processConversationDepthStrict(clientId, remoteId, userName, contactName, fullConversationLines, {
+                        isGroup: isGroupConversation,
+                        speakers: extractSpeakersFromLines(fullConversationLines)
+                    });
                 } catch (depthErr) {
                     console.error(`[Worker] ❌ [Conv: ${contactName}] Error en profundidad consolidada:`, depthErr.message);
                 }
@@ -369,7 +574,7 @@ export async function distillAndVectorize(clientId) {
             totalProcessedThisRun += messages.length;
 
             console.log(`[Worker] 🍶 Iniciando Destilación Autónoma...`);
-            await autonomousDistillation(clientId, soulData.slug, messages.slice(-50));
+            await autonomousDistillation(clientId, soulData.slug, eligibleMessages.slice(-50), ownerName);
             console.log(`[Worker] ✅ Batch finalizado (Acumulado: ${totalProcessedThisRun})`);
         }
         await invalidateSemanticCache(clientId);
@@ -382,6 +587,7 @@ export async function distillAndVectorize(clientId) {
 
 // === 4. DREAM CYCLE ===
 async function dreamCycle(clientId) {
+    if (!ENABLE_DREAM_CYCLE) return;
     try {
         const { data: nodes } = await supabase.from('knowledge_nodes').select('entity_name, entity_type').eq('client_id', clientId).limit(50);
         const { data: edges } = await supabase.from('knowledge_edges').select('source_node, relationship_type, target_node').eq('client_id', clientId).limit(50);
@@ -461,13 +667,22 @@ async function main() {
             const active = [...new Set(clients?.map(c => c.client_id))];
             for (const cid of active) await distillAndVectorize(cid);
         });
-        cron.schedule('0 3 * * *', async () => {
-            const { data: clients } = await supabase.from('user_souls').select('client_id');
-            for (const c of (clients || [])) await dreamCycle(c.client_id);
-        });
+        if (ENABLE_DREAM_CYCLE) {
+            cron.schedule('0 3 * * *', async () => {
+                const { data: clients } = await supabase.from('user_souls').select('client_id');
+                for (const c of (clients || [])) await dreamCycle(c.client_id);
+            });
+        } else {
+            console.log('[Dream Cycle] Disabled by default. Set OPENCLAW_ENABLE_DREAM_CYCLE=true to opt in.');
+        }
         cron.schedule('0 */3 * * *', consolidateMemories);
         cron.schedule('0 4 * * *', cleanupRawMessages);
     } catch (err) { }
 }
 
-main().catch(console.error);
+const currentFile = fileURLToPath(import.meta.url);
+const invokedFile = process.argv[1] ? path.resolve(process.argv[1]) : null;
+
+if (invokedFile === currentFile) {
+    main().catch(console.error);
+}

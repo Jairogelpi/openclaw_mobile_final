@@ -43,6 +43,7 @@ import { traverseGraph, hybridSearch } from './services/graph.service.mjs';
 import { summarizeYouTubeVideo } from './services/skill_executor.mjs';
 import { startRagTrace } from './services/rag_metrics.mjs';
 import { getConfig } from './services/config.service.mjs';
+import { buildRagQueryPlan, runEvidenceFirstRag } from './services/evidence_rag.service.mjs';
 
 /** Groq Helper para Reemplazar OpenRouter (401 Unauthorized Fix) */
 async function groqChat(model, messages, options = {}) {
@@ -65,6 +66,23 @@ async function groqChat(model, messages, options = {}) {
         console.error("GroqChat Error:", e.message);
         throw e;
     }
+}
+
+async function persistAssistantReply({ clientId, senderId, channel, content, metadata = {} }) {
+    if (!content) return;
+    await supabase.from('raw_messages').insert([{
+        client_id: clientId,
+        sender_role: 'assistant',
+        content,
+        remote_id: senderId,
+        processed: true,
+        metadata: {
+            channel: channel || 'whatsapp',
+            generated_by: 'core_engine',
+            exclude_from_memory: true,
+            ...metadata
+        }
+    }]);
 }
 
 /**
@@ -303,8 +321,74 @@ export async function processMessage(incomingEvent) {
             return trivialReply;
         }
 
-        // 1.6. SEMANTIC CACHE (Respuesta Instantánea si ya se respondió algo similar)
+        // 1.6. MODO RAG + SEMANTIC CACHE SEGURO
+        const ragMode = String(await getConfig('rag_mode') || 'legacy');
         const cacheEnabled = await getConfig('semantic_cache_enabled');
+        trace.setMode?.(ragMode);
+
+        if (ragMode === 'evidence_first') {
+            const plan = await buildRagQueryPlan(clientId, safeText, trace);
+            trace.setQueryPlan?.(plan);
+
+            const cacheEligible = Boolean(
+                cacheEnabled &&
+                !plan.need_exact_entity_match &&
+                !plan.temporal_window &&
+                !plan.relation_filter &&
+                !plan.entities?.length &&
+                plan.intent === 'exploratory'
+            );
+
+            if (cacheEligible) {
+                const cachedReply = await checkSemanticCache(clientId, queryVector);
+                if (cachedReply) {
+                    console.log(`⚡ [Semantic Cache] HIT seguro en modo evidence_first.`);
+                    trace.markCacheHit();
+                    trace.setAnswerVerdict?.({
+                        verdict: 'cached',
+                        citationCoverage: 1,
+                        supportedClaims: []
+                    });
+                    await trace.finish(cachedReply);
+                    return cachedReply;
+                }
+            }
+
+            const evidenceResult = await runEvidenceFirstRag({
+                clientId,
+                queryText: safeText,
+                queryVector,
+                trace,
+                precomputedPlan: plan
+            });
+
+            if (cacheEnabled && evidenceResult.cacheEligible && evidenceResult.verdict === 'answer') {
+                await saveToSemanticCache(clientId, queryVector, safeText, evidenceResult.reply);
+            }
+
+            await persistAssistantReply({
+                clientId,
+                senderId,
+                channel,
+                content: evidenceResult.reply,
+                metadata: {
+                    fast_path: true,
+                    rag_mode: 'evidence_first',
+                    answer_verdict: evidenceResult.verdict,
+                    citation_coverage: evidenceResult.citationCoverage,
+                    query_plan: evidenceResult.plan,
+                    citations: (evidenceResult.verification?.supportedClaims || []).map(claim => ({
+                        text: claim.text,
+                        citations: claim.citations
+                    }))
+                }
+            });
+
+            await trace.finish(evidenceResult.reply);
+            console.log(`✨ [Core Engine] Respuesta evidence_first entregada (${evidenceResult.verdict}).`);
+            return evidenceResult.reply;
+        }
+
         if (cacheEnabled) {
             const cachedReply = await checkSemanticCache(clientId, queryVector);
             if (cachedReply) {
@@ -590,7 +674,8 @@ Responde JSON:
 
         // 🧠 PHASE 5: COGNITIVE SYNTHESIS (Self-Updating Soul)
         // Solo si hay contexto sustancial y no es una charla trivial.
-        if (accumulatedContext && accumulatedContext.length > 200 && !searchIsDone) {
+        const autoSoulUpdateEnabled = await getConfig('rag_auto_soul_update_enabled');
+        if (autoSoulUpdateEnabled && accumulatedContext && accumulatedContext.length > 200 && !searchIsDone) {
             console.log(`🧠 [Cognitive Synthesis] Analizando hallazgos para actualizar identidad permanente...`);
             const synthesisPrompt = `Eres el NÚCLEO DE SÍNTESIS de OpenClaw. Tu misión es detectar hechos de IDENTIDAD CLAVE que deban ser recordados permanentemente en el Soul.
 
@@ -792,10 +877,18 @@ Responde JSON:
 
             if (directReply) {
                 await saveToSemanticCache(clientId, queryVector, text, directReply);
-                await supabase.from('raw_messages').insert([{
-                    client_id: clientId, sender_role: 'assistant', content: directReply,
-                    remote_id: senderId, metadata: { reflection_attempts: 0, reflection_approved: true, fast_path: true }
-                }]);
+                await persistAssistantReply({
+                    clientId,
+                    senderId,
+                    channel,
+                    content: directReply,
+                    metadata: {
+                        reflection_attempts: 0,
+                        reflection_approved: true,
+                        fast_path: true,
+                        rag_mode: 'legacy'
+                    }
+                });
                 trace.logReflection({ attempts: 0, score: 10, conflictDetected: false, conflictDetails: null, elapsedMs: 0 });
                 await trace.finish(directReply);
                 console.log(`✨ [Core Engine] Respuesta rápida entregada (Fast Path).`);
@@ -938,16 +1031,17 @@ Responde JSON:
         });
 
         await saveToSemanticCache(clientId, queryVector, text, aiReply);
-        await supabase.from('raw_messages').insert([{
-            client_id: clientId,
-            sender_role: 'assistant',
+        await persistAssistantReply({
+            clientId,
+            senderId,
+            channel,
             content: aiReply,
-            remote_id: senderId,
             metadata: {
                 reflection_attempts: attempts,
-                reflection_approved: isApproved
+                reflection_approved: isApproved,
+                rag_mode: 'legacy'
             }
-        }]);
+        });
 
         // 📊 RAG METRICS: Finalize and persist trace
         await trace.finish(aiReply);

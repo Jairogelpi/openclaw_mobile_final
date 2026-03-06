@@ -176,7 +176,15 @@ ESTÁ ESTRICTAMENTE PROHIBIDO GENERAR CÓDIGO JSON O RESÚMENES LARGOS. Solo des
                             sender_role: 'user_onboarding',
                             content: chunk.contextualized,
                             remote_id: clientId.toString(),
-                            metadata: { ...attachment, is_chunk: true, chunk_index: chunk.index, source: 'onboarding' }
+                            processed: true,
+                            metadata: {
+                                ...attachment,
+                                is_chunk: true,
+                                chunk_index: chunk.index,
+                                source: 'onboarding',
+                                channel: 'onboarding',
+                                exclude_from_memory: true
+                            }
                         }]);
                     }
                 }

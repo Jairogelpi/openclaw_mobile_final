@@ -15,6 +15,16 @@ const CACHE_TTL_MS = 60_000; // Refresca config cada 60 segundos
 // Defaults: Si la tabla no existe o no tiene la key, usamos estos valores
 const DEFAULTS = {
     'rag_confidence_threshold': 0.9,
+    'rag_mode': 'evidence_first',
+    'rag_max_candidates': 24,
+    'rag_max_query_variants': 4,
+    'rag_query_expansion_enabled': true,
+    'rag_semantic_rerank_enabled': true,
+    'rag_semantic_rerank_max_candidates': 8,
+    'rag_reranker_enabled': true,
+    'rag_claim_verifier_enabled': true,
+    'rag_allow_graph_hop_answers': false,
+    'rag_auto_soul_update_enabled': false,
     'max_investigation_hops': 4,
     'reflection_min_chars': 50,
     'reflection_enabled': true,

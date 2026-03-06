@@ -1,5 +1,5 @@
 -- ====================================================================
--- OPENCLAW GRAPHRAG V3: Cognitive Resonance & Path Tracking Engine
+-- OPENCLAW GRAPHRAG V3: Adaptive Cognitive Resonance & Path Tracking Engine
 -- ====================================================================
 
 DROP FUNCTION IF EXISTS public.graphrag_traverse;
@@ -8,7 +8,8 @@ CREATE OR REPLACE FUNCTION graphrag_traverse(
     query_text text,
     query_embedding vector(768),
     match_count int,
-    p_client_id text
+    p_client_id text,
+    p_max_hops int DEFAULT 3
 )
 RETURNS TABLE (
     knowledge text,
@@ -44,18 +45,19 @@ BEGIN
         LIMIT match_count
     ),
 
-    -- B. HOP 1: Direct Edges (Decay applied)
+    -- B. HOP 1: Direct Edges (Minimal Decay)
     hop1_edges AS (
         SELECT DISTINCT ON (e.source_node, e.relation_type, e.target_node)
             e.source_node, e.relation_type, e.target_node, e.context,
-            s.rrf_score * 0.9 as resonance,
+            s.rrf_score * 0.95 as resonance,
             s.entity_name as seed_origin
         FROM knowledge_edges e
         INNER JOIN seed_nodes s ON (e.source_node = s.entity_name OR e.target_node = s.entity_name)
         WHERE e.client_id = p_client_id
+          AND p_max_hops >= 1
     ),
 
-    -- C. HOP 2: Secondary Inference (More Decay)
+    -- C. HOP 2: Secondary Inference (Light Decay to preserve relevance)
     hop1_discovered_nodes AS (
         SELECT DISTINCT unnest(ARRAY[source_node, target_node]) as node_name, resonance, seed_origin
         FROM hop1_edges
@@ -63,16 +65,17 @@ BEGIN
     hop2_edges AS (
         SELECT DISTINCT ON (e.source_node, e.relation_type, e.target_node)
             e.source_node, e.relation_type, e.target_node, e.context,
-            h.resonance * 0.75 as resonance,
+            h.resonance * 0.85 as resonance,
             h.seed_origin
         FROM knowledge_edges e
         INNER JOIN hop1_discovered_nodes h ON (e.source_node = h.node_name OR e.target_node = h.node_name)
         WHERE e.client_id = p_client_id
+          AND p_max_hops >= 2
           AND NOT EXISTS (SELECT 1 FROM hop1_edges h1 WHERE h1.source_node = e.source_node AND h1.relation_type = e.relation_type AND h1.target_node = e.target_node)
         LIMIT 40
     ),
 
-    -- D. HOP 3: Unconscious Intuition (Maximum Decay)
+    -- D. HOP 3: Unconscious Intuition (Preserved relatively high if matches well)
     hop2_discovered_nodes AS (
         SELECT DISTINCT unnest(ARRAY[source_node, target_node]) as node_name, resonance, seed_origin
         FROM hop2_edges
@@ -80,11 +83,12 @@ BEGIN
     hop3_edges AS (
         SELECT DISTINCT ON (e.source_node, e.relation_type, e.target_node)
             e.source_node, e.relation_type, e.target_node, e.context,
-            h2.resonance * 0.5 as resonance,
+            h2.resonance * 0.75 as resonance,
             h2.seed_origin
         FROM knowledge_edges e
         INNER JOIN hop2_discovered_nodes h2 ON (e.source_node = h2.node_name OR e.target_node = h2.node_name)
         WHERE e.client_id = p_client_id
+          AND p_max_hops >= 3
           AND NOT EXISTS (SELECT 1 FROM hop1_edges h1 WHERE h1.source_node = e.source_node AND h1.target_node = e.target_node)
           AND NOT EXISTS (SELECT 1 FROM hop2_edges hn2 WHERE hn2.source_node = e.source_node AND hn2.target_node = e.target_node)
         LIMIT 15 

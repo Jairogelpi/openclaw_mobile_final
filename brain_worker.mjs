@@ -33,7 +33,8 @@ const brainWorker = new Worker('incomingMessagesQueue', async (job) => {
                 clientId,
                 clientSlug,
                 senderId,
-                text: prefixedReply
+                text: prefixedReply,
+                memoryText: aiReply
             }, {
                 removeOnComplete: true,
                 attempts: 3,
@@ -46,7 +47,8 @@ const brainWorker = new Worker('incomingMessagesQueue', async (job) => {
                 clientId,
                 clientSlug,
                 senderId,
-                text: aiReply
+                text: aiReply,
+                memoryText: aiReply
             }, {
                 removeOnComplete: true,
                 attempts: 3,

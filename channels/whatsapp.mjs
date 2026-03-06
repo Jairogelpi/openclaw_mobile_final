@@ -6,7 +6,10 @@ import { incomingQueue, outgoingQueue, mediaQueue } from '../config/queues.mjs';
 import redisClient from '../config/redis.mjs';
 import groq from '../services/groq.mjs';
 import { resolveIdentity } from '../skills/whatsapp_contacts.mjs';
+import { discoverWhatsAppGroup } from '../skills/whatsapp_groups.mjs';
 import supabase from '../config/supabase.mjs';
+import crypto from 'node:crypto';
+import { fallbackNameFromRemoteId, looksLikeBotText, pickBestHumanName } from '../utils/message_guard.mjs';
 
 /**
  * Resetea el temporizador de inactividad para un cliente.
@@ -19,6 +22,92 @@ async function triggerMemoryTimer(clientId) {
     } catch (e) {
         console.warn('[Timer] Error reseteando temporizador:', e.message);
     }
+}
+
+const OUTBOUND_AI_TTL_SECONDS = 24 * 60 * 60;
+
+function createMessageFingerprint(text) {
+    return crypto.createHash('sha1').update(String(text || '').trim()).digest('hex');
+}
+
+async function rememberTrackedOutboundMessage(clientId, remoteId, text, metadata = {}) {
+    if (!redisClient || !text) return;
+
+    const fingerprint = createMessageFingerprint(text);
+    const key = `wa:outbound_ai:${clientId}:${remoteId}:${fingerprint}`;
+    await redisClient.set(key, JSON.stringify({
+        trackedAt: new Date().toISOString(),
+        ...metadata
+    }), { EX: OUTBOUND_AI_TTL_SECONDS });
+}
+
+async function consumeTrackedOutboundMessage(clientId, remoteId, text) {
+    if (!redisClient || !text) return null;
+
+    const fingerprint = createMessageFingerprint(text);
+    const key = `wa:outbound_ai:${clientId}:${remoteId}:${fingerprint}`;
+    const payload = await redisClient.get(key);
+    if (!payload) return null;
+
+    await redisClient.del(key);
+    try {
+        return JSON.parse(payload);
+    } catch (e) {
+        return { generated_by: 'core_engine', exclude_from_memory: true };
+    }
+}
+
+async function syncAssistantMessageId(clientId, remoteId, logicalText, sentMessageId, generatedBy = 'core_engine', sentText = null) {
+    if (!logicalText || !sentMessageId) return;
+
+    const { data: rows, error } = await supabase
+        .from('raw_messages')
+        .select('id, metadata')
+        .eq('client_id', clientId)
+        .eq('remote_id', remoteId)
+        .eq('sender_role', 'assistant')
+        .eq('content', logicalText)
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+    if (error || !rows?.length) return;
+
+    const row = rows[0];
+    const nextMetadata = {
+        ...(row.metadata || {}),
+        msgId: sentMessageId,
+        channel: 'whatsapp',
+        generated_by: generatedBy,
+        exclude_from_memory: true,
+        outbound_text: sentText || logicalText
+    };
+
+    await supabase
+        .from('raw_messages')
+        .update({ metadata: nextMetadata, processed: true })
+        .eq('id', row.id);
+}
+
+async function resolveCachedIdentityName(identityCache, clientId, jid, pushName = null) {
+    const cacheKey = `${jid || 'unknown'}::${pushName || ''}`;
+    if (identityCache.has(cacheKey)) {
+        return identityCache.get(cacheKey);
+    }
+
+    let resolvedName = null;
+    try {
+        const identity = await resolveIdentity(clientId, jid, pushName);
+        resolvedName = pickBestHumanName(
+            identity?.name,
+            pushName,
+            fallbackNameFromRemoteId(jid)
+        );
+    } catch (e) {
+        resolvedName = pickBestHumanName(pushName, fallbackNameFromRemoteId(jid));
+    }
+
+    identityCache.set(cacheKey, resolvedName);
+    return resolvedName;
 }
 
 export const activeSessions = new Map();
@@ -288,6 +377,11 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                         const redisCheck = redisClient ? await redisClient.get(welcomeKey) : null;
 
                         if (!redisCheck) {
+                            const welcomeText = `🤖 *OpenClaw AI — Tu Asistente Personal*\n\n¡Hola! Soy tu asistente de inteligencia artificial. Puedes preguntarme cualquier cosa sobre tus contactos, conversaciones y recuerdos.\n\n*Ejemplos:*\n• _¿Quién es Víctor?_\n• _¿De qué hablé con María la semana pasada?_\n• _¿Qué sé sobre el proyecto X?_\n\nTodo lo que me preguntes será procesado usando tu base de conocimiento personal (GraphRAG + Memoria Vectorial).\n\n_Escribe aquí tu primera pregunta_ 👇`;
+                            await rememberTrackedOutboundMessage(clientId, myNormalizedJid, welcomeText, {
+                                generated_by: 'welcome_message',
+                                exclude_from_memory: true
+                            });
                             console.log(`[🤖 Self-Chat AI] Enviando mensaje de bienvenida a ${myNormalizedJid}...`);
                             await sock.sendMessage(myNormalizedJid, {
                                 text: `🤖 *OpenClaw AI — Tu Asistente Personal*\n\n¡Hola! Soy tu asistente de inteligencia artificial. Puedes preguntarme cualquier cosa sobre tus contactos, conversaciones y recuerdos.\n\n*Ejemplos:*\n• _¿Quién es Víctor?_\n• _¿De qué hablé con María la semana pasada?_\n• _¿Qué sé sobre el proyecto X?_\n\nTodo lo que me preguntes será procesado usando tu base de conocimiento personal (GraphRAG + Memoria Vectorial).\n\n_Escribe aquí tu primera pregunta_ 👇`
@@ -380,6 +474,16 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
             // Sincronizar agenda inicial
             if (contacts) await syncContacts(contacts);
 
+            const { data: existingRows } = await supabase
+                .from('raw_messages')
+                .select('metadata')
+                .eq('client_id', clientId);
+            const knownMsgIds = new Set(
+                (existingRows || [])
+                    .map(row => row.metadata?.msgId)
+                    .filter(Boolean)
+            );
+
             // Sincronizar metadatos de grupos iniciales
             if (chats && redisClient) {
                 for (const chat of chats) {
@@ -413,6 +517,7 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
             let totalHistorySaved = 0;
             let unreadsTagged = 0;
             let messagesToInsert = [];
+            const historyIdentityCache = new Map();
 
             for (const chat of chats) {
                 const chatMessages = (messages || []).filter(m => m.key.remoteJid === chat.id);
@@ -428,6 +533,7 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 for (const msg of chatMessages) {
                     // Filtrar mensajes basura del protocolo de Meta (cifrado, sender keys)
                     if (msg.message?.protocolMessage || msg.message?.senderKeyDistributionMessage) continue;
+                    if (knownMsgIds.has(msg.key.id)) continue;
 
                     const text = extractMessageContent(msg.message);
                     if (!text && !msg.message?.imageMessage && !msg.message?.audioMessage && !msg.message?.videoMessage) continue;
@@ -438,6 +544,11 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                     // 💎 Extracción de Metadatos Ricos para 10K History
                     const quotedMessageId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId || null;
                     const pushName = msg.pushName || null;
+                    const participantJid = chat.id.endsWith('@g.us') ? msg.key.participant : chat.id;
+                    const canonicalSenderName = isSentByMe
+                        ? 'Yo'
+                        : await resolveCachedIdentityName(historyIdentityCache, clientId, participantJid, pushName);
+                    const conversationName = chat.name || chat.id;
 
                     let mediaPayload = null;
                     if (msg.message?.imageMessage) mediaPayload = { imageMessage: msg.message.imageMessage };
@@ -445,25 +556,34 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                     else if (msg.message?.videoMessage) mediaPayload = { videoMessage: msg.message.videoMessage };
                     else if (msg.message?.documentMessage) mediaPayload = { documentMessage: msg.message.documentMessage };
                     else if (msg.message?.stickerMessage) mediaPayload = { stickerMessage: msg.message.stickerMessage };
+                    const historyContent = text || (msg.message?.imageMessage ? `[Imagen: ${msg.key.id}]` : (msg.message?.videoMessage ? `[Video: ${msg.key.id}]` : `[Audio: ${msg.key.id}]`));
+                    const excludeFromHistoryMemory = isSentByMe && looksLikeBotText(historyContent);
 
                     messagesToInsert.push({
                         client_id: clientId,
                         remote_id: chat.id,
-                        sender_role: isSentByMe ? 'Usuario' : (pushName || 'Contacto'),
-                        content: text || (msg.message?.imageMessage ? `[Imagen: ${msg.key.id}]` : (msg.message?.videoMessage ? `[Video: ${msg.key.id}]` : `[Audio: ${msg.key.id}]`)),
-                        processed: false, // Forzar al worker a mirarlo para GraphRAG/Perfiles
+                        sender_role: isSentByMe
+                            ? 'user_sent'
+                            : (canonicalSenderName || fallbackNameFromRemoteId(participantJid) || 'Contacto'),
+                        content: historyContent,
+                        processed: excludeFromHistoryMemory,
                         metadata: {
                             msgId: msg.key.id,
                             timestamp: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toISOString() : new Date().toISOString(),
                             isHistory: true,
                             is_new_unread: isUnread, // 🔑 ESTO LE DICE AL WORKER SI DEBE CREAR TARJETA DE INBOX O NO
-                            participantJid: chat.id.endsWith('@g.us') ? msg.key.participant : chat.id,
+                            channel: 'whatsapp',
+                            participantJid,
                             status: isSentByMe ? 'read' : 'sent',
                             quotedMessageId: quotedMessageId,
                             pushName: pushName,
-                            mediaPayload: mediaPayload
+                            canonicalSenderName: canonicalSenderName || fallbackNameFromRemoteId(participantJid) || null,
+                            conversationName,
+                            mediaPayload: mediaPayload,
+                            exclude_from_memory: excludeFromHistoryMemory
                         }
                     });
+                    knownMsgIds.add(msg.key.id);
 
                     if (isUnread) unreadsTagged++;
                 }
@@ -544,7 +664,12 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                     const targetJid = isGroup ? participantJid : senderId;
                     contactIdentity = await resolveIdentity(clientId, targetJid, msg.pushName);
                 }
-                const pushName = contactIdentity?.name || msg.pushName || (isSentByMe ? 'Yo' : 'Contacto');
+                const pushName = pickBestHumanName(
+                    contactIdentity?.name,
+                    msg.pushName,
+                    fallbackNameFromRemoteId(participantJid),
+                    isSentByMe ? 'Yo' : 'Contacto'
+                ) || (isSentByMe ? 'Yo' : 'Contacto');
 
                 const hasImage = !!msgContent.imageMessage;
                 const hasAudio = !!(msgContent.audioMessage || msgContent.pttMessage);
@@ -659,6 +784,14 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 }
 
                 console.log(`[${clientSlug} - ${isSentByMe ? 'Sent' : 'Recv'}]: ${finalText.slice(0, 50)}...`);
+                const assistantEcho = isSentByMe
+                    ? await consumeTrackedOutboundMessage(clientId, senderId, finalText)
+                    : null;
+                const excludeFromMemory = Boolean(assistantEcho?.exclude_from_memory) || (isSentByMe && looksLikeBotText(finalText));
+                const groupMeta = isGroup ? await discoverWhatsAppGroup(clientId, senderId).catch(() => null) : null;
+                const conversationName = isGroup
+                    ? (pickBestHumanName(groupMeta?.subject, fallbackNameFromRemoteId(senderId)) || senderId)
+                    : pushName;
 
                 // 👤 Obtener Avatar URL (con caché de 1h)
                 let avatarUrl = null;
@@ -681,15 +814,22 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                     sender_role: isSentByMe ? 'user_sent' : pushName,
                     content: finalText,
                     remote_id: senderId, // This acts as conversation/group ID
+                    processed: excludeFromMemory,
                     metadata: {
                         pushName,
+                        channel: 'whatsapp',
                         isGroup,
                         hasMedia: !!mediaDescription,
                         historical: false,
                         avatarUrl,
                         participantJid,
                         msgId: msg.key.id,
-                        status: isSentByMe ? 'sent' : 'read'
+                        status: isSentByMe ? 'sent' : 'read',
+                        canonicalSenderName: isSentByMe ? 'Yo' : pushName,
+                        conversationName,
+                        exclude_from_memory: excludeFromMemory,
+                        assistant_echo: Boolean(assistantEcho),
+                        generated_by: assistantEcho?.generated_by || null
                     }
                 }]).select('id, created_at');
 
@@ -725,7 +865,9 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 }
 
                 // Notificar al worker de memoria (Amnesia Consolidator) en cada interacción
-                await triggerMemoryTimer(clientId);
+                if (!excludeFromMemory) {
+                    await triggerMemoryTimer(clientId);
+                }
 
                 // ====================================================================
                 // 🤖 MODO ASISTENTE PERSONAL (Self-Chat AI)
@@ -749,6 +891,10 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 }
 
                 if (isSelfChat) {
+                    if (assistantEcho) {
+                        console.log(`[🤖 Self-Chat AI] Ignorando eco del bot marcado en salida.`);
+                        continue;
+                    }
                     // 🛡️ Evitar bucle: No procesar mensajes que el propio bot generó
                     if (finalText.startsWith('🤖') || finalText.startsWith('[OpenClaw')) {
                         console.log(`[🤖 Self-Chat AI] ℹ️ Ignorando mensaje propio del bot.`);
@@ -938,7 +1084,7 @@ import fs from 'fs/promises';
  * Envía un mensaje simulando comportamiento humano (Typing... + Delay aleatorio)
  * para reducir el riesgo de baneos de WhatsApp.
  */
-export async function sendHumanLikeMessage(clientId, jid, content, opts = {}) {
+export async function sendHumanLikeMessage(clientId, jid, content, opts = {}, tracking = {}) {
     const sock = activeSessions.get(String(clientId));
     if (!sock) throw new Error('WhatsApp no conectado');
 
@@ -947,6 +1093,7 @@ export async function sendHumanLikeMessage(clientId, jid, content, opts = {}) {
         content = { text: content };
     }
     const text = content.text || '';
+    const shouldTrackEcho = tracking.excludeFromMemory === true;
 
     try {
         // 1. Simular "Escribiendo..."
@@ -963,7 +1110,23 @@ export async function sendHumanLikeMessage(clientId, jid, content, opts = {}) {
         await new Promise(r => setTimeout(r, finalDelay));
 
         // 3. Enviar mensaje
+        if (shouldTrackEcho && text) {
+            await rememberTrackedOutboundMessage(clientId, jid, text, {
+                generated_by: tracking.generatedBy || 'core_engine',
+                exclude_from_memory: true
+            });
+        }
         const sent = await sock.sendMessage(jid, content, opts);
+        if (shouldTrackEcho && sent?.key?.id) {
+            await syncAssistantMessageId(
+                clientId,
+                jid,
+                tracking.logicalText || text,
+                sent.key.id,
+                tracking.generatedBy || 'core_engine',
+                text
+            );
+        }
 
         // 4. Detener "Escribiendo..."
         await sock.sendPresenceUpdate('paused', jid);
@@ -972,7 +1135,24 @@ export async function sendHumanLikeMessage(clientId, jid, content, opts = {}) {
     } catch (e) {
         console.error(`[Anti-Ban] ❌ Error enviando mensaje humanizado:`, e.message);
         // Fallback: intentar enviar normal si la simulación falla
-        return await sock.sendMessage(jid, content, opts);
+        if (shouldTrackEcho && text) {
+            await rememberTrackedOutboundMessage(clientId, jid, text, {
+                generated_by: tracking.generatedBy || 'core_engine',
+                exclude_from_memory: true
+            });
+        }
+        const sent = await sock.sendMessage(jid, content, opts);
+        if (shouldTrackEcho && sent?.key?.id) {
+            await syncAssistantMessageId(
+                clientId,
+                jid,
+                tracking.logicalText || text,
+                sent.key.id,
+                tracking.generatedBy || 'core_engine',
+                text
+            );
+        }
+        return sent;
     }
 }
 
@@ -1077,11 +1257,15 @@ export async function fetchHistoricalMedia(clientId, remoteJid, messageId) {
 // ser un humano (Typing delay).
 
 const outgoingWorker = new Worker('outgoingMessagesQueue', async (job) => {
-    const { clientId, clientSlug, senderId, text } = job.data;
+    const { clientId, clientSlug, senderId, text, memoryText } = job.data;
     console.log(`[Queue] 📥 Recibida respuesta generada por IA para ${clientSlug}...`);
 
     try {
-        await sendHumanLikeMessage(clientId, senderId, text);
+        await sendHumanLikeMessage(clientId, senderId, text, {}, {
+            excludeFromMemory: true,
+            generatedBy: 'core_engine',
+            logicalText: memoryText || text
+        });
         console.log(`[Queue-WhatsApp] ✅ Mensaje enviado a ${senderId} correctamente.`);
     } catch (err) {
         console.error(`[Queue-WhatsApp] ❌ Error enviando el mensaje: ${err.message}`);
