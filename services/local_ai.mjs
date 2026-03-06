@@ -8,9 +8,14 @@ const __dirname = path.dirname(__filename);
 
 let embedderWorker = null;
 let embedderTimeout = null;
-const EMBEDDER_TTL_MS = 10 * 60 * 1000; // 10 minutos de inactividad
+const EMBEDDER_TTL_MS = Number(process.env.OPENCLAW_EMBEDDER_TTL_MS || (60 * 60 * 1000));
+const EMBEDDER_KEEP_WARM = String(process.env.OPENCLAW_EMBEDDER_KEEP_WARM || 'true').toLowerCase() === 'true';
+const WARMUP_CACHE_MS = 5 * 60 * 1000;
+const WARMUP_TEXT = 'hola';
 let messageIdCounter = 0;
 const pendingRequests = new Map();
+let lastWarmupAt = 0;
+let warmupPromise = null;
 
 function initWorker() {
     if (!embedderWorker) {
@@ -40,6 +45,7 @@ function initWorker() {
 
 // Función para liberar la RAM
 function unloadEmbedder() {
+    if (EMBEDDER_KEEP_WARM) return;
     if (embedderWorker) {
         console.log('💤 [AI Service] Descargando modelo de embeddings de la RAM por inactividad (Lazy Unload)...');
         embedderWorker.postMessage({ action: 'unload', id: ++messageIdCounter });
@@ -55,8 +61,30 @@ function unloadEmbedder() {
 
 // Resetea el reloj de arena cada vez que alguien necesita pensar
 function resetEmbedderTimer() {
+    if (EMBEDDER_KEEP_WARM) return;
     if (embedderTimeout) clearTimeout(embedderTimeout);
     embedderTimeout = setTimeout(unloadEmbedder, EMBEDDER_TTL_MS);
+}
+
+export async function warmupEmbedder(reason = 'startup', { force = false } = {}) {
+    const now = Date.now();
+    if (!force && warmupPromise) return warmupPromise;
+    if (!force && (now - lastWarmupAt) < WARMUP_CACHE_MS) return null;
+
+    warmupPromise = (async () => {
+        try {
+            console.log(`Warmup [AI Service] (${reason})...`);
+            await generateEmbedding(WARMUP_TEXT, true);
+            lastWarmupAt = Date.now();
+            console.log('[AI Service] Warmup completado.');
+        } catch (error) {
+            console.warn(`[AI Service] Warmup skipped: ${error.message}`);
+        } finally {
+            warmupPromise = null;
+        }
+    })();
+
+    return warmupPromise;
 }
 
 /**

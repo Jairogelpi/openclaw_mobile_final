@@ -2,6 +2,7 @@ import 'dotenv/config';
 import { Worker } from 'bullmq';
 import { incomingQueue, outgoingQueue } from './config/queues.mjs';
 import { processMessage } from './core_engine.mjs';
+import { warmupEmbedder } from './services/local_ai.mjs';
 import IORedis from 'ioredis';
 
 const redisConnection = new IORedis({
@@ -9,7 +10,11 @@ const redisConnection = new IORedis({
     port: process.env.REDIS_PORT || 6379,
     maxRetriesPerRequest: null,
 });
+
 console.log('🧠 [Brain Worker] Iniciando servicio neuro-cognitivo (AI Microservice)...');
+warmupEmbedder('brain_worker_boot').catch(err => {
+    console.warn(`[Brain Worker] Warmup skipped: ${err.message}`);
+});
 
 // 1. Instanciar el Worker para la Cola de Entrada
 // Escucha lo que los clientes dicen por WhatsApp (empujado por el Gateway)
