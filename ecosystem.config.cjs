@@ -17,7 +17,7 @@ module.exports = {
             instances: 1, // Puedes aumentar esto si quieres escalar la IA (ej: 2, 4, o 'max')
             autorestart: true,
             watch: false,
-            max_memory_restart: '2G',
+            max_memory_restart: '4G',
             env: {
                 NODE_ENV: "production",
             }

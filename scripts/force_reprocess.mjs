@@ -6,6 +6,10 @@ const clientId = 'cc2afceb-4db2-4c1e-81e3-9adf8d6eaad6';
 async function run() {
     console.log(`🚀 Starting massive re-processing for client ${clientId}...`);
 
+    // Forzar el desbloqueo del cliente antes de arrancar
+    console.log(`🔓 Forcing client unlock...`);
+    await supabase.from('user_souls').update({ is_processing: false }).eq('client_id', clientId);
+
     let finished = false;
     let totalProcessed = 0;
 
@@ -35,9 +39,6 @@ async function run() {
         const duration = (Date.now() - startTime) / 1000;
 
         console.log(`✅ Batch finished in ${duration.toFixed(2)}s.`);
-
-        // Brief pause to prevent rate limiting issues if any
-        await new Promise(r => setTimeout(r, 1000));
     }
 
     console.log(`🏁 All messages processed for client ${clientId}.`);

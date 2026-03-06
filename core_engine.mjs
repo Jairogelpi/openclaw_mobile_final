@@ -5,13 +5,21 @@ import logger from './utils/logger.mjs';
 import groq from './services/groq.mjs';
 import { generateEmbedding, cosineSimilarity } from './services/local_ai.mjs';
 
-const parseLLMJson = (text) => {
+const parseLLMJson = (text, fallback = {}) => {
     try {
-        const cleaned = text.replace(/```json | ```/g, '').trim();
+        // Tratar de parsear quitando tags de código si los hay
+        const cleaned = text.replace(/```(?:json)?\s*([\s\S]*?)\s*```/g, '$1').trim();
         return JSON.parse(cleaned);
     } catch (e) {
-        console.warn('⚠️ [LLM-JSON] Fallback parsing failed for:', text.slice(0, 100));
-        throw e;
+        // Intento severo: extraer el primer bloque {...}
+        try {
+            const match = text.match(/\{[\s\S]*?\}/);
+            if (match) {
+                return JSON.parse(match[0]);
+            }
+        } catch (e2) { }
+        console.warn(`⚠️ [LLM-JSON] Fallback parsing failed. Returning default object. Text preview: ${text.slice(0, 100)}`);
+        return fallback;
     }
 };
 
@@ -48,7 +56,10 @@ async function groqChat(model, messages, options = {}) {
         if (options.response_format) {
             params.response_format = options.response_format;
         }
-        const response = await groq.chat.completions.create(params);
+        const response = await Promise.race([
+            groq.chat.completions.create(params),
+            new Promise((_, reject) => setTimeout(() => reject(new Error('Groq API Timeout (20s)')), 20000))
+        ]);
         return response.choices[0].message.content;
     } catch (e) {
         console.error("GroqChat Error:", e.message);
@@ -119,17 +130,14 @@ async function getRelevantContext(clientId, userQuery, queryVector, trace = null
 
             case 'exploratory':
             default:
-                // Full fusion: both strategies in parallel
-                const [hybridResult, graphResult] = await Promise.allSettled([
-                    hybridSearch(clientId, userQuery, queryVector, 15),
-                    traverseGraph(clientId, userQuery, queryVector, 8)
-                ]);
-                hybridMemories = hybridResult.status === 'fulfilled' ? hybridResult.value : [];
-                graphKnowledge = graphResult.status === 'fulfilled' ? graphResult.value : [];
+                // Full fusion: both strategies sequentially to avoid ONNX/DB concurrency overloads
+                try { hybridMemories = await hybridSearch(clientId, userQuery, queryVector, 15); } catch (e) { hybridMemories = []; }
+                try { graphKnowledge = await traverseGraph(clientId, userQuery, queryVector, 8); } catch (e) { graphKnowledge = []; }
                 break;
         }
 
-        // 3. Fusionar y deduplicar
+        // 3. Fusionar y deduplicar (PRIORIZANDO RECUERDOS REALES)
+        // Ponemos los híbridos primero para que tengan prioridad en la deduplicación y en el slice de la ventana de contexto
         const allCandidates = [...hybridMemories, ...graphKnowledge];
         if (!allCandidates.length) return "[CONFIANZA_CONTEXTO: NONE]\nNo hay recuerdos previos ni datos conocidos sobre este tema.";
 
@@ -160,18 +168,76 @@ async function getRelevantContext(clientId, userQuery, queryVector, trace = null
             }
         }
 
-        // 5. Re-Ranking SELECTIVO
-        const rankedKnowledge = await reRankMemories(userQuery, uniqueCandidates, queryVector);
-        const top10 = rankedKnowledge.slice(0, 10);
+        let rankedKnowledge = [];
+        if (uniqueCandidates.length > 0) {
+            // MEJORA: Priorización temporal + SESGO DE FUENTE (Híbridos > Grafo)
+            uniqueCandidates.sort((a, b) => {
+                const dateA = new Date(a.timestamp || a.metadata?.dateStart || 0);
+                const dateB = new Date(b.timestamp || b.metadata?.dateStart || 0);
 
-        // 6. ANTI-ALUCINACIÓN
-        const avgScore = top10.reduce((sum, k) => sum + (k.rerank_score || 0), 0) / (top10.length || 1);
-        let confidenceLevel = avgScore > 0.4 && top10.length >= 3 ? 'HIGH' : (avgScore > 0.1 || top10.length >= 1 ? 'LOW' : 'NONE');
+                // Si la fecha es igual o la diferencia es pequeña, priorizar HÍBRIDO (Conversación real)
+                if (Math.abs(dateB - dateA) < 1000) {
+                    if (a.source === 'HYBRID' && b.source !== 'HYBRID') return -1;
+                    if (b.source === 'HYBRID' && a.source !== 'HYBRID') return 1;
+                }
+
+                return dateB - dateA; // Más recientes arriba
+            });
+            try {
+                // Preparamos un prompt ultra-corto para que el LLM elija los mejores
+                const isTimeSensitive = queryType === 'temporal' || userQuery.toLowerCase().includes('ayer') || userQuery.toLowerCase().includes('hoy');
+                const currentDate = new Date().toISOString().split('T')[0];
+                const pruningPrompt = `Hoy es ${currentDate}.
+Analiza estos recuerdos y selecciona SOLO los IDs de los ${isTimeSensitive ? '20' : '10'} que respondan mejor a: "${userQuery}".
+${isTimeSensitive ? 'IMPORTANTE: Esta es una consulta TEMPORAL. Prioriza los recuerdos que ocurrieron en la fecha solicitada relativa a hoy.' : ''}
+
+Recuerdos:
+${uniqueCandidates.slice(0, 80).map((c, idx) => {
+                    const timestamp = c.timestamp || c.metadata?.dateStart || 'N/A';
+                    const sourceLabel = c.source === 'HYBRID' ? '[CHARLA]' : '[GRAFO]';
+                    return `##ID:${idx}## [${timestamp}] ${sourceLabel} ${c.content.substring(0, 200).replace(/\n/g, ' ')}`;
+                }).join('\n')}
+
+Responde SOLO con una lista de IDs separados por coma (ej: 0, 3, 5).`;
+
+                const selectedIdsStr = await groqChat('llama-3.1-8b-instant', [
+                    { role: 'system', content: 'Eres un filtro de relevancia experto en contextos sociales y temporales. Los IDs están en formato ##ID:X##.' },
+                    { role: 'user', content: pruningPrompt }
+                ], { temperature: 0.1 });
+
+                const selectedIds = (selectedIdsStr || '').match(/##ID:(\d+)##/g)?.map(m => parseInt(m.match(/\d+/)[0])) || (selectedIdsStr || '').match(/\d+/g)?.map(Number) || [];
+                console.log(`🤖 [Pruning] LLM eligió IDs: ${selectedIds.join(', ')}`);
+                rankedKnowledge = selectedIds
+                    .filter(id => uniqueCandidates[id])
+                    .map(id => uniqueCandidates[id]);
+
+                // MEJORA: Siempre incluir híbridos recientes si es temporal
+                if (isTimeSensitive) {
+                    const topHybrids = uniqueCandidates
+                        .filter(c => c.source === 'HYBRID' && c.timestamp && !rankedKnowledge.includes(c))
+                        .slice(0, 15);
+                    rankedKnowledge = [...topHybrids, ...rankedKnowledge];
+                }
+
+                // Si el LLM no devolvió nada útil, usamos el fallback de score original
+                if (rankedKnowledge.length === 0) {
+                    rankedKnowledge = uniqueCandidates.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
+                }
+            } catch (e) {
+                console.warn(`⚠️ [Pruning] Falló el refinamiento LLM, usando fallback de DB.`);
+                rankedKnowledge = uniqueCandidates.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
+            }
+        }
+
+        const topN = rankedKnowledge.slice(0, 30); // Aumentado a 30 para maximizar inteligencia
+
+        // 6. ANTI-ALUCINACIÓN (Criterio de confianza simplificado)
+        let confidenceLevel = topN.length >= 3 ? 'HIGH' : (topN.length >= 1 ? 'LOW' : 'NONE');
 
         if (trace) {
             trace.logRetrieval({
-                hybridMemories, graphKnowledge, uniqueCandidates, top7: top10,
-                confidenceLevel, avgScore, queryType,
+                hybridMemories, graphKnowledge, uniqueCandidates, topN,
+                confidenceLevel, queryType,
                 elapsedMs: Date.now() - retrievalStart
             });
         }
@@ -180,14 +246,13 @@ async function getRelevantContext(clientId, userQuery, queryVector, trace = null
         const { data: soulData } = await supabase.from('user_souls').select('soul_json').eq('client_id', clientId).single();
         const currentContext = soulData?.soul_json?.key_facts ? JSON.stringify(soulData.soul_json.key_facts) : "Desconocido.";
 
-        const contextBlock = top10.map(k => {
-            const prefix = k.source === 'GRAPH' || k.source === 'GRAPH_V3'
-                ? `🕸️ GRAFO[Hop ${k.hop}][${k.timestamp || ''}]`
-                : `📝 MEMORIA[Score: ${(k.rerank_score || k.similarity)?.toFixed(3) || '?'}]`;
-            return `- ${prefix}: ${k.content} `;
+        const contextBlock = topN.map(k => {
+            const dateStr = k.timestamp || k.metadata?.dateStart || '';
+            const prefix = dateStr ? `[${dateStr}]` : '[INFO_GENÉRICA]';
+            return `${prefix} ${k.content} `;
         }).join('\n');
 
-        return `[CONFIANZA_CONTEXTO: ${confidenceLevel}][TIPO_QUERY: ${queryType}]\n\n[HECHOS ACTUALES (SILO TEMPORAL)]:\n${currentContext}\n\n[MEMORIAS RECUPERADAS]:\n${contextBlock}`;
+        return `[CONFIANZA_CONTEXTO: ${confidenceLevel}][TIPO_QUERY: ${queryType}]\n\n[HECHOS ACTUALES]:\n${currentContext}\n\n[RECUERDOS]:\n${contextBlock}`;
     } catch (e) {
         console.error("[RAG] Error en pipeline Agentic+GraphRAG:", e.message);
         return "[CONFIANZA_CONTEXTO: NONE]\nNo se pudieron recuperar recuerdos.";
@@ -202,9 +267,14 @@ export async function processMessage(incomingEvent) {
     console.log(`🧠[Core Engine] Recibido de ${channel}: "${text.substring(0, 30)}..."(clientId: ${clientId})`);
 
     try {
-        if (isSentByMe) {
+        // 🤖 SELF-CHAT AI: Si el usuario escribe en su propio chat, es una consulta al asistente
+        const isSelfChatQuery = isSentByMe && incomingEvent.metadata?.isSelfChat;
+        if (isSentByMe && !isSelfChatQuery) {
             console.log(`✍️[Core Engine] Analizando estilo de mensaje enviado.`);
             return null;
+        }
+        if (isSelfChatQuery) {
+            console.log(`🤖 [Self-Chat AI] Consulta del usuario al asistente IA: "${text.substring(0, 50)}..."`);
         }
 
         const senderLabel = incomingEvent.metadata?.isGroup
@@ -286,7 +356,12 @@ export async function processMessage(incomingEvent) {
         console.log(`🕵️ [Agentic RAG V4 Cíborg] Iniciando Investigación Reflexiva...`);
         let accumulatedContext = "";
         let iterations = 0;
-        const maxIterations = await getConfig('max_investigation_hops'); // Dinámico desde Supabase
+
+        // 🔥 SPEED OVERRIDE: Forzamos 3 saltos máximos para permitir que la IA decida cuándo parar
+        // 🔥 SPEED OVERRIDE: Forzamos 2 saltos máximos para permitir que la IA decida cuándo parar
+        // El salto único ya recupera ~80-100 nodos de grafo + memoria híbrida, lo cual es inmenso.
+        const maxIterations = 2; // Reducido: Balance óptimo entre velocidad e inteligencia
+
         let searchIsDone = false;
         let investigationLog = []; // Chain-of-Thought visible
         let agenticWebUsed = false;
@@ -298,50 +373,38 @@ export async function processMessage(incomingEvent) {
 
         while (iterations < maxIterations && !searchIsDone) {
             iterations++;
-            const agenticPrompt = `Eres EL INVESTIGADOR CÍBORG de OpenClaw. Un agente de IA de élite hiper-rápido que rutea decisiones.
+            console.log(`🕵️ [Hop ${iterations}/${maxIterations}] Buscando información...`);
 
-PREGUNTA ORIGINAL DEL USUARIO: "${text}"
+            // Si ya tenemos información relevante de alta confianza, paramos rápido
+            if (accumulatedContext.includes('[CONFIANZA_CONTEXTO: HIGH]') && iterations > 1) {
+                console.log(`✅ [Investigador] Info de alta confianza encontrada. Parando búsqueda anticipadamente.`);
+                searchIsDone = true;
+                break;
+            }
 
-TU BITÁCORA DE INVESTIGACIÓN (lo que ya has descubierto en saltos previos):
-${investigationLog.length > 0 ? investigationLog.map((log, i) => `[Hop ${i + 1}] Busqué: "${log.query}" → Encontré: "${log.finding}"`).join('\n') : 'Vacía. Primera iteración.'}
+            const agenticPrompt = `Eres EL INVESTIGADOR CÍBORG de OpenClaw. Tu misión es la CONECTIVIDAD TOTAL.
+            
+PREGUNTA ORIGINAL: "${text}"
 
-CONTEXTO ACUMULADO HASTA AHORA:
+TU BITÁCORA:
+${investigationLog.length > 0 ? investigationLog.map((log, i) => `[Hop ${i + 1}] Busqué: "${log.query}" → Encontré: "${log.finding}"`).join('\n') : 'Vacía.'}
+
+CONTEXTO ACUMULADO:
 ${accumulatedContext || 'Vacío.'}
 
- INSTRUCCIONES DE RETRIEVAL Y DECISIÓN (OpenClaw V4):
-1. BÚSQUEDA INTERNA (LOCAL): Si la pregunta es sobre el usuario, sus memórias, o relaciones, busca internamente. No asumas nada. Formula queries que ataquen GraphRAG directamente.
-2. CONSULTAS TEMPORALES Y TEMÁTICAS: Si te preguntan "Qué hablé en enero?" o "De qué hablo más?", genera una sub-query orientada al grafo: "EVENTO_TEMPORAL enero" o "TEMA más frecuente".
-3. WEB SEARCH (INTERNET): SOLO pon "use_web_search": true si te piden un dato del mundo exterior, reciente, de dominio público, noticias, o hechos que no pertenecen a la memoria personal (Ej. "Quién ganó el mundial de 2026?", "Clima en París"). 
-   - ⛔ PROHIBIDO buscar en internet datos personales ("Quién es mi novia?", "Problemas de Juan").
-4. Si ya tienes suficiente información para responder con altísima confianza, pon investigation_complete = true. No des saltos innecesarios.
+INSTRUCCIONES DE ÉLITE (V4.2):
+1. DESCUBRIMIENTO DE IDENTIDAD: Si preguntan por una relación (madre, novia, etc.), busca por la ENTIDAD y la RELACIÓN.
+2. CONCIENCIA TEMPORAL: Si la pregunta menciona tiempo (ayer, hoy, enero, etc.), INCLUYE el término temporal en tus queries (Ej: "Víctor ayer", "Reunión martes").
+3. BÚSQUEDA CRUZADA: Si ya sabes un nombre (ej: "Mireya"), busca sus conexiones: "Mireya relación", "Mireya vínculo".
+4. NO SUPONGAS: Si el grafo no tiene la respuesta tras 2 saltos, termina y admite que no tienes ese dato específico.
+5. WEB SEARCH: SOLO conocimiento general/noticias. NUNCA para datos personales.
 
-SKILLS DISPONIBLES (Booleans):
-- use_youtube_tool: Si el usuario pasa un link de YouTube en el texto.
-- use_recall_media_tool: Si pide buscar una foto o audio antiguo.
-- use_brain_sql_tool: SOLO para estadísticas puras matemáticas (ej. "Cuántos mensajes tengo").
-
-TAREAS PARA ESTE SALTO:
-Evalúa lo acumulado. Si es suficiente, termina. Si no, genera entre 1 y 2 queries MUY concisas para la siguiente ronda.
-
-Responde ÚNICAMENTE en JSON ESTRICTO:
+Responde JSON:
 {
   "investigation_complete": boolean,
-  "reasoning": "Breve cadena de pensamiento rápida",
-  "missing_piece": "Qué falta (N/A si terminas)",
-  "optimized_queries": ["sub_query_1", "sub_query_2"],
-  "use_web_search": boolean,
-  "web_search_query": "Búsqueda exacta para Google/Tavily si aplica",
-  "use_youtube_tool": boolean,
-  "youtube_url": "string o null",
-  "use_recall_media_tool": boolean,
-  "media_id": "string o null",
-  "use_self_improvement_tool": boolean,
-  "self_improvement_type": "axiom|directive|style|fact",
-  "self_improvement_info": "Nueva regla",
-  "use_brain_sql_tool": boolean,
-  "sql_analysis_intent": "string o null",
-  "contact_jid": "string o null",
-  "confidence_score": 0.0 a 1.0 (usa 0.99 si estás listísimo y quieres ahorrar ciclos)
+  "reasoning": "Breve cadena de pensamiento",
+  "optimized_queries": ["query_1", "query_2"],
+  "confidence_score": 0.0 a 1.0
 }`;
 
             try {
@@ -351,7 +414,11 @@ Responde ÚNICAMENTE en JSON ESTRICTO:
                     { role: 'system', content: agenticPrompt }
                 ], { temperature: 0.1, response_format: { type: 'json_object' } });
 
-                const decision = JSON.parse(agenticRaw);
+                const decision = parseLLMJson(agenticRaw, {
+                    investigation_complete: false,
+                    reasoning: 'Fallback reasoning due to JSON parse failure',
+                    confidence_score: 0.1
+                });
                 console.log(`🕵️ [Hop ${iterations}/${maxIterations}] Razón: ${decision.reasoning}`);
 
                 // TRIVIAL EXIT: Si es la primera iteración y no es una pregunta, salimos
@@ -399,7 +466,8 @@ Responde ÚNICAMENTE en JSON ESTRICTO:
 
                 agenticAllQueries.push(...queries);
 
-                const results = await Promise.all(queries.map(async (q) => {
+                const results = [];
+                for (const q of queries) {
                     const vec = await generateEmbedding(q, true);
 
                     // D. QUERY DEDUP: Skip queries too similar to previous ones
@@ -409,12 +477,14 @@ Responde ÚNICAMENTE en JSON ESTRICTO:
                     });
                     if (isDuplicate) {
                         console.log(`♻️ [Dedup] Sub-query "${q.substring(0, 40)}..." es duplicada (>0.85 sim). Saltando.`);
-                        return null; // Skip — marked as null for dedup detection
+                        results.push(null); // Skip — marked as null for dedup detection
+                        continue;
                     }
                     previousQueryVectors.push(vec);
 
-                    return await getRelevantContext(clientId, q, vec, trace);
-                }));
+                    const res = await getRelevantContext(clientId, q, vec, trace);
+                    results.push(res);
+                }
 
                 // SMART EARLY-STOP: Si TODAS las sub-queries fueron deduplicadas, no hay info nueva posible
                 const validResults = results.filter(r => r !== null);
@@ -521,16 +591,17 @@ Responde ÚNICAMENTE en JSON ESTRICTO:
             queries: agenticAllQueries, elapsedMs: Date.now() - agenticStart
         });
 
-        // 🔄 RE-FETCH SOUL SI HUBO MEJORA (Evitar respuesta con datos viejos)
+        // 🔄 RE-FETCH SOUL SI HUVO MEJORA (Evitar respuesta con datos viejos)
         if (soulWasUpdated) {
             console.log(`🔄 [Core Engine] Re-cargando identidad actualizada tras auto-mejora...`);
             const { data: updatedSoul } = await supabase.from('user_souls').select('soul_json').eq('client_id', clientId).single();
             if (updatedSoul) soulData.soul_json = updatedSoul.soul_json;
         }
 
-        // 4. CONTEXT ATOMIZATION (Beyond-God-Tier Cost Cut)
-        console.log(`🧪 [Architect RAG] Atomizando contexto (Ahorro de Tokens)...`);
-        let distilledKnowledge = "";
+        // 4. CONTEXT ATOMIZATION (BYPASSED FOR EXTREME SPEED & DATA RETENTION)
+        console.log(`🧪 [Architect RAG] Atomización desactivada (Modo Velocidad Máxima)...`);
+        let distilledKnowledge = accumulatedContext;
+        console.log(`🧠 [DEBUG RAG] Contexto acumulado sample (first 1000ch): ${distilledKnowledge.substring(0, 1000)}...`);
         const atomStart = Date.now();
 
         // ANTI-HALLUCINATION GATE: Si la confianza es NONE, inyectar guardia estricta
@@ -543,24 +614,12 @@ Responde ÚNICAMENTE en JSON ESTRICTO:
         const investigationChain = investigationLog.length > 0
             ? '\n[BITÁCORA DEL INVESTIGADOR]:\n' + investigationLog.map((l, i) => `  Hop ${i + 1} (${l.strategy}): Busqué "${l.query}" → ${l.finding}`).join('\n')
             : '';
-        try {
-            // MODEL TIERING: 8B para destilación de hechos puros
-            trace.addLLMCall();
-            distilledKnowledge = await groqChat('llama-3.1-8b-instant', [
-                { role: 'system', content: `Eres un Atomizador de Contexto. Extrae ÚNICAMENTE los "Átomos de Hecho" más relevantes del contexto provisto como una lista de viñetas muy cortas. Omite todo el texto de relleno. Formato: "- Hecho 1\n- Hecho 2". Si el contexto está vacío, responde "Sin hechos."` },
-                { role: 'user', content: `CONTEXTO:\n${accumulatedContext}` }
-            ], { temperature: 0.1 });
-        } catch (e) {
-            distilledKnowledge = accumulatedContext;
-        }
-        // 📊 RAG METRICS: Log atomization
-        trace.logAtomization({
-            charsBefore: accumulatedContext.length,
-            charsAfter: distilledKnowledge.length,
-            elapsedMs: Date.now() - atomStart
-        });
+
+        // 📊 RAG METRICS: Log atomization (Skipped)
+        trace.logAtomization({ charsBefore: accumulatedContext.length, charsAfter: distilledKnowledge.length, elapsedMs: 0 });
 
         // 5. GENERACIÓN FINAL
+        console.log("!!! TRACE 1: Before Style Mirroring");
         // A. Obtener ejemplos de estilo (Mirroring Dinámico)
         let userStyleExamples = "";
         try {
@@ -594,7 +653,13 @@ Responde ÚNICAMENTE en JSON ESTRICTO:
             console.warn(`⚠️ [Core Engine] Error en mirroring dinámico:`, e.message);
         }
 
-        const parsedSoul = JSON.parse(soul);
+        console.log("!!! TRACE 2: Before JSON.parse(soul)");
+        let parsedSoul = {};
+        try {
+            parsedSoul = JSON.parse(soul);
+        } catch (e) {
+            parsedSoul = soulJson.soul_patch || soulJson || {};
+        }
         const styleInfo = parsedSoul.style_profile ? `
         ESTILO DE ESCRITURA:
         - Tono: ${parsedSoul.style_profile.tone || 'Natural'}
@@ -609,6 +674,13 @@ Responde ÚNICAMENTE en JSON ESTRICTO:
         const matrices = parsedSoul.matrices_decision?.join('\n- ') || "No detectadas.";
         const directives = parsedSoul.personal_directives?.join('\n- ') || "No hay directivas específicas.";
         const psych = parsedSoul.psychological_profile ? JSON.stringify(parsedSoul.psychological_profile) : "No analizado.";
+
+        console.log("!!! TRACE 3: Before System Prompt Generation");
+        // 5. GENERACIÓN FINAL
+        const isSelfChat = isSelfChatQuery; // Volvemos a la detección purista
+        const brevityDirective = isSelfChat
+            ? '\n- MODO ESPEJO: Responde como si fueras su propio clon digital. Sé breve, natural y directo. Si falta info, admítelo con naturalidad. PROHIBIDO decir "Soy una IA" o "No tengo acceso a tiempo real". Si no sabes algo de tu vida, di simplemente que no lo recuerdas ahora mismo.'
+            : '\n- BREVEDAD: Responde de forma natural y concisa según el estilo del SOUL.';
 
         const systemPrompt = `
         === 🧠 CEREBRO DIGITAL: CLONACIÓN DE NIVEL 5 ===
@@ -635,34 +707,31 @@ Responde ÚNICAMENTE en JSON ESTRICTO:
         ${mood}
         
         === DIRECTIVAS Y AXIOMAS (PRIORIDAD ALTA) ===
-        - ${directives}
+        - ${directives}${brevityDirective}
         - AXIOMAS: ${axionas}
         - MATRICES: ${matrices}
         - PERFIL PSICOLÓGICO: ${psych}
         
         === REGLAS DE ORO ===
-        1. MANTÉN EL PERSONAJE: Responde con el estilo, tono y emojis que verás en los ejemplos. No seas una IA.
-        2. BREVEDAD HUMANA: Si el dueño es corto y seco, HAZ LO MISMO.
-        3. CONTEXTO SOCIAL: Si detectas que hablas con alguien del [NETWORK], usa los matices de esa relación.
-        4. PROACTIVIDAD: Si el mensaje se alinea con tus [GOALS], sé proactivo.
-        5. PROCEDIMIENTOS: Sigue el [PLAYBOOK] para tareas operativas (agendar, filtrar, etc).
-        6. RESONANCIA EMOCIONAL: Modula tu energía y empatía según el [MOOD]. Si el usuario está estresado, sé breve y servicial; si está eufórico, comparte la energía. Imita su vibración actual.
-        7. EVIDENCIA MULTIMODAL: Tus recuerdos incluyen análisis de imágenes (fotos, esquemas, facturas) y audios. Trátalos como hechos presenciados por ti.
+        1. MANTÉN EL PERSONAJE: Responde con el estilo, tono y emojis del SOUL.
+        2. BREVEDAD HUMANA: Imita la longitud de los mensajes del dueño.
+        3. CONTEXTO SOCIAL: Detecta con quién hablas y ajusta el trato.
+        4. PROACTIVIDAD: Alinea respuestas con [GOALS].
+        5. PROCEDIMIENTOS: Usa el [PLAYBOOK].
+        6. RESONANCIA EMOCIONAL: Imita la vibración actual del usuario.
+        7. EVIDENCIA MULTIMODAL: Tus recuerdos incluyen análisis de multimedia.
         
         === CONTEXTO DINÁMICO (MEMORIA EPISÓDICA) ===
         ${distilledKnowledge}
         
         === ESPEJO SEMÁNTICO (TU VOZ REAL) ===
-        ${userStyleExamples || "Imita el estilo del SOUL."}${antiHallucinationDirective}${investigationChain}`;
+        ${userStyleExamples || "Imita el estilo del SOUL."}${antiHallucinationDirective}`;
 
-        // 5. BUCLE DE REFLEXIÓN (DRAFT -> CRITIQUE -> REFINE)
-        // SPEED OPTIMIZATION: Solo ejecutar la reflexión pesada para preguntas complejas
-        const reflectionMinChars = await getConfig('reflection_min_chars');
-        const reflectionEnabled = await getConfig('reflection_enabled');
-        const needsDeepReflection = reflectionEnabled && (text.includes('?') || text.length > reflectionMinChars);
+        // 5. BUCLE DE REFLEXIÓN
+        const needsDeepReflection = false; // SPEED OVERRIDE
 
         if (!needsDeepReflection) {
-            console.log(`⚡ [Reflection Skip] Mensaje casual detectado. Generando respuesta directa sin auditoría.`);
+            console.log(`⚡ [Reflection Skip] Generando respuesta directa.`);
             trace.addLLMCall();
             const directReply = await groqChat('llama-3.3-70b-versatile', [
                 { role: 'system', content: systemPrompt },
@@ -754,7 +823,14 @@ Responde ÚNICAMENTE en JSON ESTRICTO:
                         response_format: { type: 'json_object' }
                     });
 
-                    audit = parseLLMJson(auditRaw);
+                    audit = parseLLMJson(auditRaw, { approved: false, score: 0, conflict_detected: false, error: true });
+
+                    if (audit.error) {
+                        console.warn('⚠️ [Reflection] JSON roto, forzando reintento...');
+                        retryCount++;
+                        continue;
+                    }
+
                     lastAuditScore = audit.score || 0;
                     lastConflict = audit.conflict_detected || false;
                     lastConflictDetails = audit.conflict_details || null;

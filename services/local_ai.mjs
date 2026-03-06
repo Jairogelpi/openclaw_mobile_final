@@ -1,20 +1,55 @@
-import { pipeline } from '@huggingface/transformers';
+import { Worker } from 'worker_threads';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import redisClient from '../config/redis.mjs';
 
-let localEmbedder = null;
-let localReRanker = null;
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
 
+let embedderWorker = null;
 let embedderTimeout = null;
 const EMBEDDER_TTL_MS = 10 * 60 * 1000; // 10 minutos de inactividad
+let messageIdCounter = 0;
+const pendingRequests = new Map();
+
+function initWorker() {
+    if (!embedderWorker) {
+        console.log('🧠 [AI Service] Inicializando red neuronal en hilo dedicado (Worker Thread)...');
+        embedderWorker = new Worker(path.join(__dirname, 'ai_worker.mjs'));
+
+        embedderWorker.on('message', (msg) => {
+            const resolver = pendingRequests.get(msg.id);
+            if (resolver) {
+                if (msg.error) resolver.reject(new Error(msg.error));
+                else resolver.resolve(msg.vector || msg);
+                pendingRequests.delete(msg.id);
+            }
+        });
+
+        embedderWorker.on('error', (err) => {
+            console.error('❌ [AI Worker] Error en hilo de embeddings:', err);
+            embedderWorker = null;
+        });
+
+        embedderWorker.on('exit', (code) => {
+            if (code !== 0) console.warn(`⚠️ [AI Worker] Hilo cerrado con código ${code}`);
+            embedderWorker = null;
+        });
+    }
+}
 
 // Función para liberar la RAM
 function unloadEmbedder() {
-    if (localEmbedder) {
+    if (embedderWorker) {
         console.log('💤 [AI Service] Descargando modelo de embeddings de la RAM por inactividad (Lazy Unload)...');
-        if (typeof localEmbedder.dispose === 'function') {
-            try { localEmbedder.dispose(); } catch (e) { }
-        }
-        localEmbedder = null; // Liberamos la referencia para el Garbage Collector
+        embedderWorker.postMessage({ action: 'unload', id: ++messageIdCounter });
+        // Optionally terminate the worker thread completely after unload
+        setTimeout(() => {
+            if (embedderWorker) {
+                embedderWorker.terminate();
+                embedderWorker = null;
+            }
+        }, 1000);
     }
 }
 
@@ -25,24 +60,34 @@ function resetEmbedderTimer() {
 }
 
 /**
- * Genera un embedding vectorial de un texto usando MiniLM localmente.
+ * Genera un embedding vectorial de un texto usando MiniLM en un Worker Thread.
  * @param {string} text 
  * @param {boolean} isQuery 
  * @returns {Promise<number[]>}
  */
 export async function generateEmbedding(text, isQuery = false) {
-    if (!localEmbedder) {
-        console.log('🧠 [AI Service] Inicializando red neuronal (all-mpnet-base-v2)...');
-        localEmbedder = await pipeline('feature-extraction', 'Xenova/all-mpnet-base-v2', {
-            quantized: true
-        });
-    }
-
+    initWorker();
     resetEmbedderTimer(); // Reiniciar temporizador en cada uso
 
     const prefix = isQuery ? 'search_query: ' : 'search_document: ';
-    const output = await localEmbedder(prefix + text, { pooling: 'mean', normalize: true });
-    return Array.from(output.data);
+    const textToEmbed = prefix + text;
+
+    return new Promise((resolve, reject) => {
+        const id = ++messageIdCounter;
+        pendingRequests.set(id, { resolve, reject });
+
+        // Timeout watchdog for the worker thread
+        setTimeout(() => {
+            if (pendingRequests.has(id)) {
+                pendingRequests.delete(id);
+                console.warn(`⏳ [AI Service] Timeout esperando embedding ${id} (Worker thread no responde en 60s)`);
+                reject(new Error('Embedding generation timeout (Worker stalled)'));
+            }
+        }, 60000);
+
+        // console.log(`[AI Service] Enviando request de embedding ${id}...`);
+        embedderWorker.postMessage({ action: 'embed', id, text: textToEmbed });
+    });
 }
 
 /**
@@ -61,10 +106,12 @@ export async function reRankMemories(query, memories, queryVector = null) {
     const qVec = queryVector || await generateEmbedding(query, true);
 
     let onTheFlyCount = 0;
-    const MAX_ON_THE_FLY = 10; // Cap para evitar bloqueo de CPU
+    const MAX_ON_THE_FLY = 0; // DESACTIVADO: Evita el bloqueo de CPU/RAM en hardware limitado
 
-    // Computar similitud coseno REAL para cada candidato
-    const scored = await Promise.all(memories.map(async (m) => {
+    // Computar similitud coseno REAL para cada candidato de forma secuencial
+    // (Ejecutar ONNX models en paralelo con Promise.all congela el proceso)
+    const scored = [];
+    for (const m of memories) {
         let score = m.similarity || 0; // Base: score RRF de PostgreSQL
 
         // Si la memoria tiene embedding guardado, usarlo para re-rank preciso
@@ -80,10 +127,9 @@ export async function reRankMemories(query, memories, queryVector = null) {
                 // Mantener score original si falla
             }
         }
-        // Si ya superamos el cap, mantener el score RRF original (ya normalizado)
 
-        return { ...m, rerank_score: score };
-    }));
+        scored.push({ ...m, rerank_score: score });
+    }
 
     // Ordenar por score real descendente
     scored.sort((a, b) => b.rerank_score - a.rerank_score);

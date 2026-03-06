@@ -274,6 +274,35 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                         console.warn(`[${clientSlug}] ⚠️ Tarea post-conexión ${i} falló:`, res.reason?.message);
                     }
                 });
+
+                // 🤖 ASISTENTE IA: Enviar mensaje de bienvenida al self-chat
+                // Esto crea/surfea el chat "Mensajes a ti mismo" en WhatsApp
+                try {
+                    const myJid = sock.user?.id;
+                    if (myJid) {
+                        // Normalizar JID (quitar device suffix) → "34667789805@s.whatsapp.net"
+                        const myNormalizedJid = myJid.split(':')[0] + '@s.whatsapp.net';
+
+                        // Verificar si ya enviamos el mensaje de bienvenida recientemente (1x por sesión)
+                        const welcomeKey = `ai_welcome_sent:${clientId}`;
+                        const redisCheck = redisClient ? await redisClient.get(welcomeKey) : null;
+
+                        if (!redisCheck) {
+                            console.log(`[🤖 Self-Chat AI] Enviando mensaje de bienvenida a ${myNormalizedJid}...`);
+                            await sock.sendMessage(myNormalizedJid, {
+                                text: `🤖 *OpenClaw AI — Tu Asistente Personal*\n\n¡Hola! Soy tu asistente de inteligencia artificial. Puedes preguntarme cualquier cosa sobre tus contactos, conversaciones y recuerdos.\n\n*Ejemplos:*\n• _¿Quién es Víctor?_\n• _¿De qué hablé con María la semana pasada?_\n• _¿Qué sé sobre el proyecto X?_\n\nTodo lo que me preguntes será procesado usando tu base de conocimiento personal (GraphRAG + Memoria Vectorial).\n\n_Escribe aquí tu primera pregunta_ 👇`
+                            });
+                            console.log(`[🤖 Self-Chat AI] ✅ Mensaje de bienvenida enviado.`);
+
+                            // Marcar como enviado por 24h para no repetir
+                            if (redisClient) {
+                                await redisClient.set(welcomeKey, '1', { EX: 86400 });
+                            }
+                        }
+                    }
+                } catch (welcomeErr) {
+                    console.warn(`[🤖 Self-Chat AI] ⚠️ Error enviando bienvenida:`, welcomeErr.message);
+                }
             }, 6000); // 6s to ensure session is fully ready
         }
     });
@@ -698,23 +727,57 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 // Notificar al worker de memoria (Amnesia Consolidator) en cada interacción
                 await triggerMemoryTimer(clientId);
 
-                if (!isSentByMe) {
-                    // Enviar el mensaje al Cortex (Cerebro) a través de la Cola de BullMQ para auto-respuesta
-                    console.log(`[Queue] 📬 Encolando mensaje a incomingMessagesQueue para ${clientSlug}...`);
-                    await incomingQueue.add('process_message', {
-                        clientId,
-                        clientSlug,
-                        channel: 'whatsapp',
-                        senderId,
-                        text: finalText,
-                        isSentByMe,
-                        metadata: { pushName, isGroup }
-                    }, {
-                        removeOnComplete: true,
-                        removeOnFail: 50 // Guardar los últimos 50 fallidos para debug
-                    });
+                // ====================================================================
+                // 🤖 MODO ASISTENTE PERSONAL (Self-Chat AI)
+                // Solo responde cuando TÚ escribes en tu propio chat ("Mensajes a ti mismo").
+                // Los mensajes de otros contactos se guardan en la DB pero NO se responden.
+                // ====================================================================
+                const myJid = sock.user?.id;
+                const myLid = sock.user?.lid; // Baileys LID (e.g. "159755754573992:45@lid")
+                const myNormalizedJid = myJid?.replace(/:.*@/, '@'); // → "34678688954@s.whatsapp.net"
+                const myNormalizedLid = myLid?.replace(/:.*@/, '@'); // → "159755754573992@lid"
+
+                // Self-chat messages arrive with @lid, so check BOTH formats
+                const isSelfChat = isSentByMe && !isGroup && (
+                    senderId === myNormalizedJid ||
+                    senderId === myNormalizedLid ||
+                    senderId === myJid
+                );
+
+                if (isSentByMe && !isGroup) {
+                    console.log(`[🤖 Self-Chat Debug] senderId=${senderId} | myJid=${myNormalizedJid} | myLid=${myNormalizedLid} | match=${isSelfChat}`);
                 }
 
+                if (isSelfChat) {
+                    // 🛡️ Evitar bucle: No procesar mensajes que el propio bot generó
+                    if (finalText.startsWith('🤖') || finalText.startsWith('[OpenClaw')) {
+                        console.log(`[🤖 Self-Chat AI] ℹ️ Ignorando mensaje propio del bot.`);
+                    } else {
+                        // 🧠 El usuario está hablando consigo mismo → Activar el Asistente IA
+                        console.log(`[🤖 Self-Chat AI] 📬 Pregunta del usuario detectada: "${finalText.slice(0, 60)}..."`);
+
+                        // 🔥 FEEDBACK VISUAL: Mostrar "escribiendo..." inmediatamente
+                        try {
+                            await sock.sendPresenceUpdate('composing', senderId);
+                        } catch (presenceErr) {
+                            console.warn(`[🤖 Self-Chat AI] No se pudo enviar 'composing': ${presenceErr.message}`);
+                        }
+
+                        console.log(`[🤖 Self-Chat AI] Encolando a incomingMessagesQueue para ${clientSlug}...`);
+                        await incomingQueue.add('process_message', {
+                            clientId,
+                            clientSlug,
+                            channel: 'whatsapp',
+                            senderId, // Responderá al propio JID del usuario
+                            text: finalText,
+                            isSentByMe: true,
+                            metadata: { pushName: 'Yo (Asistente)', isGroup: false, isSelfChat: true }
+                        }, {
+                            removeOnComplete: true,
+                            removeOnFail: 50
+                        });
+                    }
+                }
             } catch (handlerErr) {
                 console.error(`[${clientSlug}] 💀 CRITICAL HANDLER ERROR:`, handlerErr.message);
             }
@@ -879,7 +942,11 @@ export async function sendHumanLikeMessage(clientId, jid, content, opts = {}) {
     const sock = activeSessions.get(String(clientId));
     if (!sock) throw new Error('WhatsApp no conectado');
 
-    const text = typeof content === 'string' ? content : (content.text || '');
+    // Normalize: Baileys sendMessage expects { text: '...' }, never a raw string
+    if (typeof content === 'string') {
+        content = { text: content };
+    }
+    const text = content.text || '';
 
     try {
         // 1. Simular "Escribiendo..."
@@ -948,7 +1015,7 @@ export async function fetchHistoricalMedia(clientId, remoteJid, messageId) {
 
     try {
         console.log(`[Lazy Media] 🔍 Buscando BD metadata histórica para ${messageId}...`);
-        
+
         // 1. Obtener los metadatos y las llaves de desencriptado directamente de PostgreSQL
         const { data: records, error } = await supabase
             .from('raw_messages')
@@ -967,7 +1034,7 @@ export async function fetchHistoricalMedia(clientId, remoteJid, messageId) {
         }
 
         const msgContent = metadata.mediaPayload;
-        
+
         // 2. Reconstruir el objeto de mensaje que Baileys espera para desencriptar
         const msgInfo = {
             key: {
@@ -983,7 +1050,7 @@ export async function fetchHistoricalMedia(clientId, remoteJid, messageId) {
 
         const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
         console.log(`[Lazy Media] 📥 Descargando e inyectando buffer multimedia histórico desde Meta (Lazy-Load)...`);
-        
+
         // 3. Descarga y decodifica sobre la marcha sin necesidad de Store en RAM
         const buffer = await downloadMediaMessage(msgInfo, 'buffer', {}, { logger: sock.logger, reuploadRequest: sock.updateMediaMessage });
 
@@ -994,7 +1061,7 @@ export async function fetchHistoricalMedia(clientId, remoteJid, messageId) {
         else if (msgContent.videoMessage) { mediaType = 'video'; mimeType = msgContent.videoMessage.mimetype; }
         else if (msgContent.documentMessage) { mediaType = 'document'; mimeType = msgContent.documentMessage.mimetype; }
         else if (msgContent.stickerMessage) { mediaType = 'sticker'; mimeType = msgContent.stickerMessage.mimetype; }
-        
+
         return { buffer, mediaType, mimeType };
     } catch (e) {
         console.error(`[Lazy Media] Error buscando/descargando media para ${messageId}:`, e.message);
@@ -1021,8 +1088,11 @@ const outgoingWorker = new Worker('outgoingMessagesQueue', async (job) => {
         throw err; // Reintenta según políticas de BullMQ
     }
 }, {
-    connection: (await import('../config/redis.mjs')).default, // Reusa la conexión habitual
-    concurrency: 10 // Puede enviar hasta 10 mensajes en paralelo para evitar embudos
+    connection: new (await import('ioredis')).default({
+        host: process.env.REDIS_HOST || '127.0.0.1',
+        port: process.env.REDIS_PORT || 6379,
+        maxRetriesPerRequest: null,
+    }), concurrency: 10 // Puede enviar hasta 10 mensajes en paralelo para evitar embudos
 });
 
 outgoingWorker.on('failed', (job, err) => {

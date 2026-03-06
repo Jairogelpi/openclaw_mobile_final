@@ -69,6 +69,7 @@ REGLAS DE IDENTIDAD (PROHIBIDO GENÉRICOS):
 1. **IDENTIDADES DE NODO**: Prohibido usar "Usuario", "Contacto", "Él", "Persona", "Interlocutor" o "Anónimo". 
    - SIEMPRE usa "${userName}" y "${contactName}".
    - Si se menciona a alguien sin nombre, usa su rol descriptivo (ej: "Primo de Víctor", "Vendedor de Amazon") o su ID (${remoteId}). Pero NUNCA "Contacto".
+   - **PROHIBIDO** extraer formatos multimedia ("Audio", "Imagen", "Video", "Foto", "Voz", "Documento") como entidades. Ignora los prefijos del sistema y enfócate sólo en la INFORMACIÓN narrada.
 2. **ENTIDADES TÁCITAS**: Extrae miedos, metas, rasgos (ej: "Resiliente", "Obsesivo").
 
 REGLAS DE CONECTIVIDAD (DENSIDAD EXTREMA):
@@ -100,7 +101,7 @@ EXTRAE ESTO:
 Analiza y responde ÚNICAMENTE en JSON ESTRICTO.`;
 
         const response = await groq.chat.completions.create({
-            model: 'llama-3.3-70b-versatile',
+            model: 'llama-3.1-8b-instant',
             messages: [{ role: 'system', content: prompt }, { role: 'user', content: messages.join('\n') }],
             response_format: { type: 'json_object' },
             temperature: 0.0
@@ -137,8 +138,8 @@ async function autonomousDistillation(clientId, clientSlug, messages) {
         const { data: soulRow } = await supabase.from('user_souls').select('soul_json').eq('client_id', clientId).single();
         const currentSoul = soulRow?.soul_json || {};
         const response = await groq.chat.completions.create({
-            model: 'llama-3.3-70b-versatile',
-            messages: [{ role: 'system', content: `Update Soul JSON based on conversation.Accumulate info.\nCURRENT SOUL: ${JSON.stringify(currentSoul)} \nCONVERSATION: \n${messages.map(m => `${m.sender_role}: ${m.content}`).join('\n')} ` }],
+            model: 'llama-3.1-8b-instant',
+            messages: [{ role: 'system', content: `Update Soul JSON based on conversation. Accumulate info.\nCURRENT SOUL: ${JSON.stringify(currentSoul)} \nCONVERSATION: \n${messages.map(m => `${m.sender_role}: ${m.content}`).join('\n')} ` }],
             response_format: { type: 'json_object' }
         });
         const result = cleanJSON(response.choices[0].message.content);
@@ -177,20 +178,64 @@ async function autonomousDistillation(clientId, clientSlug, messages) {
     }
 }
 
+// Helper to fix malformed JSON from LLM
+function repairJson(str) {
+    try {
+        // Try simple cleanup
+        let clean = str.trim();
+        if (clean.includes('```json')) {
+            clean = clean.split('```json')[1].split('```')[0].trim();
+        } else if (clean.includes('```')) {
+            clean = clean.split('```')[1].split('```')[0].trim();
+        }
+
+        // Fix common unclosed JSON issues
+        if (clean.endsWith('}') === false) {
+            // Attempt to count braces and close them
+            const openBraces = (clean.match(/\{/g) || []).length;
+            const closeBraces = (clean.match(/\}/g) || []).length;
+            const openBrackets = (clean.match(/\[/g) || []).length;
+            const closeBrackets = (clean.match(/\]/g) || []).length;
+
+            for (let i = 0; i < (openBrackets - closeBrackets); i++) clean += ']';
+            for (let i = 0; i < (openBraces - closeBraces); i++) clean += '}';
+        }
+
+        return JSON.parse(clean);
+    } catch (e) {
+        console.warn('[RepairJSON] Failed to repair:', e.message);
+        return { entities: [], relationships: [] };
+    }
+}
+
+async function saveGraphData(clientId, graphData) {
+    for (const ent of (graphData.entities || [])) {
+        await upsertKnowledgeNode(clientId, ent.name, ent.type || 'ENTITY', ent.desc || '');
+    }
+    for (const rel of (graphData.relationships || [])) {
+        const weight = rel.weight ? Math.min(10, Math.max(1, Math.round(rel.weight * 10))) : 1;
+        await upsertKnowledgeEdge(clientId, rel.source, rel.target, rel.type, weight, rel.context || '');
+    }
+}
+
+/**
+ * Main Logic for Distillation and Vectorization
+ */
 // === MAIN PROCESS: DISTILL + VECTORIZE + INBOX ===
 export async function distillAndVectorize(clientId) {
     const { data: soulData } = await supabase.from('user_souls').select('slug, soul_json').eq('client_id', clientId).single();
     if (!soulData) return;
     const clientSlug = soulData.slug;
 
-    // Acquire lock
+    // Acquire lock (Temporarily disabled for Antigravity debugging)
+    /*
     const { data: soul2 } = await supabase.from('user_souls').select('is_processing').eq('client_id', clientId).single();
     if (soul2?.is_processing) {
-        console.log(`[Worker] 🔒 Cliente ${clientId} bloqueado.Saltando.`);
+        console.log(`[Worker] 🔒 Cliente ${clientId} bloqueado. Saltando.`);
         return;
     }
-
     await supabase.from('user_souls').update({ is_processing: true, worker_status: '🧠 Procesando...' }).eq('client_id', clientId);
+    */
 
     try {
         let totalProcessedThisRun = 0;
@@ -246,7 +291,7 @@ export async function distillAndVectorize(clientId) {
 
                 const userName = soulData?.soul_json?.nombre || "Usuario Principal";
 
-                const CHUNK_SIZE = 20;
+                const CHUNK_SIZE = 50;
                 const msgCount = conv.raw.length;
 
                 // Preparar todos los chunks
@@ -258,50 +303,59 @@ export async function distillAndVectorize(clientId) {
                     });
                 }
 
-                // Procesar en lotes paralelos (concurrencia de 5) para no saturar APIs
-                const CONCURRENCY_LIMIT = 5;
+                // Procesar en lotes paralelos (concurrencia de 10) para no saturar APIs
+                const CONCURRENCY_LIMIT = 10;
                 for (let b = 0; b < allChunks.length; b += CONCURRENCY_LIMIT) {
                     const batchChunks = allChunks.slice(b, b + CONCURRENCY_LIMIT);
 
                     await Promise.all(batchChunks.map(async ({ chunk, startIndex: i }) => {
-                        const chunkMessages = chunk.map(m => `${m.sender_role}: ${m.content} `);
-                        const chunkText = chunk.map(m => m.content).join('\n');
-                        const lastM = chunk[chunk.length - 1];
+                        // Identity Resolution for the chunk (using conversation-level resolution)
+                        const { remoteId: chunkRemoteId, userName: chunkUserName, contactName: chunkContactName } = { remoteId, userName, contactName };
 
-                        const hasUnread = chunk.some(m => m.metadata?.is_new_unread);
-                        const isHistorical = chunk.every(m => m.metadata?.isHistory);
+                        const chunkText = chunk.map(m => {
+                            // Filter out untranscribed media placeholders to avoid "Audio" entities in Graph
+                            let cleanContent = m.content.replace(/\[Audio:.*?\]/g, '').replace(/\[Imagen:.*?\]/g, '').replace(/\[Video:.*?\]/g, '').trim();
+                            if (!cleanContent) return null; // Skip if only media
+                            return `${m.sender_role}: ${cleanContent}`;
+                        }).filter(Boolean).join('\n');
 
-                        // 1. Inbox Summary
-                        if (i + CHUNK_SIZE >= msgCount || hasUnread) {
-                            try {
-                                const summaryRes = await groq.chat.completions.create({
-                                    model: 'llama-3.1-8b-instant',
-                                    messages: [{ role: 'system', content: 'Crea un titular de 10 palabras max para esta charla.' }, { role: 'user', content: chunkMessages.join('\n') }]
-                                });
-                                const summary = summaryRes.choices[0].message.content.trim();
-                                await supabase.from('inbox_summaries').upsert({
-                                    client_id: clientId, conversation_id: remoteId, summary, last_message_text: lastM.content,
-                                    last_updated: new Date().toISOString(), is_unread: hasUnread
-                                }, { onConflict: 'client_id, conversation_id' });
-                            } catch (e) { }
+                        if (!chunkText) {
+                            console.log(`[Worker] ⏩ [Conv: ${chunkRemoteId}] Chunk ${i / CHUNK_SIZE} saltado (solo contenía media sin transcribir).`);
+                            return;
                         }
 
-                        // 2. Holographic Checkpoint
                         try {
-                            const chunkHeader = `[Fragmento Conversacional(Holograma)][Contacto: ${contactName}][ID: ${remoteId}][Fecha: ${chunk[0]?.created_at || '?'}]\n`;
+                            // 1. GraphRAG Extraction (entities & relations)
+                            console.log(`[Worker] 🕸️ [Conv: ${chunkRemoteId}] Extrayendo grafo para chunk ${i / CHUNK_SIZE}...`);
+                            await processConversationDepth(clientId, chunkRemoteId, chunkUserName, chunkContactName, [chunkText], null, null, null);
+
+                            // 2. Cognitive Depth (Soul Update & Insights) - MOVED OUTSIDE CHUNK LOOP OR CONSOLIDATED
+                            // For massive re-processing, we will do this once per conversation group in the next block to save LLM calls
+
+                        } catch (chunkErr) {
+                            console.error(`[Worker] ❌ [Conv: ${chunkRemoteId}] Error en chunk ${i / CHUNK_SIZE}:`, chunkErr.message);
+                            // No lanzamos error para permitir que el resto de la tanda se procese
+                        }
+
+                        try {
+                            const chunkHeader = `[Fragmento Conversacional(Holograma)][Contacto: ${chunkContactName}][ID: ${chunkRemoteId}][Fecha: ${chunk[0]?.created_at || '?'}]\n`;
                             const enrichedText = chunkHeader + chunkText;
                             const holographicEmbedding = await generateEmbedding(enrichedText);
                             await supabase.from('user_memories').insert({
                                 client_id: clientId, content: enrichedText, sender: 'system_vectorization',
-                                embedding: holographicEmbedding, metadata: { remoteId, contactName, holographic: true, chunkIndex: i / CHUNK_SIZE, date: chunk[0]?.created_at }
+                                embedding: holographicEmbedding, metadata: { remoteId: chunkRemoteId, contactName: chunkContactName, holographic: true, chunkIndex: i / CHUNK_SIZE, date: chunk[0]?.created_at }
                             });
                         } catch (embErr) { }
-
-                        // 3. Deep Extraction (Cíborg 4.0)
-                        if (!isHistorical || hasUnread) {
-                            await processConversationDepth(clientId, remoteId, userName, contactName, chunkMessages, lastM.sender_role, chunkText, lastM.created_at);
-                        }
                     }));
+                }
+
+                // 2. Consolidated Cognitive Depth (Once per conversation per batch)
+                try {
+                    console.log(`[Worker] 🧠 [Conv: ${contactName}] Actualizando profundidad cognitiva consolidada (${msgCount} msgs)...`);
+                    const fullConvText = conv.raw.map(m => `${m.sender_role}: ${m.content}`).join('\n');
+                    await processConversationDepth(clientId, remoteId, userName, contactName, conv.raw.map(m => `${m.sender_role}: ${m.content}`), conv.raw[msgCount - 1].sender_role, fullConvText, conv.raw[msgCount - 1].created_at);
+                } catch (depthErr) {
+                    console.error(`[Worker] ❌ [Conv: ${contactName}] Error en profundidad consolidada:`, depthErr.message);
                 }
             }
 
@@ -310,8 +364,13 @@ export async function distillAndVectorize(clientId) {
                 const chunkIds = allIds.slice(i, i + 100);
                 await supabase.from('raw_messages').update({ processed: true }).in('id', chunkIds);
             }
+            console.log(`[Worker] ✅ ${allIds.length} mensajes marcados como procesados.`);
+
             totalProcessedThisRun += messages.length;
-            await autonomousDistillation(clientId, client.slug, messages.slice(-50));
+
+            console.log(`[Worker] 🍶 Iniciando Destilación Autónoma...`);
+            await autonomousDistillation(clientId, soulData.slug, messages.slice(-50));
+            console.log(`[Worker] ✅ Batch finalizado (Acumulado: ${totalProcessedThisRun})`);
         }
         await invalidateSemanticCache(clientId);
     } catch (e) {

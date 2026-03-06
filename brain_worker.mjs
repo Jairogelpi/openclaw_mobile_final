@@ -2,8 +2,13 @@ import 'dotenv/config';
 import { Worker } from 'bullmq';
 import { incomingQueue, outgoingQueue } from './config/queues.mjs';
 import { processMessage } from './core_engine.mjs';
-import redisClient from './config/redis.mjs';
+import IORedis from 'ioredis';
 
+const redisConnection = new IORedis({
+    host: process.env.REDIS_HOST || '127.0.0.1',
+    port: process.env.REDIS_PORT || 6379,
+    maxRetriesPerRequest: null,
+});
 console.log('🧠 [Brain Worker] Iniciando servicio neuro-cognitivo (AI Microservice)...');
 
 // 1. Instanciar el Worker para la Cola de Entrada
@@ -20,8 +25,22 @@ const brainWorker = new Worker('incomingMessagesQueue', async (job) => {
         // Enviar al Cerebro Principal
         const aiReply = await processMessage(data);
 
-        // Si la IA generó una respuesta válida, se la pasamos al Oído/Boca (WhatsApp)
-        if (aiReply) {
+        // Prefixar respuesta con 🤖 si es self-chat (para distinguir bot de usuario)
+        if (aiReply && data.metadata?.isSelfChat) {
+            const prefixedReply = aiReply.startsWith('🤖') ? aiReply : `🤖 ${aiReply}`;
+            console.log(`[Queue-Out] 🗣️ Empujando respuesta a outgoingMessagesQueue para ${clientSlug}...`);
+            await outgoingQueue.add('send_reply', {
+                clientId,
+                clientSlug,
+                senderId,
+                text: prefixedReply
+            }, {
+                removeOnComplete: true,
+                attempts: 3,
+                backoff: { type: 'exponential', delay: 2000 }
+            });
+            console.log(`[Queue-Out] ✅ Respuesta self-chat encolada para WhatsApp.`);
+        } else if (aiReply) {
             console.log(`[Queue-Out] 🗣️ Empujando respuesta a outgoingMessagesQueue para ${clientSlug}...`);
             await outgoingQueue.add('send_reply', {
                 clientId,
@@ -43,12 +62,16 @@ const brainWorker = new Worker('incomingMessagesQueue', async (job) => {
         throw err; // El trabajo fallará y BullMQ lo reintentará
     }
 }, {
-    connection: redisClient,
-    concurrency: 5 // Este servidor puede "pensar" en 5 respuestas de IA al mismo tiempo
+    connection: redisConnection,
+    concurrency: 1, // Reducido a 1 para evitar asfixiar el CPU con ONNX
+    lockDuration: 300000,   // 5 minutos para que el RAG+LLM complete (aumentado por ONNX freeze)
+    lockRenewTime: 15000,   // Intentar renovar muy frecuentemente
+    stalledInterval: 300000, // 5 min sin heartbeat para considerarlo stalled
+    maxStalledCount: 5       // Permitir hasta 5 stalls antes de fallar permanentemente
 });
 
 brainWorker.on('failed', (job, err) => {
-    console.error(`[BullMQ-Brain] 💥 Job ID ${job.id} falló de forma crítica:`, err.message);
+    console.error(`[BullMQ-Brain] 💥 Job ID ${job?.id} falló de forma crítica:`, err.message);
 });
 
 console.log('🌟 [Brain Worker] Listo y escuchando. Esperando señales en incomingMessagesQueue...');

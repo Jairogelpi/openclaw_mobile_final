@@ -193,7 +193,8 @@ export async function hybridSearch(clientId, queryText, queryVector, matchCount 
     const results = (data || []).map(m => ({
         ...m,
         source: 'HYBRID',
-        remote_id: m.remote_id
+        remote_id: m.remote_id,
+        timestamp: m.timestamp || m.created_at // Estandarizar
     }));
 
     // E. NAME-AWARE SENDER FILTER with ALIAS RESOLUTION
@@ -247,7 +248,7 @@ export async function hybridSearch(clientId, queryText, queryVector, matchCount 
 
             // Also do REVERSE LOOKUP: if "Victor" appears in a network VALUE, add the KEY
             for (const [key, value] of Object.entries(network)) {
-                const valLower = (value || '').toLowerCase();
+                const valLower = String(value || '').toLowerCase();
                 for (const queryName of detectedNames) {
                     if (valLower.includes(queryName.toLowerCase())) {
                         expandedNames.add(key);
@@ -302,11 +303,11 @@ export async function hybridSearch(clientId, queryText, queryVector, matchCount 
 
             // For each detected name, find aliases in the pool
             for (const queryName of detectedNames) {
-                const qLower = queryName.toLowerCase();
+                const qLower = queryName.toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
                 for (const known of allKnownNames) {
                     if (!known) continue;
-                    const kLower = known.toLowerCase().replace(/[🌸🖤💕]/g, '').trim();
-                    // Match if: partial match, or same person different form
+                    const kLower = known.toLowerCase().replace(/[🌸🖤💕]/g, '').trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+                    // Match if: partial match, or same person different form (accent insensitive)
                     if (kLower.includes(qLower) || qLower.includes(kLower) ||
                         kLower.split(' ').some(part => part === qLower) ||
                         qLower.split(' ').some(part => part === kLower)) {
@@ -322,57 +323,52 @@ export async function hybridSearch(clientId, queryText, queryVector, matchCount 
             console.warn('[Name Resolution] Error:', e.message);
         }
 
-        // Search by ALL expanded names (original + aliases)
-        for (const name of expandedNames) {
+        // Search by ALL expanded names (original + aliases) in BATCH to be Lean
+        const nameList = [...expandedNames].map(n => n.replace(/[🌸🖤💕]/g, '').trim()).filter(Boolean);
+
+        if (nameList.length > 0) {
+            console.log(`🔎 [Name Filter] Buscando en lote para ${nameList.length} variaciones...`);
             try {
-                const cleanName = name.replace(/[🌸🖤💕]/g, '').trim();
+                // Batch search for senders
                 const { data: senderMatches } = await supabase
                     .from('user_memories')
                     .select('id, content, sender, metadata')
                     .eq('client_id', clientId)
-                    .ilike('sender', `%${cleanName}%`)
+                    .in('sender', nameList) // Exact match on aliases is much faster than multiple ILIKEs
                     .order('created_at', { ascending: false })
-                    .limit(10);
+                    .limit(20);
 
                 if (senderMatches?.length > 0) {
-                    console.log(`🎯 [Name Filter] Encontrados ${senderMatches.length} recuerdos directos de sender "${cleanName}"`);
                     for (const sm of senderMatches) {
                         if (!results.some(r => r.id === sm.id)) {
-                            results.push({
-                                ...sm,
-                                date: sm.metadata?.dateStart || null,
-                                similarity: 0.9,
-                                source: 'SENDER_FILTER'
-                            });
+                            results.push({ ...sm, similarity: 0.95, source: 'SENDER_BATCH' });
                         }
                     }
                 }
 
-                // Also search content mentioning the name
-                const { data: contentMatches } = await supabase
-                    .from('user_memories')
-                    .select('id, content, sender, metadata')
-                    .eq('client_id', clientId)
-                    .ilike('content', `%${cleanName}%`)
-                    .order('created_at', { ascending: false })
-                    .limit(5);
+                // If results are still low, do a targeted ILIKE only on the primary name
+                const primaryName = detectedNames[0]?.replace(/[🌸🖤💕]/g, '').trim();
+                if (results.length < 5 && primaryName) {
+                    const { data: softMatches } = await supabase
+                        .from('user_memories')
+                        .select('id, content, sender, metadata')
+                        .eq('client_id', clientId)
+                        .ilike('content', `%${primaryName}%`)
+                        .limit(10);
 
-                if (contentMatches?.length > 0) {
-                    for (const cm of contentMatches) {
-                        if (!results.some(r => r.id === cm.id)) {
-                            results.push({
-                                ...cm,
-                                date: cm.metadata?.dateStart || null,
-                                similarity: 0.85,
-                                source: 'CONTENT_NAME_MATCH'
-                            });
+                    if (softMatches) {
+                        for (const sm of softMatches) {
+                            if (!results.some(r => r.id === sm.id)) {
+                                results.push({ ...sm, similarity: 0.8, source: 'CONTENT_PRIMARY_MATCH' });
+                            }
                         }
                     }
                 }
             } catch (e) {
-                console.warn(`[Name Filter] Error buscando "${name}":`, e.message);
+                console.warn(`[Name Filter] Error en búsqueda por lote:`, e.message);
             }
         }
+        console.log(`✅ [Name Filter] Búsqueda finalizada. Resultados: ${results.length}`);
     }
 
     // 2. RECUPERACIÓN DE COMUNIDADES (GraphRAG Level 1)
