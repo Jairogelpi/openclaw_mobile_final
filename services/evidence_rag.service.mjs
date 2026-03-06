@@ -4,6 +4,8 @@ import {
     exactEntityFactSearch,
     exactEntityMemorySearch,
     hybridSearchV2,
+    exactRelationshipSearch,
+    mediaMemorySearch,
     temporalMemorySearch,
     traverseGraphV2
 } from './graph.service.mjs';
@@ -38,6 +40,10 @@ const RELATION_QUERY_EXPANSIONS = {
 
 const SIMPLE_IDENTITY_INTENT_REGEX = /\b(quien es|quien era|quien fue|como se llama|que sabes de|hablame de|dime de)\b/;
 const SIMPLE_FACT_INTENT_REGEX = /\b(donde|vive|trabaja|estudia|edad|cumpleanos|cumpleaños|numero|número|direccion|dirección)\b/;
+
+const SIMPLE_MEDIA_INTENT_REGEX = /\b(audio|nota de voz|voz|foto|imagen|video|documento|pdf|archivo|media)\b/;
+const GENERIC_RELATION_INTENT_REGEX = /\b(que relacion hay entre|que relaci[oÃ³]n hay entre|como se relacionan|relacion entre|relaciona a)\b/;
+const GHOST_NAME_PREFIXES = ['persona fantasma', 'personafantasma', 'ghost person', 'ghostperson'];
 
 async function groqJsonWithTimeout({ systemPrompt, userPrompt }, trace = null, {
     model = 'llama-3.1-8b-instant',
@@ -290,7 +296,7 @@ function fallbackIntent(queryText) {
 function isSimpleExactLookup(queryText, identityMatches = []) {
     const q = normalizeComparableText(queryText);
     if (!q || !identityMatches.length) return false;
-    if (hasTemporalSignal(queryText) || relationFromQuery(queryText)) return false;
+    if (hasTemporalSignal(queryText) || relationFromQueryV2(queryText)) return false;
     return SIMPLE_IDENTITY_INTENT_REGEX.test(q) || SIMPLE_FACT_INTENT_REGEX.test(q);
 }
 
@@ -317,6 +323,79 @@ function relationFromQuery(queryText) {
 function hasTemporalSignal(queryText) {
     const q = normalizeComparableText(queryText);
     return /\b(hoy|ayer|anoche|semana pasada|este mes|lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b/.test(q);
+}
+
+function hasMediaSignal(queryText) {
+    return SIMPLE_MEDIA_INTENT_REGEX.test(normalizeComparableText(queryText));
+}
+
+function fallbackIntentV2(queryText) {
+    const q = normalizeComparableText(queryText);
+    if (/\b(quien es|quiÃ©n es|como se llama|quien era)\b/.test(q)) return 'identity_lookup';
+    if (SIMPLE_MEDIA_INTENT_REGEX.test(q)) return 'media_lookup';
+    if (/\b(madre|padre|novia|novio|pareja|familia|relacion|relaciÃ³n|amigo|conoce)\b/.test(q)) return 'relationship_lookup';
+    if (/\b(ayer|hoy|anoche|semana pasada|martes|miercoles|miÃ©rcoles|jueves|viernes|sabado|sÃ¡bado|domingo)\b/.test(q)) return 'temporal_lookup';
+    if (/\b(trabaja|vive|estudia|cumpleanos|cumpleaÃ±os|edad|numero|nÃºmero|direccion|direcciÃ³n)\b/.test(q)) return 'fact_lookup';
+    return 'exploratory';
+}
+
+function determineFallbackIntentV2(queryText, identityMatches = []) {
+    const q = normalizeComparableText(queryText);
+    if (SIMPLE_MEDIA_INTENT_REGEX.test(q)) return 'media_lookup';
+    if (identityMatches.length) {
+        if (SIMPLE_IDENTITY_INTENT_REGEX.test(q) || /\bque recuerdas de\b/.test(q)) return 'identity_lookup';
+        if (SIMPLE_FACT_INTENT_REGEX.test(q)) return 'fact_lookup';
+    }
+    return fallbackIntentV2(queryText);
+}
+
+function relationFromQueryV2(queryText) {
+    const q = normalizeComparableText(queryText);
+    if (GENERIC_RELATION_INTENT_REGEX.test(q) || /\brelacion\b/.test(q)) return 'ANY_RELATION';
+    if (/\b(madre|padre|hermano|hermana|hijo|hija|familia)\b/.test(q)) return 'FAMILIA_DE';
+    if (/\b(novia|novio|pareja|esposa|esposo)\b/.test(q)) return 'PAREJA_DE';
+    if (/\b(amigo|amistad)\b/.test(q)) return 'AMISTAD';
+    if (/\b(trabaja)\b/.test(q)) return 'TRABAJA_EN';
+    if (/\b(vive)\b/.test(q)) return 'VIVE_EN';
+    if (/\b(estudia)\b/.test(q)) return 'ESTUDIA_EN';
+    return null;
+}
+
+function inferRawEntitiesFromQuery(queryText) {
+    const source = String(queryText || '');
+    if (!source.trim()) return [];
+
+    const patterns = [
+        /\bquien es\s+(.+?)$/i,
+        /\bque sabes de\s+(.+?)$/i,
+        /\bque recuerdas de\s+(.+?)$/i,
+        /\brecuerdas (?:el|la|los|las)?\s*(?:audio|nota de voz|foto|imagen|video|documento|pdf|archivo)?\s*(?:de|sobre)?\s+(.+?)$/i,
+        /\bque paso con\s+(.+?)\s+(?:el|la)?\s*(hoy|ayer|anoche|semana pasada|lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b/i,
+        /\bque relacion hay entre\s+(.+?)\s+y\s+(.+?)$/i,
+        /\bcomo se relacionan\s+(.+?)\s+y\s+(.+?)$/i
+    ];
+
+    const entities = [];
+    for (const pattern of patterns) {
+        const match = source.match(pattern);
+        if (!match) continue;
+        for (const group of match.slice(1)) {
+            const cleaned = String(group || '')
+                .replace(/\b(hoy|ayer|anoche|semana pasada|lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b/gi, '')
+                .replace(/[?!.,"']/g, ' ')
+                .replace(/\s+/g, ' ')
+                .trim();
+            if (cleaned.length >= 2) entities.push(cleaned);
+        }
+    }
+
+    return [...new Set(entities)];
+}
+
+function isGhostName(entity) {
+    const normalized = normalizeComparableText(entity);
+    if (!normalized) return false;
+    return GHOST_NAME_PREFIXES.some(prefix => normalized.startsWith(prefix)) || /fantasma\d+/i.test(entity);
 }
 
 function buildRetrievalQueries(queryText, plan, maxVariants = 4) {
@@ -361,8 +440,13 @@ function buildRetrievalQueries(queryText, plan, maxVariants = 4) {
         if (entitySpan) addVariant(`${entitySpan} ${plan.temporal_window.label}`);
     }
 
-    if (plan.intent === 'relationship_lookup' && (plan.entities || []).length >= 2) {
+    if ((plan.intent === 'relationship_lookup' || plan.intent === 'media_lookup') && (plan.entities || []).length >= 2) {
         addVariant((plan.entities || []).join(' '));
+    }
+
+    if (plan.intent === 'media_lookup') {
+        const entitySpan = (plan.entities || []).join(' ').trim();
+        if (entitySpan) addVariant(`${entitySpan} audio foto video`);
     }
 
     return variants.slice(0, Math.max(1, maxVariants));
@@ -413,7 +497,7 @@ export async function buildRagQueryPlan(clientId, userQuery, trace = null) {
 
 Devuelve SOLO JSON con:
 {
-  "intent": "identity_lookup|relationship_lookup|fact_lookup|temporal_lookup|exploratory",
+  "intent": "identity_lookup|relationship_lookup|fact_lookup|temporal_lookup|media_lookup|exploratory",
   "entities": ["nombre canonico"],
   "temporal_window": { "label": "string", "start": "ISO8601|null", "end": "ISO8601|null" } | null,
   "relation_filter": "string|null",
@@ -428,6 +512,7 @@ Reglas:
 - Para preguntas sobre personas, activa need_exact_entity_match.
 - Para preguntas temporales, rellena temporal_window si se puede inferir.
  - Para preguntas relacionales, usa relation_filter si procede.
+ - Para preguntas sobre audios, fotos, videos o documentos, usa intent=media_lookup y evita graph hops.
 
 Ejemplo valido:
 {
@@ -446,12 +531,15 @@ Responde solo con el JSON del plan.`;
 
     const fallbackPlan = {
         ...DEFAULT_PLAN,
-        intent: determineFallbackIntent(userQuery, identityMatches),
-        entities: identityMatches.map(match => match.canonical_name).slice(0, 3),
+        intent: determineFallbackIntentV2(userQuery, identityMatches),
+        entities: [...new Set([
+            ...identityMatches.map(match => match.canonical_name),
+            ...inferRawEntitiesFromQuery(userQuery)
+        ])].slice(0, 3),
         temporal_window: inferTemporalWindowStable(userQuery) || inferTemporalWindow(userQuery),
-        relation_filter: relationFromQuery(userQuery),
-        need_exact_entity_match: identityMatches.length > 0,
-        allow_graph_hops: true,
+        relation_filter: relationFromQueryV2(userQuery),
+        need_exact_entity_match: identityMatches.length > 0 || inferRawEntitiesFromQuery(userQuery).length > 0,
+        allow_graph_hops: !hasMediaSignal(userQuery),
         allow_web: false
     };
 
@@ -477,15 +565,28 @@ Responde solo con el JSON del plan.`;
         nextPlan.temporal_window = deterministicTemporalWindow;
     }
     if (!nextPlan.relation_filter) {
-        nextPlan.relation_filter = relationFromQuery(userQuery);
+        nextPlan.relation_filter = relationFromQueryV2(userQuery);
     }
     if ((!nextPlan.entities || !nextPlan.entities.length) && identityMatches.length) {
         nextPlan.entities = identityMatches.map(match => match.canonical_name).slice(0, 3);
+    }
+    if ((!nextPlan.entities || !nextPlan.entities.length)) {
+        nextPlan.entities = inferRawEntitiesFromQuery(userQuery).slice(0, 3);
     }
     nextPlan.need_exact_entity_match = Boolean(nextPlan.need_exact_entity_match || nextPlan.entities?.length || identityMatches.length);
     if (isSimpleExactLookup(userQuery, identityMatches)) {
         nextPlan.intent = SIMPLE_FACT_INTENT_REGEX.test(normalizeComparableText(userQuery)) ? 'fact_lookup' : 'identity_lookup';
         nextPlan.allow_graph_hops = false;
+    }
+    if (hasMediaSignal(userQuery)) {
+        nextPlan.intent = 'media_lookup';
+        nextPlan.allow_graph_hops = false;
+    }
+    if (GENERIC_RELATION_INTENT_REGEX.test(normalizeComparableText(userQuery)) && (nextPlan.entities || []).length >= 2) {
+        nextPlan.intent = 'relationship_lookup';
+        nextPlan.allow_graph_hops = false;
+        nextPlan.need_exact_entity_match = true;
+        nextPlan.relation_filter = 'ANY_RELATION';
     }
 
     const identityMap = await resolveIdentityNames(clientId, nextPlan.entities || []).catch(() => new Map());
@@ -501,12 +602,19 @@ async function collectGraphRecall(clientId, queryText, queryVector, plan, maxCan
     const graphCandidates = await traverseGraphV2(clientId, queryText, queryVector, maxCandidates).catch(() => []);
     return graphCandidates.filter(candidate => {
         if (!plan.allow_graph_hops && candidate.hop > 1) return false;
-        if (plan.relation_filter && candidate.relation_type) {
+        if (plan.relation_filter && plan.relation_filter !== 'ANY_RELATION' && candidate.relation_type) {
             const relation = normalizeComparableText(candidate.relation_type);
             const expected = normalizeComparableText(plan.relation_filter);
             if (!relation.includes(expected) && !expected.includes(relation)) {
                 return false;
             }
+        }
+        if (plan.intent === 'relationship_lookup' && (plan.entities || []).length >= 2) {
+            const nodes = [candidate.metadata?.source_node, candidate.metadata?.target_node, candidate.metadata?.entity_name]
+                .filter(Boolean)
+                .map(value => normalizeComparableText(value));
+            const required = (plan.entities || []).slice(0, 2).map(value => normalizeComparableText(value));
+            if (!required.every(entity => nodes.some(node => node === entity))) return false;
         }
         return true;
     });
@@ -524,6 +632,9 @@ function hasDirectFactSupport(plan, factCandidates = []) {
 
     if (plan.relation_filter) {
         const expected = normalizeComparableText(plan.relation_filter);
+        if (expected === 'any_relation') {
+            return directFacts.some(candidate => Boolean(candidate.relation_type || candidate.metadata?.relation_type));
+        }
         return directFacts.some(candidate => {
             const relation = normalizeComparableText(candidate.relation_type || candidate.metadata?.relation_type || '');
             return relation && (relation.includes(expected) || expected.includes(relation));
@@ -534,6 +645,9 @@ function hasDirectFactSupport(plan, factCandidates = []) {
 }
 
 function filterFactCandidatesForPlan(plan, factCandidates = []) {
+    if (plan?.intent === 'media_lookup') {
+        return (factCandidates || []).filter(candidate => !['owner_identity', 'contact_identity', 'knowledge_node'].includes(candidate.metadata?.fact_type));
+    }
     if (!plan?.temporal_window) return factCandidates;
     return (factCandidates || []).filter(candidate => !['owner_identity', 'contact_identity'].includes(candidate.metadata?.fact_type));
 }
@@ -555,8 +669,24 @@ export async function collectEvidenceCandidates(clientId, queryText, queryVector
     const maxQueryVariants = Number(await getConfig('rag_max_query_variants')) || 4;
     const rerankerEnabled = await getConfig('rag_reranker_enabled');
     const entities = plan.entities || [];
+    const rawEntityMatches = await detectIdentityMatchesFromQueryFast(clientId, queryText).catch(() => []);
+    const strictUnknownExactLookup = Boolean(
+        plan.need_exact_entity_match &&
+        ['identity_lookup', 'fact_lookup', 'media_lookup'].includes(plan.intent) &&
+        entities.length &&
+        rawEntityMatches.length === 0
+    );
+    const ghostOnlyExactLookup = Boolean(
+        plan.need_exact_entity_match &&
+        entities.length &&
+        rawEntityMatches.length === 0 &&
+        entities.every(entity => isGhostName(entity))
+    );
     const rawFactCandidates = plan.need_exact_entity_match && entities.length
         ? await exactEntityFactSearch(clientId, entities, Math.min(ragMaxCandidates, 12)).catch(() => [])
+        : [];
+    const relationshipCandidates = plan.intent === 'relationship_lookup' && entities.length >= 2
+        ? await exactRelationshipSearch(clientId, entities, Math.min(ragMaxCandidates, 10)).catch(() => [])
         : [];
     const factCandidates = filterFactCandidatesForPlan(plan, rawFactCandidates);
     const exactLookupMode = Boolean(
@@ -568,17 +698,23 @@ export async function collectEvidenceCandidates(clientId, queryText, queryVector
     const temporalCandidates = plan.temporal_window
         ? await temporalMemorySearch(clientId, plan.temporal_window, entities, ragMaxCandidates).catch(() => [])
         : [];
+    const mediaCandidates = plan.intent === 'media_lookup'
+        ? await mediaMemorySearch(clientId, entities, queryText, Math.min(ragMaxCandidates, 12)).catch(() => [])
+        : [];
     const fastPathTemporal = hasDirectTemporalSupport(plan, temporalCandidates);
-    const queryVariants = (queryExpansionEnabled && !fastPathStructured && !fastPathTemporal)
+    const fastPathRelationship = plan.intent === 'relationship_lookup' && relationshipCandidates.some(candidate => candidate.directness === 'direct');
+    const fastPathMedia = plan.intent === 'media_lookup' && mediaCandidates.some(candidate => candidate.directness === 'direct');
+    const strictRelationshipLookup = Boolean(plan.intent === 'relationship_lookup' && entities.length >= 2);
+    const queryVariants = (queryExpansionEnabled && !fastPathStructured && !fastPathTemporal && !fastPathRelationship && !fastPathMedia && !ghostOnlyExactLookup && !strictUnknownExactLookup && !strictRelationshipLookup)
         ? buildRetrievalQueries(queryText, plan, maxQueryVariants)
         : buildRetrievalQueries(queryText, plan, 2);
     const perVariantCount = Math.max(5, Math.ceil(ragMaxCandidates / Math.max(queryVariants.length, 1)) + 1);
 
-    const exactCandidates = (!fastPathStructured && !fastPathTemporal && plan.need_exact_entity_match && entities.length)
+    const exactCandidates = (!fastPathStructured && !fastPathTemporal && !fastPathRelationship && !fastPathMedia && !ghostOnlyExactLookup && plan.need_exact_entity_match && entities.length)
         ? await exactEntityMemorySearch(clientId, entities, ragMaxCandidates).catch(() => [])
         : [];
 
-    const semanticCandidates = (fastPathStructured || fastPathTemporal)
+    const semanticCandidates = (fastPathStructured || fastPathTemporal || fastPathRelationship || fastPathMedia || ghostOnlyExactLookup || strictUnknownExactLookup || strictRelationshipLookup)
         ? []
         : await collectHybridRecall(
             clientId,
@@ -589,7 +725,7 @@ export async function collectEvidenceCandidates(clientId, queryText, queryVector
         ).catch(() => []);
 
     const graphCandidates = [];
-    if (!fastPathStructured && !fastPathTemporal) {
+    if (!fastPathStructured && !fastPathTemporal && !fastPathRelationship && !fastPathMedia && !ghostOnlyExactLookup && !strictUnknownExactLookup && !strictRelationshipLookup) {
         const graphQueryVariants = queryVariants.slice(0, Math.min(exactLookupMode ? 1 : 2, queryVariants.length));
         for (const variant of graphQueryVariants) {
             const rows = await collectGraphRecall(
@@ -608,8 +744,10 @@ export async function collectEvidenceCandidates(clientId, queryText, queryVector
 
     const merged = dedupeCandidates([
         ...factCandidates,
+        ...relationshipCandidates,
         ...exactCandidates,
         ...temporalCandidates,
+        ...mediaCandidates,
         ...semanticCandidates,
         ...graphCandidates
     ]);
@@ -621,7 +759,7 @@ export async function collectEvidenceCandidates(clientId, queryText, queryVector
             plan,
             candidates: merged,
             maxCandidates: ragMaxCandidates,
-            semanticEnabled: Boolean(semanticRerankEnabled && !fastPathStructured && !fastPathTemporal),
+            semanticEnabled: Boolean(semanticRerankEnabled && !fastPathStructured && !fastPathTemporal && !fastPathRelationship && !fastPathMedia && !ghostOnlyExactLookup && !strictUnknownExactLookup && !strictRelationshipLookup),
             semanticMaxCandidates: semanticRerankMaxCandidates
         })
         : merged
@@ -723,9 +861,16 @@ function buildDeterministicClaims(plan, directCandidates) {
                     return 9;
                 }
                 if (plan.relation_filter) {
+                    if (candidate.source_kind === 'fact' && candidate.metadata?.fact_type === 'relationship_edge') return 0;
                     if (candidate.source_kind === 'graph_edge') return 0;
                     if (candidate.source_kind === 'fact' && candidate.metadata?.relation_type) return 1;
                     if (candidate.source_kind === 'memory_chunk') return 2;
+                    if (candidate.source_kind === 'graph_node') return 3;
+                }
+                if (plan.intent === 'media_lookup') {
+                    if (candidate.source_kind === 'memory_chunk') return 0;
+                    if (candidate.source_kind === 'fact') return 1;
+                    if (candidate.source_kind === 'graph_edge') return 2;
                     if (candidate.source_kind === 'graph_node') return 3;
                 }
                 if (candidate.source_kind === 'fact' && candidate.metadata?.owner_identity) return 0;
@@ -757,6 +902,9 @@ function buildDeterministicClaims(plan, directCandidates) {
         } else if (candidate.source_kind === 'graph_node' && candidate.metadata?.context && candidate.metadata?.entity_name) {
             text = normalizeSentence(`${candidate.metadata.entity_name}: ${candidate.metadata.context}`);
         } else if (plan.temporal_window && candidate.source_kind === 'memory_chunk') {
+            const prefix = candidate.timestamp ? `${String(candidate.timestamp).slice(0, 10)}: ` : '';
+            text = normalizeSentence(`${prefix}${extractMemorySnippet(candidate.evidence_text, candidate.speaker)}`, 180);
+        } else if (plan.intent === 'media_lookup' && candidate.source_kind === 'memory_chunk') {
             const prefix = candidate.timestamp ? `${String(candidate.timestamp).slice(0, 10)}: ` : '';
             text = normalizeSentence(`${prefix}${extractMemorySnippet(candidate.evidence_text, candidate.speaker)}`, 180);
         }

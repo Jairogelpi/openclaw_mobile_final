@@ -642,6 +642,151 @@ export async function temporalMemorySearch(clientId, temporalWindow, entityNames
         }, { source: 'TEMPORAL_MEMORY' }));
 }
 
+export async function mediaMemorySearch(clientId, entityNames = [], queryText = '', matchCount = 12) {
+    const lookup = await buildEntityLookupContext(clientId, entityNames);
+    const rowsPerPass = Math.max(matchCount * 80, 1200);
+    const mediaTerms = [...new Set([
+        'audio',
+        'nota de voz',
+        'voz',
+        'voice',
+        'foto',
+        'imagen',
+        'image',
+        'video',
+        'clip',
+        'documento',
+        'pdf',
+        ...String(queryText || '')
+            .split(/\s+/)
+            .map(token => normalizeComparableText(token))
+            .filter(Boolean)
+    ])];
+
+    try {
+        const { data: rows, error } = await supabase
+            .from('user_memories')
+            .select('id, content, sender, metadata, created_at')
+            .eq('client_id', clientId)
+            .order('created_at', { ascending: false })
+            .limit(rowsPerPass);
+
+        if (error) throw error;
+
+        const remoteIdSet = new Set(lookup.remoteIdList);
+        return (rows || [])
+            .filter(row => {
+                const haystack = normalizeComparableText([
+                    row.sender,
+                    row.content,
+                    row.metadata?.contactName,
+                    row.metadata?.canonicalSenderName,
+                    row.metadata?.mediaType,
+                    row.metadata?.attachmentType,
+                    row.metadata?.attachmentMime,
+                    row.metadata?.caption
+                ].filter(Boolean).join(' '));
+
+                if (!haystack) return false;
+                const hasMediaSignal = mediaTerms.some(term => term && haystack.includes(term));
+                if (!hasMediaSignal) return false;
+
+                if (!lookup.aliasList.length && !remoteIdSet.size) return true;
+
+                const remoteId = row.metadata?.remoteId || row.metadata?.remote_id || row.metadata?.participantJid || null;
+                if (remoteIdSet.has(remoteId)) return true;
+
+                return [...lookup.normalizedAliases].some(alias => haystack.includes(alias));
+            })
+            .slice(0, matchCount)
+            .map(row => toMemoryEvidenceCandidate({
+                ...row,
+                remote_id: row.metadata?.remoteId || null,
+                timestamp: getEventTimestamp(row),
+                score_vector: 0.78,
+                score_fts: 0.92,
+                recall_score: 0.94
+            }, { source: 'MEDIA_MEMORY' }));
+    } catch (error) {
+        console.warn('[Graph Service] mediaMemorySearch skipped:', error.message);
+        return [];
+    }
+}
+
+export async function exactRelationshipSearch(clientId, entityNames = [], matchCount = 10) {
+    const lookup = await buildEntityLookupContext(clientId, entityNames);
+    const canonicalEntities = [...new Set([
+        ...lookup.names,
+        ...lookup.identityMatches.map(row => row.canonical_name)
+    ].map(value => String(value || '').trim()).filter(Boolean))].slice(0, 3);
+
+    if (canonicalEntities.length < 2) return [];
+
+    try {
+        const pairs = [];
+        for (let i = 0; i < canonicalEntities.length; i += 1) {
+            for (let j = i + 1; j < canonicalEntities.length; j += 1) {
+                pairs.push([canonicalEntities[i], canonicalEntities[j]]);
+            }
+        }
+
+        const results = [];
+        const seen = new Set();
+        const pushCandidate = candidate => {
+            if (!candidate?.source_id || seen.has(candidate.source_id)) return;
+            seen.add(candidate.source_id);
+            results.push(candidate);
+        };
+
+        for (const [left, right] of pairs.slice(0, 3)) {
+            const queries = await Promise.all([
+                supabase
+                    .from('knowledge_edges')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight')
+                    .eq('client_id', clientId)
+                    .eq('source_node', left)
+                    .eq('target_node', right)
+                    .order('last_seen', { ascending: false })
+                    .limit(6),
+                supabase
+                    .from('knowledge_edges')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight')
+                    .eq('client_id', clientId)
+                    .eq('source_node', right)
+                    .eq('target_node', left)
+                    .order('last_seen', { ascending: false })
+                    .limit(6)
+            ]);
+
+            for (const queryResult of queries) {
+                for (const edge of (queryResult.data || [])) {
+                    pushCandidate(toFactEvidenceCandidate({
+                        fact_type: 'relationship_edge',
+                        source_id: `relationship_edge:${edge.source_node}:${edge.relation_type}:${edge.target_node}`,
+                        entity_name: edge.source_node,
+                        speaker: edge.source_node,
+                        timestamp: edge.last_seen || null,
+                        relation_type: edge.relation_type,
+                        source_node: edge.source_node,
+                        target_node: edge.target_node,
+                        evidence_text: `${edge.source_node} tiene relacion ${edge.relation_type} con ${edge.target_node}.`,
+                        metadata: {
+                            context: edge.context || null,
+                            weight: edge.weight || null
+                        },
+                        recall_score: 0.985
+                    }, { source: 'RELATIONSHIP_EDGE_EXACT' }));
+                }
+            }
+        }
+
+        return results.slice(0, matchCount);
+    } catch (error) {
+        console.warn('[Graph Service] exactRelationshipSearch skipped:', error.message);
+        return [];
+    }
+}
+
 export async function hybridSearch(clientId, queryText, queryVector, matchCount = 10) {
     const { data, error } = await supabase.rpc('hybrid_search_memories', {
         query_text: queryText,
