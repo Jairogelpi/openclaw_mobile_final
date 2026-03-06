@@ -20,6 +20,8 @@ module.exports = {
             max_memory_restart: '4G',
             env: {
                 NODE_ENV: "production",
+                OPENCLAW_EMBEDDER_KEEP_WARM: "true",
+                OPENCLAW_EMBEDDER_TTL_MS: "3600000",
             }
         },
         {
@@ -31,6 +33,8 @@ module.exports = {
             max_memory_restart: '1G',
             env: {
                 NODE_ENV: "production",
+                OPENCLAW_EMBEDDER_KEEP_WARM: "true",
+                OPENCLAW_EMBEDDER_TTL_MS: "3600000",
             }
         },
         {
