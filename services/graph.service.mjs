@@ -586,6 +586,7 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
             const aliases = [...new Set((row.aliases || []).filter(isMeaningfulAlias))].slice(0, 4);
             const aliasSuffix = aliases.length ? ` Alias confirmados: ${aliases.join(', ')}.` : '';
             const isOwnerIdentity = row.remote_id === 'self' || row.source_details?.owner_identity;
+            const isGroupIdentity = String(row.remote_id || '').endsWith('@g.us');
             pushResult(toFactEvidenceCandidate({
                 fact_type: 'contact_identity',
                 source_id: `contact_identity:${row.remote_id}`,
@@ -595,11 +596,14 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
                 timestamp: row.last_verified_at || row.updated_at || row.created_at || null,
                 evidence_text: isOwnerIdentity
                     ? `${row.canonical_name} es el titular de esta memoria.`
-                    : `${row.canonical_name} es un contacto identificado en tu memoria.${aliasSuffix}`,
+                    : (isGroupIdentity
+                        ? `${row.canonical_name} es un grupo identificado en tu memoria.${aliasSuffix}`
+                        : `${row.canonical_name} es un contacto identificado en tu memoria.${aliasSuffix}`),
                 metadata: {
                     aliases,
                     confidence: row.confidence,
-                    owner_identity: isOwnerIdentity
+                    owner_identity: isOwnerIdentity,
+                    identity_kind: isGroupIdentity ? 'group' : 'contact'
                 },
                 recall_score: 0.99
             }, { source: 'CONTACT_IDENTITY' }));
