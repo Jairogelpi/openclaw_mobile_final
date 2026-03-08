@@ -327,6 +327,46 @@ function sanitizeIdentityRow(row) {
     };
 }
 
+function normalizedAliasSignature(values = []) {
+    return JSON.stringify(
+        (values || [])
+            .map(value => normalizeComparableText(value))
+            .filter(Boolean)
+            .sort()
+    );
+}
+
+async function synchronizeSanitizedIdentityRows(clientId) {
+    const rows = await getIdentityRows(clientId);
+    let updated = 0;
+
+    for (const row of rows) {
+        const sanitized = sanitizeIdentityRow(row);
+        const sameCanonical = normalizeComparableText(sanitized.canonical_name) === normalizeComparableText(row.canonical_name);
+        const sameAliases = normalizedAliasSignature(sanitized.aliases) === normalizedAliasSignature(row.aliases || []);
+        if (sameCanonical && sameAliases) continue;
+
+        const { error } = await supabase
+            .from('contact_identities')
+            .update({
+                canonical_name: sanitized.canonical_name,
+                normalized_name: sanitized.normalized_name,
+                aliases: sanitized.aliases,
+                updated_at: new Date().toISOString()
+            })
+            .eq('client_id', clientId)
+            .eq('remote_id', row.remote_id);
+
+        if (!error) updated += 1;
+    }
+
+    if (updated > 0) {
+        identityRowsCache.delete(clientId);
+    }
+
+    return updated;
+}
+
 function setIdentityRowsCache(clientId, rows = []) {
     identityRowsCache.set(clientId, {
         at: Date.now(),
@@ -659,6 +699,10 @@ export async function hydrateContactIdentities(clientId, { force = false } = {})
             { [signal.source]: true }
         );
     }
+
+    await synchronizeSanitizedIdentityRows(clientId).catch(error => {
+        console.warn('[Identity Registry] sanitize sync skipped:', error.message);
+    });
 
     registryCache.set(clientId, Date.now());
     identityRowsCache.delete(clientId);
