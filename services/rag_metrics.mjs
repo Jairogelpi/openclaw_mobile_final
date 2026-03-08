@@ -11,6 +11,11 @@ function sanitizeString(value) {
     return safe.trim();
 }
 
+function sanitizeJsonKey(key) {
+    const cleaned = sanitizeString(key).replace(/[^\w.-]/g, '_').slice(0, 80);
+    return cleaned || 'unknown_key';
+}
+
 function sanitizeJsonValue(value, depth = 0) {
     if (depth > 6) return null;
     if (value == null) return null;
@@ -26,11 +31,73 @@ function sanitizeJsonValue(value, depth = 0) {
         const next = {};
         for (const [key, nestedValue] of Object.entries(value)) {
             const sanitized = sanitizeJsonValue(nestedValue, depth + 1);
-            if (sanitized !== undefined) next[key] = sanitized;
+            if (sanitized !== undefined) next[sanitizeJsonKey(key)] = sanitized;
         }
         return next;
     }
     return sanitizeString(value);
+}
+
+function toTransportSafeJson(value) {
+    try {
+        return JSON.parse(JSON.stringify(value));
+    } catch (error) {
+        return JSON.parse(JSON.stringify(sanitizeJsonValue(value)));
+    }
+}
+
+async function tryDiagnosticInsert(row) {
+    const { data, error } = await supabase
+        .from('rag_metrics')
+        .insert([row])
+        .select('id')
+        .limit(1);
+
+    if (error) return { ok: false, error: error.message };
+
+    const insertedId = data?.[0]?.id || null;
+    if (insertedId) {
+        await supabase.from('rag_metrics').delete().eq('id', insertedId);
+    }
+
+    return { ok: true };
+}
+
+async function diagnoseInvalidJsonRow(row) {
+    try {
+        const baseProbe = await tryDiagnosticInsert({
+            ...row,
+            metadata: null
+        });
+
+        if (!baseProbe.ok) {
+            console.warn(`[RAG Metrics] Diagnóstico: el payload falla incluso sin metadata (${baseProbe.error}).`);
+            return;
+        }
+
+        const metadata = row.metadata || {};
+        const failingKeys = [];
+
+        for (const [key, value] of Object.entries(metadata)) {
+            const probe = await tryDiagnosticInsert({
+                ...row,
+                metadata: { [key]: value }
+            });
+
+            if (!probe.ok) {
+                failingKeys.push(`metadata.${key} (${probe.error})`);
+            }
+        }
+
+        if (failingKeys.length) {
+            console.warn(`[RAG Metrics] Diagnóstico: campos conflictivos detectados -> ${failingKeys.join(', ')}`);
+            return;
+        }
+
+        console.warn('[RAG Metrics] Diagnóstico: ningún campo individual falla; el problema parece estar en una combinación de metadata.');
+    } catch (error) {
+        console.warn('[RAG Metrics] Diagnóstico no crítico:', error.message);
+    }
 }
 
 export function startRagTrace(clientId, query) {
@@ -154,7 +221,7 @@ export function startRagTrace(clientId, query) {
         async finish(response) {
             this.timing.total = Date.now() - this._startTime;
 
-            const row = sanitizeJsonValue({
+            const row = toTransportSafeJson(sanitizeJsonValue({
                 client_id: this.client_id,
                 query: this.query,
                 mode: this.mode,
@@ -188,16 +255,17 @@ export function startRagTrace(clientId, query) {
                     timing_breakdown: this.timing,
                     response_preview: sanitizeString(response).slice(0, 200)
                 }
-            });
+            }));
 
             try {
-                const { data, error } = await supabase.from('rag_metrics').insert(row).select();
+                const { data, error } = await supabase.from('rag_metrics').insert([row]).select();
                 if (!error) {
                     console.log(`[RAG Metrics] Trace guardado: ${this.confidence_level} | ${this.hybrid_count}H+${this.graph_count}G | ${this.timing.total}ms | ${this.llm_calls_count} LLM calls`);
                     return data?.[0] || row;
                 }
 
                 console.warn('[RAG Metrics] Error persistiendo metricas:', error.message);
+                await diagnoseInvalidJsonRow(row);
             } catch (error) {
                 console.warn('[RAG Metrics] Error no critico:', error.message);
             }

@@ -922,6 +922,50 @@ function extractMediaSnippet(text, speaker = null, maxLength = 180) {
     return extractMemorySnippet(text, speaker, maxLength);
 }
 
+function inferMediaKind(candidate) {
+    const source = normalizeComparableText([
+        ...(candidate?.metadata?.mediaMatchedTerms || []),
+        candidate?.metadata?.mediaType,
+        candidate?.metadata?.attachmentType,
+        candidate?.metadata?.attachmentMime,
+        candidate?.metadata?.mediaSnippet,
+        candidate?.evidence_text
+    ].filter(Boolean).join(' '));
+
+    if (/\b(foto|imagen|image)\b/.test(source)) return 'foto';
+    if (/\b(video|clip)\b/.test(source)) return 'video';
+    if (/\b(documento|pdf|archivo)\b/.test(source)) return 'documento';
+    return 'audio';
+}
+
+function extractSpeakersFromDialog(snippet = '') {
+    const matches = [...String(snippet || '').matchAll(/(?:^|\s)([^:\n]{2,40}):/g)];
+    return [...new Set(matches
+        .map(match => normalizeSentence(match[1], 40))
+        .filter(Boolean)
+        .filter(label => normalizeComparableText(label).split(' ').length <= 4))].slice(0, 2);
+}
+
+function buildMediaClaimText(candidate) {
+    const mediaKind = inferMediaKind(candidate);
+    const snippet = String(candidate?.metadata?.mediaSnippet || '').trim() || extractMediaSnippet(candidate?.evidence_text, candidate?.speaker, 180);
+    const speakers = (candidate?.metadata?.mediaParticipants || []).length
+        ? candidate.metadata.mediaParticipants.slice(0, 2)
+        : extractSpeakersFromDialog(snippet);
+    const datePrefix = candidate?.timestamp ? `El ${String(candidate.timestamp).slice(0, 10)}` : 'En tus recuerdos';
+
+    if (speakers.length >= 2) {
+        return `${datePrefix} aparece una conversación sobre un ${mediaKind} entre ${speakers[0]} y ${speakers[1]}.`;
+    }
+    if (speakers.length === 1) {
+        return `${datePrefix} ${speakers[0]} menciona un ${mediaKind}.`;
+    }
+    if (candidate?.speaker) {
+        return `${datePrefix} ${candidate.speaker} menciona un ${mediaKind}.`;
+    }
+    return `${datePrefix} aparece un recuerdo sobre un ${mediaKind}.`;
+}
+
 function humanizeRelationType(relationType) {
     const normalized = normalizeComparableText(String(relationType || '').replace(/[\[\]]/g, ' '));
     if (!normalized) return 'tiene relacion con';
@@ -981,10 +1025,8 @@ function buildDeterministicClaims(plan, directCandidates) {
             if (mediaCandidates.length) {
                 const citationLabels = [...new Set(mediaCandidates.map(candidate => candidate.citation_label))].slice(0, 2);
                 const lead = mediaCandidates[0];
-                const snippet = String(lead.metadata?.mediaSnippet || '').trim() || extractMediaSnippet(lead.evidence_text, lead.speaker, 160);
-                const prefix = lead.timestamp ? `${String(lead.timestamp).slice(0, 10)}: ` : '';
                 return [{
-                    text: normalizeSentence(`${prefix}${snippet}`, 180),
+                    text: normalizeSentence(buildMediaClaimText(lead), 180),
                     citations: citationLabels
                 }];
         }

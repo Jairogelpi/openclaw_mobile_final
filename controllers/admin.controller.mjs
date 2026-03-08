@@ -8,8 +8,29 @@ import redisClient from '../config/redis.mjs';
 import { processMessage } from '../core_engine.mjs';
 import { getAggregatedMetrics } from '../services/rag_metrics.mjs';
 import { getAllConfig, setConfig } from '../services/config.service.mjs';
+import { adminNeuralQueue } from '../config/queues.mjs';
 
 const execPromise = util.promisify(exec);
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function waitForAdminNeuralResult(requestId, timeoutMs = 35000) {
+    if (!requestId || !redisClient) return null;
+
+    const startedAt = Date.now();
+    while ((Date.now() - startedAt) < timeoutMs) {
+        const payload = await redisClient.get(`admin_neural_result:${requestId}`);
+        if (payload) {
+            await redisClient.del(`admin_neural_result:${requestId}`).catch(() => null);
+            return JSON.parse(payload);
+        }
+        await sleep(150);
+    }
+
+    return null;
+}
 
 export async function adminHealthDashboard(req, res, activeSessions) {
     const token = req.query.token;
@@ -522,18 +543,40 @@ export async function adminNeuralChat(req, res) {
         // Fetch slug for the client
         const { data: soul } = await supabase.from('user_souls').select('slug').eq('client_id', clientId).single();
         const clientSlug = soul?.slug || 'unknown';
-
-        console.log(`🧠 [Neural Terminal] Testing for ${clientId} (${clientSlug}): "${text.slice(0, 30)}..."`);
-        const reply = await processMessage({
+        const requestId = `admin_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+        const payload = {
             clientId,
             clientSlug,
             text,
             senderId: remoteId || 'terminal-admin',
             pushName: 'Admin Debugger',
-            channel: 'terminal'
-        });
+            channel: 'terminal',
+            adminRequestId: requestId,
+            metadata: {
+                adminProbe: true
+            }
+        };
 
-        // Fetch latest RAG trace for this client to show in the dashboard
+        console.log(`🧠 [Neural Terminal] Testing for ${clientId} (${clientSlug}): "${text.slice(0, 30)}..."`);
+        if (adminNeuralQueue && redisClient) {
+            await adminNeuralQueue.add('admin_probe', payload, {
+                jobId: requestId,
+                removeOnComplete: true,
+                attempts: 1
+            });
+
+            const result = await waitForAdminNeuralResult(requestId, 35000);
+            if (!result) {
+                return res.status(504).json({ error: 'Timeout esperando respuesta del brain worker.' });
+            }
+            if (!result.ok) {
+                return res.status(500).json({ error: result.error || 'Fallo procesando admin probe.' });
+            }
+            return res.json({ reply: result.reply, trace: result.trace || null });
+        }
+
+        const reply = await processMessage(payload);
+
         let trace = null;
         try {
             const { data } = await supabase
@@ -545,7 +588,7 @@ export async function adminNeuralChat(req, res) {
             if (data?.[0]) trace = data[0];
         } catch (e) { /* non-critical */ }
 
-        res.json({ reply, trace });
+        return res.json({ reply, trace });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }

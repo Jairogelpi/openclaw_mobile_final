@@ -123,6 +123,52 @@ function getEventTimestamp(row) {
     return row?.metadata?.dateStart || row?.metadata?.date || row?.timestamp || row?.created_at || null;
 }
 
+function isWeakMediaLine(line = '') {
+    const normalized = normalizeComparableText(line);
+    if (!normalized) return true;
+    if (normalized.length < 10) return true;
+    return [
+        'audio',
+        'el audio',
+        'al audio',
+        'esto era al audio',
+        'esto era el audio',
+        'mira el audio',
+        'escucha el audio',
+        'nota de voz',
+        'el video',
+        'la foto'
+    ].includes(normalized);
+}
+
+function scoreMediaLine(line = '', normalizedTerms = []) {
+    const normalized = normalizeComparableText(line);
+    if (!normalized) return -10;
+
+    const matchedTerms = normalizedTerms.filter(term => normalized.includes(term));
+    let score = matchedTerms.length * 5;
+
+    if (/\b(audio de|nota de voz|envie|envié|mande|mandé|paso|pasé|escuchaste|escucha|grab|video de|foto de|imagen de|pdf|documento|archivo)\b/i.test(normalized)) {
+        score += 4;
+    }
+    if (line.includes(':')) score += 2;
+    if (normalized.length >= 24) score += 2;
+    if (normalized.length >= 50) score += 1;
+    if (isWeakMediaLine(line)) score -= 5;
+
+    return score;
+}
+
+function extractSpeakerLabel(line = '') {
+    const match = String(line || '').match(/^([^:]{2,32}):/);
+    if (!match) return null;
+    const label = String(match[1] || '').trim();
+    const normalized = normalizeComparableText(label);
+    if (!normalized) return null;
+    if (normalized.split(' ').length > 4) return null;
+    return label;
+}
+
 function extractMediaSnippetFromContent(content = '', matchedTerms = [], speaker = null) {
     const normalizedTerms = [...new Set((matchedTerms || []).map(term => normalizeComparableText(term)).filter(Boolean))];
     const lines = String(content || '')
@@ -130,14 +176,43 @@ function extractMediaSnippetFromContent(content = '', matchedTerms = [], speaker
         .map(line => line.replace(/\[[^\]]+\]/g, '').trim())
         .filter(Boolean);
 
-    const mediaIndex = lines.findIndex(line => {
-        const haystack = normalizeComparableText(line);
-        return normalizedTerms.some(term => haystack.includes(term));
-    });
+    const scoredLines = lines
+        .map((line, index) => ({
+            line,
+            index,
+            score: scoreMediaLine(line, normalizedTerms)
+        }))
+        .filter(item => item.score > -10)
+        .sort((a, b) => b.score - a.score || a.index - b.index);
 
-    const snippetLines = mediaIndex >= 0
-        ? lines.slice(Math.max(0, mediaIndex - 1), Math.min(lines.length, mediaIndex + 2))
-        : lines.slice(0, 2);
+    const lead = scoredLines[0] || null;
+    const chosenIndexes = new Set();
+    if (lead) chosenIndexes.add(lead.index);
+
+    if (lead && (isWeakMediaLine(lead.line) || lead.line.length < 36)) {
+        const neighbor = scoredLines.find(item =>
+            Math.abs(item.index - lead.index) === 1 &&
+            item.score >= Math.max(1, lead.score - 2)
+        );
+        if (neighbor) chosenIndexes.add(neighbor.index);
+    }
+
+    if (lead && chosenIndexes.size === 1) {
+        const adjacent = [lead.index - 1, lead.index + 1]
+            .filter(index => index >= 0 && index < lines.length)
+            .map(index => ({ index, score: scoreMediaLine(lines[index], normalizedTerms) }))
+            .sort((a, b) => b.score - a.score)[0];
+        if (adjacent && adjacent.score >= 2) chosenIndexes.add(adjacent.index);
+    }
+
+    const snippetLines = [...chosenIndexes]
+        .sort((a, b) => a - b)
+        .map(index => lines[index])
+        .filter(Boolean);
+
+    if (!snippetLines.length) {
+        snippetLines.push(...lines.slice(0, 2));
+    }
 
     let snippet = snippetLines.join(' ');
     if (speaker) {
@@ -149,7 +224,10 @@ function extractMediaSnippetFromContent(content = '', matchedTerms = [], speaker
         }
     }
 
-    return snippet.trim().slice(0, 220);
+    return {
+        snippet: snippet.trim().slice(0, 220),
+        participants: [...new Set(snippetLines.map(extractSpeakerLabel).filter(Boolean))].slice(0, 2)
+    };
 }
 
 function extractRequestedMediaTerms(queryText = '') {
@@ -745,31 +823,41 @@ export async function mediaMemorySearch(clientId, entityNames = [], queryText = 
                 const exactPhraseBoost = /(escuchaste mi audio|audio de|nota de voz|audio llor)/i.test(contentNormalized) ? 3 : 0;
                 const senderBoost = [...lookup.normalizedAliases].some(alias => senderHaystack.includes(alias)) ? 2 : 0;
                 const remoteBoost = remoteIdSet.has(remoteId) ? 3 : 0;
+                const mediaSnippetTerms = matchedTerms.length
+                    ? matchedTerms
+                    : fallbackMediaTerms.filter(term => normalizeComparableText(row.content || '').includes(term));
+
                 return {
                     row,
-                    mediaScore: matchedTerms.length + exactPhraseBoost + senderBoost + remoteBoost
+                    mediaScore: matchedTerms.length + exactPhraseBoost + senderBoost + remoteBoost,
+                    mediaSnippetTerms
                 };
             })
             .filter(Boolean)
             .sort((a, b) => b.mediaScore - a.mediaScore || new Date(getEventTimestamp(b.row)).getTime() - new Date(getEventTimestamp(a.row)).getTime())
             .slice(0, matchCount)
-            .map(({ row, mediaScore }) => toMemoryEvidenceCandidate({
+            .map(({ row, mediaScore, mediaSnippetTerms }) => {
+                const mediaExtraction = extractMediaSnippetFromContent(
+                    row.content || '',
+                    mediaSnippetTerms,
+                    row.sender || row.metadata?.contactName || row.metadata?.canonicalSenderName || null
+                );
+
+                return toMemoryEvidenceCandidate({
                 ...row,
                 remote_id: row.metadata?.remoteId || null,
                 timestamp: getEventTimestamp(row),
                 metadata: {
                     ...(row.metadata || {}),
-                    mediaMatchedTerms: fallbackMediaTerms.filter(term => normalizeComparableText(row.content || '').includes(term)),
-                    mediaSnippet: extractMediaSnippetFromContent(
-                        row.content || '',
-                        fallbackMediaTerms.filter(term => normalizeComparableText(row.content || '').includes(term)),
-                        row.sender || row.metadata?.contactName || row.metadata?.canonicalSenderName || null
-                    )
+                    mediaMatchedTerms: mediaSnippetTerms,
+                    mediaSnippet: mediaExtraction.snippet,
+                    mediaParticipants: mediaExtraction.participants
                 },
                 score_vector: 0.78 + Math.min(mediaScore * 0.02, 0.12),
                 score_fts: 0.92,
                 recall_score: 0.94 + Math.min(mediaScore * 0.01, 0.05)
-            }, { source: 'MEDIA_MEMORY' }));
+                }, { source: 'MEDIA_MEMORY' });
+            });
     } catch (error) {
         console.warn('[Graph Service] mediaMemorySearch skipped:', error.message);
         return [];

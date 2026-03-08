@@ -20,4 +20,7 @@ export const outgoingQueue = new Queue('outgoingMessagesQueue', { connection: re
 // Cola de Medios: El Oído descarga audio/imágenes, extrae texto y empuja al cerebro.
 export const mediaQueue = new Queue('mediaProcessingQueue', { connection: redisConnection });
 
-console.log('📦 [Queues] Colas BullMQ inicializadas (incoming, outgoing, media) sobre Redis.');
+// Cola Admin: probes del terminal/admin van al brain worker, no al proceso gateway.
+export const adminNeuralQueue = new Queue('adminNeuralQueue', { connection: redisConnection });
+
+console.log('📦 [Queues] Colas BullMQ inicializadas (incoming, outgoing, media, admin) sobre Redis.');
