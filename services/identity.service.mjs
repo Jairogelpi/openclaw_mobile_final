@@ -71,6 +71,8 @@ function isLowValueIdentityAlias(value) {
     if (!normalized) return true;
     if (LOW_VALUE_IDENTITY_ALIASES.has(normalized)) return true;
     if (/^\d{6,}$/.test(normalized)) return true;
+    if (/^[\d\s+()_-]{6,}$/.test(raw)) return true;
+    if (/^\d[\d\s-]{5,}$/.test(raw)) return true;
     if (normalized.includes('@')) return true;
     return false;
 }
@@ -153,6 +155,20 @@ function sanitizeOwnerIdentityAliases(canonicalName) {
     return normalized ? [normalized.canonical] : [];
 }
 
+function sanitizeGroupIdentityAliases(canonicalName, values = []) {
+    const normalizedCanonical = normalizeIdentityName(canonicalName);
+    if (!normalizedCanonical) return [];
+
+    return mergeAliases([normalizedCanonical.canonical], values)
+        .filter(alias => {
+            const normalized = normalizeComparableText(alias);
+            if (!normalized) return false;
+            if (normalized === normalizedCanonical.normalized) return true;
+            if (isLowValueIdentityAlias(alias)) return false;
+            return isLikelyGroupLabel(alias);
+        });
+}
+
 function addScoredName(scores, value, weight = 1) {
     const normalized = normalizeIdentityName(value);
     if (!normalized || isLowValueIdentityAlias(normalized.canonical)) return;
@@ -212,9 +228,15 @@ function buildIdentityAliasSet(row) {
     const merged = mergeAliases(
         canonical ? [canonical] : [],
         row?.aliases || [],
-        isOwnerIdentityRow(row) ? [] : [fallbackNameFromRemoteId(row?.remote_id)]
+        (isOwnerIdentityRow(row) || isLikelyGroupConversation(row?.remote_id)) ? [] : [fallbackNameFromRemoteId(row?.remote_id)]
     );
 
+    if (isOwnerIdentityRow(row)) {
+        return sanitizeOwnerIdentityAliases(canonical);
+    }
+    if (isLikelyGroupConversation(row?.remote_id)) {
+        return sanitizeGroupIdentityAliases(canonical, merged);
+    }
     return sanitizeIdentityAliases(merged, canonical ? [canonical] : []);
 }
 
@@ -288,6 +310,23 @@ function cloneIdentityRows(rows = []) {
     }));
 }
 
+function sanitizeIdentityRow(row) {
+    if (!row) return row;
+
+    const canonical = normalizeIdentityName(row.canonical_name)?.canonical || row.canonical_name || null;
+    const aliases = buildIdentityAliasSet({
+        ...row,
+        canonical_name: canonical
+    });
+
+    return {
+        ...row,
+        canonical_name: canonical || row.canonical_name,
+        normalized_name: normalizeComparableText(canonical || row.canonical_name || ''),
+        aliases
+    };
+}
+
 function setIdentityRowsCache(clientId, rows = []) {
     identityRowsCache.set(clientId, {
         at: Date.now(),
@@ -330,7 +369,9 @@ export async function upsertContactIdentity(clientId, remoteId, canonicalName, a
         );
         const nextAliases = selfSignal
             ? sanitizeOwnerIdentityAliases(ownerPreferredName || normalized.canonical)
-            : sanitizeIdentityAliases(rawAliasList, [normalized.canonical]);
+            : (isLikelyGroupConversation(remoteId)
+                ? sanitizeGroupIdentityAliases(normalized.canonical, rawAliasList)
+                : sanitizeIdentityAliases(rawAliasList, [normalized.canonical]));
         const nextConfidence = Math.max(Number(existing?.confidence || 0), Number(confidence || 0));
         const nextSourceDetails = {
             ...(existing?.source_details || {}),
@@ -361,15 +402,16 @@ export async function upsertContactIdentity(clientId, remoteId, canonicalName, a
 
         if (error) throw error;
         const cached = identityRowsCache.get(clientId);
+        const sanitizedData = sanitizeIdentityRow(data);
         if (cached?.rows?.length) {
             const nextRows = cached.rows.filter(row => row.remote_id !== remoteId);
-            nextRows.push(data);
+            nextRows.push(sanitizedData);
             setIdentityRowsCache(clientId, nextRows);
         } else {
             invalidateIdentityCache(clientId);
         }
         registryCache.set(clientId, Date.now());
-        return data;
+        return sanitizedData;
     } catch (error) {
         console.warn('[Identity Registry] Upsert skipped:', error.message);
         return null;
@@ -635,7 +677,7 @@ export async function getIdentityRows(clientId) {
             .select('*')
             .eq('client_id', clientId);
         if (error) throw error;
-        const rows = data || [];
+        const rows = (data || []).map(sanitizeIdentityRow);
         setIdentityRowsCache(clientId, rows);
         return cloneIdentityRows(rows);
     } catch (error) {
