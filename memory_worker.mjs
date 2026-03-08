@@ -15,6 +15,7 @@ import { generateEmbedding, cosineSimilarity, invalidateSemanticCache } from './
 import redisClient from './config/redis.mjs';
 import { upsertKnowledgeNode, upsertKnowledgeEdge } from './services/graph.service.mjs';
 import { detectAndSaveCommunities } from './services/community.service.mjs';
+import { hydrateContactIdentities, repairOwnerIdentity } from './services/identity.service.mjs';
 import { resolveIdentity } from "./skills/whatsapp_contacts.mjs";
 import { discoverWhatsAppGroup } from './skills/whatsapp_groups.mjs';
 import { processAttachment } from "./utils/media.mjs";
@@ -635,6 +636,20 @@ export async function distillAndVectorize(clientId) {
             console.log(`[Worker] ✅ Batch finalizado (Acumulado: ${totalProcessedThisRun})`);
         }
         await invalidateSemanticCache(clientId);
+        if (totalProcessedThisRun > 0) {
+            try {
+                await hydrateContactIdentities(clientId, { force: true });
+                await repairOwnerIdentity(clientId);
+            } catch (identityErr) {
+                console.warn(`[Identity Registry] Post-process skipped: ${identityErr.message}`);
+            }
+
+            try {
+                await detectAndSaveCommunities(clientId);
+            } catch (communityErr) {
+                console.warn(`[Community Detection] Post-process skipped: ${communityErr.message}`);
+            }
+        }
     } catch (e) {
         console.error('[Memory Worker] Error:', e.message);
     } finally {

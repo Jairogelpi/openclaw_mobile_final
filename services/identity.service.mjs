@@ -1,6 +1,7 @@
 import supabase from '../config/supabase.mjs';
 import {
     fallbackNameFromRemoteId,
+    looksLikeWhatsAppRemoteId,
     normalizeComparableText,
     pickBestHumanName,
     stripDecorativeText
@@ -37,6 +38,18 @@ const LOW_VALUE_IDENTITY_ALIASES = new Set([
     'desconocido'
 ]);
 
+const GROUP_LABEL_STOPWORDS = new Set([
+    'grupo',
+    'chat',
+    'familia',
+    'casa',
+    'master',
+    'máster',
+    'info',
+    'controles',
+    'radares'
+]);
+
 export function normalizeIdentityName(value) {
     const cleaned = stripDecorativeText(String(value || ''))
         .replace(/\s+/g, ' ')
@@ -60,6 +73,64 @@ function isLowValueIdentityAlias(value) {
     if (/^\d{6,}$/.test(normalized)) return true;
     if (normalized.includes('@')) return true;
     return false;
+}
+
+function isLikelyGroupConversation(remoteId) {
+    return String(remoteId || '').endsWith('@g.us');
+}
+
+function isLikelyGroupLabel(value) {
+    const raw = stripDecorativeText(String(value || '')).trim();
+    const normalized = normalizeComparableText(raw);
+    if (!normalized) return true;
+    if (GROUP_LABEL_STOPWORDS.has(normalized)) return true;
+    if (normalized.length > 20 && normalized.split(' ').length >= 3) return true;
+    if (/^[.〰️\-_ ]+$/.test(raw)) return true;
+    return false;
+}
+
+function buildRawIdentitySignal(message) {
+    const metadata = message?.metadata || {};
+    const isGroup = isLikelyGroupConversation(message?.remote_id);
+    const participantRemoteId = String(metadata.participantJid || '').trim();
+    const senderRole = String(message?.sender_role || '').trim();
+    const canonicalSenderName = String(metadata.canonicalSenderName || '').trim();
+    const pushName = String(metadata.pushName || '').trim();
+    const conversationName = String(metadata.conversationName || '').trim();
+
+    if (isGroup && !participantRemoteId) {
+        return null;
+    }
+
+    const remoteId = participantRemoteId || String(message?.remote_id || '').trim();
+    if (!remoteId || !looksLikeWhatsAppRemoteId(remoteId)) {
+        return null;
+    }
+
+    const canonicalName = pickBestHumanName(
+        canonicalSenderName,
+        pushName,
+        senderRole
+    );
+    if (!canonicalName) return null;
+
+    const aliases = [
+        canonicalSenderName,
+        pushName,
+        senderRole
+    ].filter(Boolean);
+
+    if (!isGroup && conversationName && !isLikelyGroupLabel(conversationName)) {
+        aliases.push(conversationName);
+    }
+
+    return {
+        remoteId,
+        canonicalName,
+        aliases,
+        confidence: 0.85,
+        source: 'raw_messages'
+    };
 }
 
 function sanitizeIdentityAliases(values = [], preserve = []) {
@@ -371,26 +442,9 @@ async function collectIdentitySignals(clientId) {
             .limit(3000);
 
         for (const message of (rawMessages || [])) {
-            const remoteId = message.metadata?.participantJid || message.remote_id;
-            const canonicalName = pickBestHumanName(
-                message.metadata?.canonicalSenderName,
-                message.metadata?.pushName,
-                message.metadata?.conversationName,
-                message.sender_role
-            );
-            if (!remoteId || !canonicalName) continue;
-            signals.push({
-                remoteId,
-                canonicalName,
-                aliases: [
-                    message.metadata?.canonicalSenderName,
-                    message.metadata?.pushName,
-                    message.sender_role,
-                    message.metadata?.conversationName
-                ].filter(Boolean),
-                confidence: 0.85,
-                source: 'raw_messages'
-            });
+            const signal = buildRawIdentitySignal(message);
+            if (!signal) continue;
+            signals.push(signal);
         }
     } catch (error) {
         console.warn('[Identity Registry] raw_messages skipped:', error.message);

@@ -22,6 +22,57 @@ const BLOCKED_ENTITY_PATTERNS = [
     /^(assistant|asistente|system|contacto|persona|interlocutor|anonimo|anónimo)$/i
 ];
 
+const BLOCKED_EXACT_ENTITY_NAMES = new Set([
+    'el',
+    'la',
+    'los',
+    'las',
+    'lo',
+    'un',
+    'una',
+    'uno',
+    'unos',
+    'unas',
+    'alguien',
+    'nadie',
+    'otro',
+    'otra',
+    'otros',
+    'otras',
+    'el tipo',
+    'la tia',
+    'la tía',
+    'el tio',
+    'el tío',
+    'el jefe',
+    'la jefa',
+    'medico',
+    'médico',
+    'doctor',
+    'doctora',
+    'psiquiatra',
+    'terapeuta',
+    'madre',
+    'padre',
+    'mi madre',
+    'mi padre',
+    'mi hermano',
+    'mi hermana',
+    'su madre',
+    'su padre',
+    'el medico',
+    'él',
+    'ella',
+    'ellos',
+    'ellas',
+    'este',
+    'esta',
+    'esto',
+    'ese',
+    'esa',
+    'eso'
+]);
+
 const ENTITY_TYPE_ALIASES = new Map([
     ['persona', 'PERSONA'],
     ['person', 'PERSONA'],
@@ -96,6 +147,39 @@ const RELATION_TYPE_ALIASES = new Map([
     ['knows', 'CONOCE_A']
 ]);
 
+const ALLOWED_RELATION_TYPES = new Set([
+    'RELACIONADO_CON',
+    'HABLA_DE',
+    'CONOCE_A',
+    'FAMILIA_DE',
+    'PAREJA_DE',
+    'AMISTAD',
+    'TRABAJA_EN',
+    'VIVE_EN',
+    'ESTUDIA_EN',
+    'USA',
+    'POSEE',
+    'PLANEA',
+    'PREFIERE',
+    'EVITA',
+    'EVENTO_CON'
+]);
+
+const EXPLICIT_RELATION_CUES = new Map([
+    ['[FAMILIA_DE]', ['madre', 'padre', 'hijo', 'hija', 'hermano', 'hermana', 'familia', 'sobrino', 'sobrina', 'prima', 'primo']],
+    ['[PAREJA_DE]', ['pareja', 'novia', 'novio', 'mi amor', 'te amo', 'amor', 'cariño', 'carino', 'beso']],
+    ['[AMISTAD]', ['amigo', 'amiga', 'colega', 'bro', 'colegas']],
+    ['[TRABAJA_EN]', ['trabajo', 'curro', 'empresa', 'oficina', 'jefe', 'jefa']],
+    ['[VIVE_EN]', ['vive', 'casa', 'piso', 'mudado', 'mudarse']],
+    ['[ESTUDIA_EN]', ['estudia', 'universidad', 'instituto', 'master', 'máster', 'curso']],
+    ['[CONOCE_A]', ['conoce', 'quedo con', 'quedé con', 'he hablado con', 'hablé con']],
+    ['[USA]', ['usa', 'utiliza', 'con esto', 'me he comprado', 'me he pillado']],
+    ['[POSEE]', ['tiene', 'tengo', 'posee', 'lleva', 'he pillado']],
+    ['[PLANEA]', ['voy a', 'quiero', 'planeo', 'plan', 'vamos a']],
+    ['[PREFIERE]', ['prefiero', 'me gusta', 'me encanta']],
+    ['[EVITA]', ['evita', 'no quiero', 'odio', 'paso de']]
+]);
+
 function trimEntityEdges(value) {
     return String(value || '')
         .replace(/^["'`´“”‘’@#\s]+/, '')
@@ -156,6 +240,78 @@ function pickEvidence(record) {
     );
 }
 
+function relationMentionsEntity(evidenceText, entityName) {
+    const normalizedEvidence = normalizeComparableText(evidenceText);
+    const normalizedEntity = normalizeComparableText(entityName);
+    if (!normalizedEvidence || !normalizedEntity) return false;
+    return normalizedEvidence.includes(normalizedEntity);
+}
+
+function extractEvidenceSpeaker(evidenceText, ownerName = null) {
+    const raw = String(evidenceText || '');
+    const idx = raw.indexOf(':');
+    if (idx <= 0) return null;
+    return normalizeEntityName(raw.slice(0, idx).trim(), ownerName);
+}
+
+function hasExplicitCue(relationType, evidenceText, contextText = '') {
+    const cues = EXPLICIT_RELATION_CUES.get(relationType);
+    if (!cues?.length) return false;
+    const haystack = normalizeComparableText(`${evidenceText || ''} ${contextText || ''}`);
+    return cues.some(cue => haystack.includes(normalizeComparableText(cue)));
+}
+
+function relationshipHasStrongEvidence({
+    relationType,
+    sourceName,
+    targetName,
+    evidence,
+    context,
+    ownerName,
+    contactName,
+    isGroup
+}) {
+    const speaker = extractEvidenceSpeaker(evidence, ownerName);
+    const speakerKey = normalizeComparableText(speaker);
+    const ownerKey = normalizeComparableText(ownerName);
+    const contactKey = normalizeComparableText(contactName);
+    const sourceKey = normalizeComparableText(sourceName);
+    const targetKey = normalizeComparableText(targetName);
+    const mentionsSource = relationMentionsEntity(evidence, sourceName);
+    const mentionsTarget = relationMentionsEntity(evidence, targetName);
+    const speakerMatchesSource = speakerKey && speakerKey === sourceKey;
+    const speakerMatchesTarget = speakerKey && speakerKey === targetKey;
+    const privatePair =
+        !isGroup &&
+        ownerKey &&
+        contactKey &&
+        new Set([sourceKey, targetKey]).size === 2 &&
+        [sourceKey, targetKey].includes(ownerKey) &&
+        [sourceKey, targetKey].includes(contactKey);
+
+    if (relationType === '[HABLA_DE]') {
+        return mentionsTarget;
+    }
+
+    if (relationType === '[RELACIONADO_CON]' || relationType === '[EVENTO_CON]') {
+        return (mentionsSource || speakerMatchesSource || speakerMatchesTarget) && mentionsTarget;
+    }
+
+    if (mentionsSource && mentionsTarget) {
+        return true;
+    }
+
+    if (!hasExplicitCue(relationType, evidence, context)) {
+        return false;
+    }
+
+    if (privatePair && (speakerMatchesSource || speakerMatchesTarget || mentionsSource || mentionsTarget)) {
+        return true;
+    }
+
+    return (speakerMatchesSource || speakerMatchesTarget) && (mentionsSource || mentionsTarget);
+}
+
 function resolveKnownEntity(name, entityMap, knownNames, ownerName) {
     const normalized = normalizeEntityName(name, ownerName);
     if (!normalized) return null;
@@ -183,6 +339,7 @@ export function normalizeEntityName(value, ownerName = null) {
     if (ownerName && OWNER_ALIASES.has(comparable)) return ownerName;
     if (isGenericSpeakerLabel(rawValue)) return null;
     if (BLOCKED_ENTITY_PATTERNS.some(pattern => pattern.test(rawValue))) return null;
+    if (BLOCKED_EXACT_ENTITY_NAMES.has(comparable)) return null;
     if (rawValue.length < 2 && !/^[A-Z0-9]{2,}$/.test(rawValue)) return null;
 
     return rawValue;
@@ -198,7 +355,8 @@ export function sanitizeRelationType(value) {
     const normalized = normalizeRelationKey(value);
     if (!normalized) return null;
     const mapped = RELATION_TYPE_ALIASES.get(normalized) || normalized.toUpperCase();
-    return mapped ? `[${mapped}]` : null;
+    if (!ALLOWED_RELATION_TYPES.has(mapped)) return null;
+    return `[${mapped}]`;
 }
 
 export function normalizeWeight(value) {
@@ -279,6 +437,18 @@ export function validateGroundedGraph({
 
         const evidence = pickEvidence(relationship);
         if (!evidence || !snippetExistsInText(chunkText, evidence)) continue;
+        if (!relationshipHasStrongEvidence({
+            relationType,
+            sourceName: sourceEntity.name,
+            targetName: targetEntity.name,
+            evidence,
+            context: relationship?.context,
+            ownerName,
+            contactName,
+            isGroup
+        })) {
+            continue;
+        }
 
         if (
             isGroup

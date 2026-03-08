@@ -9,15 +9,48 @@ if (!clientId) {
 }
 
 const tablesToClear = [
+    'node_communities',
     'knowledge_edges',
     'knowledge_nodes',
     'user_memories',
     'contact_personas',
+    'contact_identities',
     'inbox_summaries',
     'knowledge_communities'
 ];
 
 async function clearClientTable(tableName) {
+    if (tableName === 'node_communities') {
+        const { data: communities, error: communityError } = await supabase
+            .from('knowledge_communities')
+            .select('id')
+            .eq('client_id', clientId);
+
+        if (communityError) {
+            console.warn(`[Rebuild] No se pudo leer knowledge_communities: ${communityError.message}`);
+            return;
+        }
+
+        const communityIds = (communities || []).map(row => row.id).filter(Boolean);
+        if (!communityIds.length) {
+            console.log('[Rebuild] node_communities sin registros que limpiar.');
+            return;
+        }
+
+        const { error: nodeError } = await supabase
+            .from('node_communities')
+            .delete()
+            .in('community_id', communityIds);
+
+        if (nodeError) {
+            console.warn(`[Rebuild] No se pudo limpiar node_communities: ${nodeError.message}`);
+            return;
+        }
+
+        console.log('[Rebuild] node_communities limpiada.');
+        return;
+    }
+
     const { error } = await supabase.from(tableName).delete().eq('client_id', clientId);
     if (error) {
         console.warn(`[Rebuild] No se pudo limpiar ${tableName}: ${error.message}`);
