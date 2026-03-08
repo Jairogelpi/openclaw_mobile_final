@@ -218,7 +218,10 @@ function mergeAliases(...aliasSets) {
 }
 
 function isOwnerIdentityRow(row) {
-    return Boolean(row?.remote_id === 'self' || row?.source_details?.owner_identity);
+    return Boolean(
+        String(row?.remote_id || '').trim() === 'self' ||
+        (row?.source_details?.owner_identity && resolveOwnerPreferredName(row?.remote_id, row?.source_details, row?.canonical_name))
+    );
 }
 
 function looksHumanIdentityLabel(value) {
@@ -243,6 +246,54 @@ function looksHumanIdentityLabel(value) {
     return alphaTokens.every(token =>
         token.length >= 2 || ['de', 'del', 'la', 'el', 'y'].includes(token)
     );
+}
+
+function resolveOwnerPreferredName(remoteId, sourceDetails = {}, canonicalName = null) {
+    const candidates = [
+        sourceDetails?.owner_preferred_name,
+        canonicalName
+    ];
+
+    for (const candidate of candidates) {
+        const normalized = normalizeIdentityName(candidate);
+        if (!normalized?.canonical) continue;
+        if (!looksHumanIdentityLabel(normalized.canonical)) continue;
+        return normalized.canonical;
+    }
+
+    const normalizedCanonical = normalizeIdentityName(canonicalName);
+    if (String(remoteId || '').trim() === 'self' && looksHumanIdentityLabel(normalizedCanonical?.canonical || '')) {
+        return normalizedCanonical.canonical;
+    }
+
+    return null;
+}
+
+function hasStrongSelfAliasSignal(values = []) {
+    return (values || []).some(isStrongSelfMarker);
+}
+
+function shouldPersistOwnerIdentity(remoteId, canonicalName, aliases = [], existingSourceDetails = {}, sourceDetails = {}) {
+    const ownerPreferredName = resolveOwnerPreferredName(
+        remoteId,
+        {
+            ...(existingSourceDetails || {}),
+            ...(sourceDetails || {})
+        },
+        canonicalName
+    );
+
+    const explicitSelfSignal = Boolean(
+        String(remoteId || '').trim() === 'self' ||
+        existingSourceDetails?.owner_identity ||
+        sourceDetails?.owner_identity ||
+        hasStrongSelfAliasSignal(aliases)
+    );
+
+    return {
+        ownerIdentity: Boolean(explicitSelfSignal && ownerPreferredName),
+        ownerPreferredName
+    };
 }
 
 function buildIdentityAliasSet(row) {
@@ -336,16 +387,37 @@ function sanitizeIdentityRow(row) {
     if (!row) return row;
 
     const canonical = normalizeIdentityName(row.canonical_name)?.canonical || row.canonical_name || null;
+    const ownerState = shouldPersistOwnerIdentity(
+        row.remote_id,
+        canonical,
+        row.aliases || [],
+        row.source_details || {},
+        {}
+    );
+    const sourceDetails = {
+        ...(row.source_details || {})
+    };
+
+    if (ownerState.ownerIdentity) {
+        sourceDetails.owner_identity = true;
+        sourceDetails.owner_preferred_name = ownerState.ownerPreferredName;
+    } else {
+        delete sourceDetails.owner_identity;
+        delete sourceDetails.owner_preferred_name;
+    }
+
     const aliases = buildIdentityAliasSet({
         ...row,
-        canonical_name: canonical
+        canonical_name: canonical,
+        source_details: sourceDetails
     });
 
     return {
         ...row,
         canonical_name: canonical || row.canonical_name,
         normalized_name: normalizeComparableText(canonical || row.canonical_name || ''),
-        aliases
+        aliases,
+        source_details: sourceDetails
     };
 }
 
@@ -366,7 +438,8 @@ async function synchronizeSanitizedIdentityRows(clientId) {
         const sanitized = sanitizeIdentityRow(row);
         const sameCanonical = normalizeComparableText(sanitized.canonical_name) === normalizeComparableText(row.canonical_name);
         const sameAliases = normalizedAliasSignature(sanitized.aliases) === normalizedAliasSignature(row.aliases || []);
-        if (sameCanonical && sameAliases) continue;
+        const sameSourceDetails = JSON.stringify(sanitized.source_details || {}) === JSON.stringify(row.source_details || {});
+        if (sameCanonical && sameAliases && sameSourceDetails) continue;
 
         const { error } = await supabase
             .from('contact_identities')
@@ -374,6 +447,7 @@ async function synchronizeSanitizedIdentityRows(clientId) {
                 canonical_name: sanitized.canonical_name,
                 normalized_name: sanitized.normalized_name,
                 aliases: sanitized.aliases,
+                source_details: sanitized.source_details,
                 updated_at: new Date().toISOString()
             })
             .eq('client_id', clientId)
@@ -413,14 +487,15 @@ export async function upsertContactIdentity(clientId, remoteId, canonicalName, a
             .eq('remote_id', remoteId)
             .maybeSingle();
 
-        const selfSignal = Boolean(
-            existing?.source_details?.owner_identity ||
-            sourceDetails?.owner_identity ||
-            [...(existing?.aliases || []), ...aliases].some(isStrongSelfMarker)
+        const ownerState = shouldPersistOwnerIdentity(
+            remoteId,
+            normalized.canonical,
+            [...(existing?.aliases || []), ...aliases],
+            existing?.source_details || {},
+            sourceDetails || {}
         );
-        const ownerPreferredName = sourceDetails?.owner_preferred_name || existing?.source_details?.owner_preferred_name || null;
-        if (selfSignal && ownerPreferredName) {
-            normalized = normalizeIdentityName(ownerPreferredName) || normalized;
+        if (ownerState.ownerPreferredName) {
+            normalized = normalizeIdentityName(ownerState.ownerPreferredName) || normalized;
         }
 
         const rawAliasList = mergeAliases(
@@ -429,8 +504,8 @@ export async function upsertContactIdentity(clientId, remoteId, canonicalName, a
             aliases,
             [fallbackNameFromRemoteId(remoteId)]
         );
-        const nextAliases = selfSignal
-            ? sanitizeOwnerIdentityAliases(ownerPreferredName || normalized.canonical)
+        const nextAliases = ownerState.ownerIdentity
+            ? sanitizeOwnerIdentityAliases(ownerState.ownerPreferredName || normalized.canonical)
             : (isLikelyGroupConversation(remoteId)
                 ? sanitizeGroupIdentityAliases(normalized.canonical, rawAliasList)
                 : sanitizePersonalIdentityAliases(normalized.canonical, rawAliasList, [normalized.canonical]));
@@ -438,11 +513,15 @@ export async function upsertContactIdentity(clientId, remoteId, canonicalName, a
         const nextSourceDetails = {
             ...(existing?.source_details || {}),
             ...(sourceDetails || {}),
-            ...(selfSignal ? {
+            ...(ownerState.ownerIdentity ? {
                 owner_identity: true,
-                owner_preferred_name: ownerPreferredName || normalized.canonical
+                owner_preferred_name: ownerState.ownerPreferredName || normalized.canonical
             } : {})
         };
+        if (!ownerState.ownerIdentity) {
+            delete nextSourceDetails.owner_identity;
+            delete nextSourceDetails.owner_preferred_name;
+        }
 
         const payload = {
             client_id: clientId,
@@ -506,8 +585,8 @@ export async function getPreferredOwnerIdentity(clientId) {
 
     const rows = await getIdentityRows(clientId);
     const ownerLikeRows = rows.filter(row =>
-        row?.source_details?.owner_identity ||
-        (row.aliases || []).some(isStrongSelfMarker)
+        isOwnerIdentityRow(row) ||
+        (hasStrongSelfAliasSignal(row.aliases || []) && looksHumanIdentityLabel(row.canonical_name))
     );
 
     for (const row of ownerLikeRows) {
@@ -517,9 +596,10 @@ export async function getPreferredOwnerIdentity(clientId) {
             addScoredName(scores, alias, isStrongSelfMarker(alias) ? 0 : 3);
             if (!isLowValueIdentityAlias(alias)) aliases.add(alias);
         }
-        if (row?.source_details?.owner_preferred_name) {
-            addScoredName(scores, row.source_details.owner_preferred_name, 8);
-            aliases.add(row.source_details.owner_preferred_name);
+        const ownerPreferredName = resolveOwnerPreferredName(row.remote_id, row.source_details, row.canonical_name);
+        if (ownerPreferredName) {
+            addScoredName(scores, ownerPreferredName, 8);
+            aliases.add(ownerPreferredName);
         }
     }
 
@@ -559,7 +639,7 @@ export async function repairOwnerIdentity(clientId, preferredName = null) {
         });
 
         return Boolean(
-            row?.source_details?.owner_identity ||
+            isOwnerIdentityRow(row) ||
             aliases.some(isStrongSelfMarker) ||
             (normalizedCanonical === normalizedOwner.normalized && String(row.remote_id || '').endsWith('@lid') && onlyOwnerOrLowValueAliases)
         );

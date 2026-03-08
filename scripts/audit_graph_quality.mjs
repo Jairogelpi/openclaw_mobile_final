@@ -56,6 +56,8 @@ const ROLE_LIKE_NODE_PATTERNS = [
     /^(el|la)\s+[a-záéíóúñ]{3,}$/i
 ];
 
+const ARTICLE_ACRONYM_ENTITY_PATTERN = /^(el|la|los|las)\s+[A-ZÁÉÍÓÚÑ0-9]{2,}(?:\s+[A-ZÁÉÍÓÚÑ0-9]{2,})*$/;
+
 const SUSPICIOUS_CONTEXT_PATTERNS = [
     /\busuario\b/i,
     /\bcontacto\b/i,
@@ -69,12 +71,15 @@ function normalize(value) {
 }
 
 function isBlockedNodeName(value) {
+    const raw = String(value || '').trim();
+    if (ARTICLE_ACRONYM_ENTITY_PATTERN.test(raw)) return false;
+
     const normalized = normalize(value);
     if (!normalized) return true;
     if (BLOCKED_NODE_NAMES.has(normalized)) return true;
     if (/^\d{6,}$/.test(normalized)) return true;
     if (normalized.includes('@')) return true;
-    if (ROLE_LIKE_NODE_PATTERNS.some(pattern => pattern.test(String(value || '').trim()))) return true;
+    if (ROLE_LIKE_NODE_PATTERNS.some(pattern => pattern.test(raw))) return true;
     return false;
 }
 

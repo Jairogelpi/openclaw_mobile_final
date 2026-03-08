@@ -345,6 +345,10 @@ function hasLeadingArticle(value) {
     return /^(el|la|los|las|un|una)\s+/i.test(String(value || '').trim());
 }
 
+function hasLowercaseArticleEntityShape(value) {
+    return /^(el|la|los|las|un|una)\s+[a-záéíóúñ]/.test(String(value || '').trim());
+}
+
 function isWeakEntityDescription(value) {
     const normalized = normalizeComparableText(value);
     if (!normalized) return true;
@@ -358,8 +362,29 @@ function isWeakEntityDescription(value) {
         'comunicacion en el chat',
         'comunicación en el chat',
         'fenomeno meteorologico',
-        'fenómeno meteorológico'
+        'fenómeno meteorológico',
+        'evento climatico',
+        'evento climático',
+        'lugar de descanso'
     ].includes(normalized);
+}
+
+function matchesWeakEntityDescriptionPattern(value) {
+    const normalized = normalizeComparableText(value);
+    if (!normalized) return true;
+
+    return [
+        /^lugar\b/,
+        /^objeto\b/,
+        /^tema\b/,
+        /^asunto\b/,
+        /^evento\b/,
+        /^mascota\b/,
+        /^animal\b/,
+        /^fenomeno\b/,
+        /^fenómeno\b/,
+        /^sitio\b/
+    ].some(pattern => pattern.test(normalized));
 }
 
 function isWeakStandaloneEntity({
@@ -383,8 +408,15 @@ function isWeakStandaloneEntity({
 
     if (known) return false;
 
-    if (['LUGAR', 'ORGANIZACION', 'EVENTO', 'TEMA', 'ENTITY'].includes(entityType)) {
-        const genericArticleEntity = hasLeadingArticle(name) && isWeakEntityDescription(desc || evidence || '');
+    if (['LUGAR', 'ORGANIZACION', 'EVENTO', 'TEMA', 'ENTITY', 'OBJETO'].includes(entityType)) {
+        const descriptionText = desc || evidence || '';
+        const genericArticleEntity =
+            hasLeadingArticle(name)
+            && (
+                isWeakEntityDescription(descriptionText)
+                || matchesWeakEntityDescriptionPattern(descriptionText)
+                || hasLowercaseArticleEntityShape(name)
+            );
         if (genericArticleEntity) return true;
     }
 
