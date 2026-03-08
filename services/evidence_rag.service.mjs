@@ -932,10 +932,16 @@ function normalizeSentence(text, maxLength = 220) {
 function normalizeReadableSnippetText(text = '') {
     return String(text || '')
         .replace(/\bde(ll[a-záéíóúñ]+)/gi, 'de $1')
+        .replace(/\bfotocon\b/gi, 'foto con')
+        .replace(/\barchivoes\b/gi, 'archivo es')
         .replace(/\s+,/g, ',')
         .replace(/\s+\./g, '.')
         .replace(/\s+/g, ' ')
         .trim();
+}
+
+function mediaKindArticle(mediaKind) {
+    return mediaKind === 'foto' ? 'una' : 'un';
 }
 
 function cleanConversationLines(text) {
@@ -1184,12 +1190,22 @@ function scoreMediaClause(clause = '') {
     return score;
 }
 
+function scoreMediaClauseV2(clause = '') {
+    const normalized = normalizeComparableText(clause);
+    if (!normalized) return -10;
+
+    let score = scoreMediaClause(clause);
+    if (/\b(foto|imagen|archivo|documento|pdf)\b/.test(normalized)) score += 2;
+    return score;
+}
+
 function summarizeMediaCandidates(mediaCandidates = []) {
     const candidates = (mediaCandidates || []).filter(Boolean);
     if (!candidates.length) return null;
 
     const lead = candidates[0];
     const mediaKind = inferMediaKind(lead);
+    const article = mediaKindArticle(mediaKind);
     const speakers = (lead?.metadata?.mediaParticipants || []).length
         ? lead.metadata.mediaParticipants.slice(0, 2)
         : extractSpeakersFromDialog(lead?.metadata?.mediaSnippet || lead?.evidence_text || '');
@@ -1214,21 +1230,21 @@ function summarizeMediaCandidates(mediaCandidates = []) {
 
     const bestClauses = clauses
         .slice()
-        .sort((a, b) => scoreMediaClause(b) - scoreMediaClause(a))
+        .sort((a, b) => scoreMediaClauseV2(b) - scoreMediaClauseV2(a))
         .slice(0, 2);
 
     if (!bestClauses.length) return buildMediaClaimText(lead);
 
     if (speakers.length >= 2) {
-        return `${datePrefix}, ${speakers[0]} y ${speakers[1]} hablan sobre un ${mediaKind}: ${bestClauses.join('; ')}.`;
+        return `${datePrefix}, ${speakers[0]} y ${speakers[1]} hablan sobre ${article} ${mediaKind}: ${bestClauses.join('; ')}.`;
     }
     if (speakers.length === 1) {
-        return `${datePrefix}, ${speakers[0]} menciona un ${mediaKind}: ${bestClauses.join('; ')}.`;
+        return `${datePrefix}, ${speakers[0]} menciona ${article} ${mediaKind}: ${bestClauses.join('; ')}.`;
     }
     if (lead?.speaker) {
-        return `${datePrefix}, ${lead.speaker} menciona un ${mediaKind}: ${bestClauses.join('; ')}.`;
+        return `${datePrefix}, ${lead.speaker} menciona ${article} ${mediaKind}: ${bestClauses.join('; ')}.`;
     }
-    return `${datePrefix} aparece un ${mediaKind}: ${bestClauses.join('; ')}.`;
+    return `${datePrefix} aparece ${article} ${mediaKind}: ${bestClauses.join('; ')}.`;
 }
 
 function humanizeRelationType(relationType) {
