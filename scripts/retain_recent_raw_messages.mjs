@@ -49,7 +49,7 @@ async function countRawMessages() {
 }
 
 async function fetchAllRawMessageRows() {
-    const pageSize = 5000;
+    const pageSize = 1000;
     let from = 0;
     let rows = [];
 
@@ -69,6 +69,11 @@ async function fetchAllRawMessageRows() {
         rows = rows.concat(data);
         if (data.length < pageSize) break;
         from += pageSize;
+    }
+
+    const total = await countRawMessages();
+    if (rows.length !== total) {
+        throw new Error(`Expected to fetch ${total} raw_messages but only received ${rows.length}.`);
     }
 
     return rows;
