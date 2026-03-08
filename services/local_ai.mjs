@@ -17,6 +17,13 @@ const pendingRequests = new Map();
 let lastWarmupAt = 0;
 let warmupPromise = null;
 
+function failPendingRequests(error) {
+    for (const [id, resolver] of pendingRequests.entries()) {
+        resolver.reject(error instanceof Error ? error : new Error(String(error || 'Embedding worker failed')));
+        pendingRequests.delete(id);
+    }
+}
+
 function initWorker() {
     if (!embedderWorker) {
         console.log('🧠 [AI Service] Inicializando red neuronal en hilo dedicado (Worker Thread)...');
@@ -33,11 +40,15 @@ function initWorker() {
 
         embedderWorker.on('error', (err) => {
             console.error('❌ [AI Worker] Error en hilo de embeddings:', err);
+            failPendingRequests(err);
             embedderWorker = null;
         });
 
         embedderWorker.on('exit', (code) => {
             if (code !== 0) console.warn(`⚠️ [AI Worker] Hilo cerrado con código ${code}`);
+            if (code !== 0) {
+                failPendingRequests(new Error(`Embedding worker exited with code ${code}`));
+            }
             embedderWorker = null;
         });
     }
