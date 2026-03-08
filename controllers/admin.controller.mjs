@@ -11,6 +11,7 @@ import { getAllConfig, setConfig } from '../services/config.service.mjs';
 import { adminNeuralQueue, adminNeuralQueueEvents } from '../config/queues.mjs';
 
 const execPromise = util.promisify(exec);
+const BRAIN_ADMIN_PORT = Number(process.env.OPENCLAW_BRAIN_ADMIN_PORT || 3001);
 
 function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
@@ -30,6 +31,27 @@ async function waitForAdminNeuralResult(requestId, timeoutMs = 35000) {
     }
 
     return null;
+}
+
+async function callBrainAdminEndpoint(token, payload, timeoutMs = 35000) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        const response = await fetch(`http://127.0.0.1:${BRAIN_ADMIN_PORT}/admin/api/neural_chat?token=${encodeURIComponent(token)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+            signal: controller.signal
+        });
+
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            throw new Error(data?.error || `Brain admin endpoint error (${response.status})`);
+        }
+        return data;
+    } finally {
+        clearTimeout(timeout);
+    }
 }
 
 export async function adminHealthDashboard(req, res, activeSessions) {
@@ -558,6 +580,17 @@ export async function adminNeuralChat(req, res) {
         };
 
         console.log(`🧠 [Neural Terminal] Testing for ${clientId} (${clientSlug}): "${text.slice(0, 30)}..."`);
+        try {
+            const directResult = await callBrainAdminEndpoint(req.query.token, {
+                clientId,
+                text,
+                remoteId: remoteId || 'terminal-admin'
+            });
+            return res.json(directResult);
+        } catch (error) {
+            console.warn(`[Neural Terminal] Brain direct probe fallback: ${error.message}`);
+        }
+
         if (adminNeuralQueue && redisClient) {
             const job = await adminNeuralQueue.add('admin_probe', payload, {
                 jobId: requestId,

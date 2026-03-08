@@ -7,12 +7,15 @@ import { preloadConfigCache } from './services/config.service.mjs';
 import IORedis from 'ioredis';
 import redisClient from './config/redis.mjs';
 import supabase from './config/supabase.mjs';
+import express from 'express';
+import cors from 'cors';
 
 const redisConnection = new IORedis({
     host: process.env.REDIS_HOST || '127.0.0.1',
     port: process.env.REDIS_PORT || 6379,
     maxRetriesPerRequest: null,
 });
+const BRAIN_ADMIN_PORT = Number(process.env.OPENCLAW_BRAIN_ADMIN_PORT || 3001);
 
 console.log('🧠 [Brain Worker] Iniciando servicio neuro-cognitivo (AI Microservice)...');
 try {
@@ -177,6 +180,62 @@ adminNeuralWorker.on('failed', async (job, err) => {
         error: err.message,
         requestId: job?.data?.adminRequestId
     });
+});
+
+const brainAdminApp = express();
+brainAdminApp.use(cors());
+brainAdminApp.use(express.json({ limit: '2mb' }));
+
+brainAdminApp.get('/healthz', (_req, res) => {
+    res.json({ ok: true, service: 'openclaw-brain', port: BRAIN_ADMIN_PORT });
+});
+
+brainAdminApp.post('/admin/api/neural_chat', async (req, res) => {
+    if (req.query.token !== process.env.ADMIN_TOKEN) {
+        return res.status(401).json({ error: 'No autorizado' });
+    }
+
+    const { clientId, text, remoteId } = req.body || {};
+    if (!clientId || !text) {
+        return res.status(400).json({ error: 'Faltan parámetros' });
+    }
+
+    try {
+        const { data: soul } = await supabase
+            .from('user_souls')
+            .select('slug')
+            .eq('client_id', clientId)
+            .single();
+
+        const clientSlug = soul?.slug || 'unknown';
+        console.log(`🧠 [Brain Admin API] Probe for ${clientId} (${clientSlug}): "${String(text).slice(0, 30)}..."`);
+
+        const result = await runBrainCycle({
+            clientId,
+            clientSlug,
+            text,
+            senderId: remoteId || 'terminal-admin',
+            pushName: 'Admin Debugger',
+            channel: 'terminal',
+            metadata: {
+                adminProbe: true
+            }
+        }, {
+            enqueueOutgoing: false,
+            logPrefix: '[Brain-HTTP]'
+        });
+
+        return res.json({
+            reply: result.reply,
+            trace: result.trace || null
+        });
+    } catch (error) {
+        return res.status(500).json({ error: error.message });
+    }
+});
+
+brainAdminApp.listen(BRAIN_ADMIN_PORT, '0.0.0.0', () => {
+    console.log(`🧠 [Brain Admin API] Listening on http://0.0.0.0:${BRAIN_ADMIN_PORT}`);
 });
 
 console.log('🌟 [Brain Worker] Listo y escuchando. Esperando señales en incomingMessagesQueue...');

@@ -281,6 +281,7 @@
             return null;
         }
         const ADMIN_TOKEN = extractToken();
+        const BRAIN_ADMIN_PORT = 3001;
         let currentClientId = null;
         let currentSlug = null;
         let clientsData = [];
@@ -610,11 +611,22 @@
             input.disabled = true;
 
             try {
-                const res = await fetch(`/admin/api/neural_chat?token=${encodeURIComponent(ADMIN_TOKEN)}`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({ clientId: currentClientId, text: text })
-                });
+                const payload = JSON.stringify({ clientId: currentClientId, text: text });
+                const directUrl = `${window.location.protocol}//${window.location.hostname}:${BRAIN_ADMIN_PORT}/admin/api/neural_chat?token=${encodeURIComponent(ADMIN_TOKEN)}`;
+                let res;
+                try {
+                    res = await fetch(directUrl, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: payload
+                    });
+                } catch (e) {
+                    res = await fetch(`/admin/api/neural_chat?token=${encodeURIComponent(ADMIN_TOKEN)}`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: payload
+                    });
+                }
                 const data = await res.json();
                 appendMsg('ai', data.reply, data.trace);
             } catch (e) {

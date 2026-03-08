@@ -22,6 +22,7 @@ module.exports = {
                 NODE_ENV: "production",
                 OPENCLAW_EMBEDDER_KEEP_WARM: "true",
                 OPENCLAW_EMBEDDER_TTL_MS: "3600000",
+                OPENCLAW_BRAIN_ADMIN_PORT: "3001",
             }
         },
         {
