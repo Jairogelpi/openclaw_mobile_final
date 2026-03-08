@@ -229,7 +229,7 @@ async function detectIdentityMatchesFromQuery(clientId, userQuery) {
         .slice(0, 8);
 }
 
-async function detectIdentityMatchesFromQueryFast(clientId, userQuery) {
+async function detectIdentityMatchesFromQueryFast(clientId, userQuery, inferredEntities = []) {
     const matches = [];
     const seen = new Set();
     let soulRow = null;
@@ -261,6 +261,30 @@ async function detectIdentityMatchesFromQueryFast(clientId, userQuery) {
         seen.add(normalizeComparableText(ownerAliases[0]));
     }
 
+    const exactRows = inferredEntities.length
+        ? await resolveIdentityCandidates(clientId, inferredEntities).catch(() => [])
+        : [];
+
+    for (const row of exactRows) {
+        const canonicalKey = normalizeComparableText(row.canonical_name);
+        if (!canonicalKey || seen.has(canonicalKey)) continue;
+        seen.add(canonicalKey);
+        matches.push({
+            ...row,
+            aliases: [...new Set([row.canonical_name, ...(row.aliases || [])].filter(Boolean))]
+        });
+    }
+
+    if (matches.length && inferredEntities.length) {
+        return matches
+            .sort((a, b) =>
+                Number(b.match_score || 0) - Number(a.match_score || 0) ||
+                Number(Boolean(b.remote_id === 'self' || b.source_details?.owner_identity)) - Number(Boolean(a.remote_id === 'self' || a.source_details?.owner_identity)) ||
+                Number(b.confidence || 0) - Number(a.confidence || 0)
+            )
+            .slice(0, 8);
+    }
+
     const rows = await getIdentityRows(clientId).catch(() => []);
     for (const row of rows) {
         const aliases = [...new Set([row.canonical_name, ...(row.aliases || [])].filter(Boolean))];
@@ -268,6 +292,7 @@ async function detectIdentityMatchesFromQueryFast(clientId, userQuery) {
         if (!matched) continue;
         const key = normalizeComparableText(row.canonical_name);
         if (seen.has(key)) continue;
+        if (!row.remote_id && !row.canonical_name) continue;
         seen.add(key);
         matches.push({
             ...row,
@@ -519,8 +544,8 @@ function buildIdentityResolutionMapFromMatches(identityMatches = []) {
 export async function buildRagQueryPlan(clientId, userQuery, trace = null) {
     await hydrateContactIdentities(clientId).catch(() => null);
 
-    const identityMatches = await detectIdentityMatchesFromQueryFast(clientId, userQuery);
     const inferredEntities = inferRawEntitiesFromQuery(userQuery);
+    const identityMatches = await detectIdentityMatchesFromQueryFast(clientId, userQuery, inferredEntities);
     const identityHints = identityMatches
         .slice(0, 8)
         .map(match => `${match.canonical_name} (${match.remote_id})`)
@@ -634,11 +659,20 @@ Responde solo con el JSON del plan.`;
             if (!identityMap.has(key)) identityMap.set(key, value);
         }
     }
-    nextPlan.entities = [...new Set((nextPlan.entities || []).map(entity => {
+    const resolvedEntities = [];
+    let resolvedMatchCount = 0;
+    for (const entity of (nextPlan.entities || [])) {
         const normalized = normalizeComparableText(entity);
-        return identityMap.get(normalized)?.canonicalName || entity;
-    }).filter(Boolean))];
-    nextPlan.identity_match_count = Number(identityMatches.length || nextPlan.identity_match_count || 0);
+        const resolved = identityMap.get(normalized);
+        if (resolved?.canonicalName) {
+            resolvedEntities.push(resolved.canonicalName);
+            resolvedMatchCount += 1;
+        } else {
+            resolvedEntities.push(entity);
+        }
+    }
+    nextPlan.entities = [...new Set(resolvedEntities.filter(Boolean))];
+    nextPlan.identity_match_count = Number(resolvedMatchCount || identityMatches.length || nextPlan.identity_match_count || 0);
 
     return nextPlan;
 }

@@ -179,6 +179,107 @@ function mergeAliases(...aliasSets) {
     return [...seen.values()];
 }
 
+function isOwnerIdentityRow(row) {
+    return Boolean(row?.remote_id === 'self' || row?.source_details?.owner_identity);
+}
+
+function looksHumanIdentityLabel(value) {
+    const raw = stripDecorativeText(String(value || '')).trim();
+    const normalized = normalizeComparableText(raw);
+    if (!normalized) return false;
+    if (isLowValueIdentityAlias(raw)) return false;
+    if (looksLikeWhatsAppRemoteId(raw)) return false;
+    if (/^\d{6,}$/.test(normalized)) return false;
+
+    const tokens = normalized
+        .split(' ')
+        .map(token => token.trim())
+        .filter(Boolean);
+
+    if (!tokens.length || tokens.length > 4) return false;
+    if (tokens.some(token => GROUP_LABEL_STOPWORDS.has(token))) return false;
+
+    const alphaTokens = tokens.filter(token => /[a-záéíóúñ]/i.test(token));
+    if (!alphaTokens.length) return false;
+
+    return alphaTokens.every(token =>
+        token.length >= 2 || ['de', 'del', 'la', 'el', 'y'].includes(token)
+    );
+}
+
+function buildIdentityAliasSet(row) {
+    const canonical = normalizeIdentityName(row?.canonical_name)?.canonical || row?.canonical_name || null;
+    const merged = mergeAliases(
+        canonical ? [canonical] : [],
+        row?.aliases || [],
+        isOwnerIdentityRow(row) ? [] : [fallbackNameFromRemoteId(row?.remote_id)]
+    );
+
+    return sanitizeIdentityAliases(merged, canonical ? [canonical] : []);
+}
+
+function buildAliasOwnershipMap(rows = []) {
+    const ownership = new Map();
+
+    for (const row of rows) {
+        const remoteId = String(row?.remote_id || '').trim();
+        if (!remoteId) continue;
+
+        for (const alias of buildIdentityAliasSet(row)) {
+            const normalized = normalizeComparableText(alias);
+            if (!normalized) continue;
+            if (!ownership.has(normalized)) ownership.set(normalized, new Set());
+            ownership.get(normalized).add(remoteId);
+        }
+    }
+
+    return ownership;
+}
+
+function scoreIdentityRowForName(row, requestedName, aliasOwnership) {
+    const requested = normalizeIdentityName(requestedName);
+    if (!requested?.normalized) return null;
+
+    const aliases = buildIdentityAliasSet(row);
+    const canonical = normalizeIdentityName(row?.canonical_name);
+    const canonicalNormalized = canonical?.normalized || '';
+    const aliasNormalizedSet = new Set(aliases.map(alias => normalizeComparableText(alias)).filter(Boolean));
+    const matched = aliasNormalizedSet.has(requested.normalized);
+    if (!matched) return null;
+
+    const owner = isOwnerIdentityRow(row);
+    const group = isLikelyGroupConversation(row?.remote_id);
+    const queryLooksHuman = looksHumanIdentityLabel(requested.canonical);
+    const canonicalLooksHuman = looksHumanIdentityLabel(canonical?.canonical || '');
+    const canonicalExact = canonicalNormalized === requested.normalized;
+    const aliasOwners = aliasOwnership.get(requested.normalized) || new Set();
+    const ambiguousAlias = aliasOwners.size > 1;
+
+    let score = canonicalExact ? 120 : 70;
+    if (owner) score += 20;
+    if (canonicalLooksHuman) score += 8;
+    if (queryLooksHuman && !canonicalLooksHuman && !canonicalExact) score -= 45;
+    if (group) score -= 25;
+    if (ambiguousAlias && !canonicalExact && !owner) score -= 35;
+    score += Number(row?.confidence || 0) * 10;
+    score += Math.min((canonical?.canonical || '').length, 24) / 24;
+
+    return {
+        row: {
+            ...row,
+            aliases
+        },
+        aliases,
+        canonicalExact,
+        owner,
+        ambiguousAlias,
+        score,
+        matchedName: requested.canonical,
+        queryLooksHuman,
+        canonicalLooksHuman
+    };
+}
+
 function cloneIdentityRows(rows = []) {
     return (rows || []).map(row => ({
         ...row,
@@ -549,22 +650,65 @@ export async function resolveIdentityCandidates(clientId, names = []) {
     if (!identityRows.length) return [];
 
     const normalizedNames = (names || [])
-        .map(name => normalizeIdentityName(name)?.normalized)
+        .map(name => normalizeIdentityName(name))
         .filter(Boolean);
 
+    const aliasOwnership = buildAliasOwnershipMap(identityRows);
     const results = [];
-    for (const row of identityRows) {
-        const aliases = mergeAliases(row.canonical_name, ...(row.aliases || []));
-        const normalizedAliases = aliases.map(alias => normalizeComparableText(alias));
-        const matches = normalizedNames.some(name => normalizedAliases.includes(name));
-        if (!matches) continue;
+    const seenRemoteIds = new Set();
+
+    for (const name of normalizedNames) {
+        const scored = identityRows
+            .map(row => scoreIdentityRowForName(row, name.canonical, aliasOwnership))
+            .filter(Boolean)
+            .sort((a, b) =>
+                b.score - a.score ||
+                Number(b.owner) - Number(a.owner) ||
+                Number(b.canonicalExact) - Number(a.canonicalExact) ||
+                Number(b.row.confidence || 0) - Number(a.row.confidence || 0)
+            );
+
+        if (!scored.length) continue;
+
+        const topCanonical = scored[0].row.canonical_name;
+        const canonicalExactMatches = scored.filter(match => match.canonicalExact);
+        const uniqueCanonicalExact = [...new Set(canonicalExactMatches.map(match => normalizeComparableText(match.row.canonical_name)))];
+        if (uniqueCanonicalExact.length > 1) {
+            continue;
+        }
+
+        const best = scored[0];
+        const competingCanonical = scored.find(match =>
+            normalizeComparableText(match.row.canonical_name) !== normalizeComparableText(topCanonical) &&
+            (best.score - match.score) < 12
+        );
+
+        if (best.ambiguousAlias && !best.canonicalExact && !best.owner) {
+            continue;
+        }
+        if (competingCanonical && !best.canonicalExact && !best.owner) {
+            continue;
+        }
+        if (best.queryLooksHuman && !best.canonicalLooksHuman && !best.canonicalExact && !best.owner) {
+            continue;
+        }
+
+        const remoteId = String(best.row.remote_id || '').trim();
+        if (!remoteId || seenRemoteIds.has(remoteId)) continue;
+        seenRemoteIds.add(remoteId);
         results.push({
-            ...row,
-            aliases
+            ...best.row,
+            matched_name: best.matchedName,
+            match_score: best.score,
+            match_type: best.canonicalExact ? 'canonical_exact' : 'alias_exact'
         });
     }
 
-    return results;
+    return results.sort((a, b) =>
+        Number(b.match_score || 0) - Number(a.match_score || 0) ||
+        Number(Boolean(b.remote_id === 'self' || b.source_details?.owner_identity)) - Number(Boolean(a.remote_id === 'self' || a.source_details?.owner_identity)) ||
+        Number(b.confidence || 0) - Number(a.confidence || 0)
+    );
 }
 
 export async function resolveIdentityNames(clientId, names = []) {
