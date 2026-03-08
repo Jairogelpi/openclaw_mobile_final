@@ -332,6 +332,65 @@ function resolveKnownEntity(name, entityMap, knownNames, ownerName) {
     return entity;
 }
 
+function compactDigits(value) {
+    return String(value || '').replace(/[^\d]/g, '');
+}
+
+function isPhoneLikeEntityName(value) {
+    const digits = compactDigits(value);
+    return digits.length >= 7;
+}
+
+function hasLeadingArticle(value) {
+    return /^(el|la|los|las|un|una)\s+/i.test(String(value || '').trim());
+}
+
+function isWeakEntityDescription(value) {
+    const normalized = normalizeComparableText(value);
+    if (!normalized) return true;
+    return [
+        'participante del chat',
+        'participante',
+        'debatido en la conversacion',
+        'debatido en la conversación',
+        'mencionado en la conversacion',
+        'mencionado en la conversación',
+        'comunicacion en el chat',
+        'comunicación en el chat',
+        'fenomeno meteorologico',
+        'fenómeno meteorológico'
+    ].includes(normalized);
+}
+
+function isWeakStandaloneEntity({
+    name,
+    type,
+    desc,
+    evidence,
+    knownNames,
+    remoteId,
+    isGroup
+}) {
+    const normalizedName = normalizeComparableText(name);
+    if (!normalizedName) return true;
+    const entityType = sanitizeEntityType(type);
+    const known = knownNames.has(normalizedName);
+
+    if (isPhoneLikeEntityName(name)) {
+        if (entityType === 'PERSONA' && !known) return true;
+        if (isGroup && compactDigits(remoteId) !== compactDigits(name)) return true;
+    }
+
+    if (known) return false;
+
+    if (['LUGAR', 'ORGANIZACION', 'EVENTO', 'TEMA', 'ENTITY'].includes(entityType)) {
+        const genericArticleEntity = hasLeadingArticle(name) && isWeakEntityDescription(desc || evidence || '');
+        if (genericArticleEntity) return true;
+    }
+
+    return false;
+}
+
 export function normalizeEntityName(value, ownerName = null) {
     const rawValue = trimEntityEdges(stripDecorativeText(value));
     if (!rawValue) return null;
@@ -416,6 +475,18 @@ export function validateGroundedGraph({
             continue;
         }
 
+        if (isWeakStandaloneEntity({
+            name: normalizedName,
+            type: entity?.type,
+            desc: entity?.desc || entity?.description || '',
+            evidence,
+            knownNames,
+            remoteId,
+            isGroup
+        })) {
+            continue;
+        }
+
         const existing = entityMap.get(nameKey);
         const nextEntity = {
             name: knownNames.get(nameKey) || normalizedName,
@@ -439,6 +510,20 @@ export function validateGroundedGraph({
 
         const evidence = pickEvidence(relationship);
         if (!evidence || !snippetExistsInText(chunkText, evidence)) continue;
+        if (relationType === '[HABLA_DE]') {
+            if (isPhoneLikeEntityName(targetEntity.name)) continue;
+            if (isGroup && isWeakStandaloneEntity({
+                name: targetEntity.name,
+                type: targetEntity.type,
+                desc: targetEntity.desc,
+                evidence,
+                knownNames,
+                remoteId,
+                isGroup
+            })) {
+                continue;
+            }
+        }
         if (!relationshipHasStrongEvidence({
             relationType,
             sourceName: sourceEntity.name,
@@ -467,6 +552,15 @@ export function validateGroundedGraph({
             if (!involvesOwner && !mentionsBothPeople) {
                 continue;
             }
+        }
+
+        if (
+            relationType === '[HABLA_DE]'
+            && isGroup
+            && sanitizeEntityType(sourceEntity.type) === 'GRUPO'
+            && isPersonLikeEntityType(targetEntity.type)
+        ) {
+            continue;
         }
 
         const relationKey = [
