@@ -313,6 +313,44 @@ function selectOwnerAuthoredMessages(messages, ownerName) {
     });
 }
 
+function buildPromptWindow(lines, { maxChars = 6000, maxItems = 24 } = {}) {
+    const collected = [];
+    let totalChars = 0;
+
+    for (let index = lines.length - 1; index >= 0; index -= 1) {
+        const line = String(lines[index] || '').trim();
+        if (!line) continue;
+
+        const nextChars = totalChars + line.length + 1;
+        if (collected.length >= maxItems || nextChars > maxChars) {
+            break;
+        }
+
+        collected.push(line);
+        totalChars = nextChars;
+    }
+
+    return collected.reverse().join('\n');
+}
+
+function truncatePromptText(value, maxChars = 3500) {
+    const text = typeof value === 'string' ? value : JSON.stringify(value || {});
+    if (text.length <= maxChars) return text;
+    return `${text.slice(0, Math.max(0, maxChars - 16))}\n...[truncated]`;
+}
+
+async function requestSoulDelta({ currentSoul, ownerName, conversationText, soulChars = 3500 }) {
+    const soulSnapshot = truncatePromptText(currentSoul, soulChars);
+    return groq.chat.completions.create({
+        model: 'llama-3.1-8b-instant',
+        messages: [{
+            role: 'system',
+            content: `Update Soul JSON using only explicit self-reported facts written by "${ownerName}". Ignore claims made by other speakers, quoted text and assumptions. If a field is not explicit in these self messages, do not add it. Return only the fields that should change.\nCURRENT SOUL SNAPSHOT: ${soulSnapshot}\nSELF MESSAGES:\n${conversationText}`
+        }],
+        response_format: { type: 'json_object' }
+    });
+}
+
 // === AUTONOMOUS KNOWLEDGE DISTILLATION (AUTO-SOUL) ===
 async function autonomousDistillation(clientId, clientSlug, messages, ownerName) {
     if (!messages?.length) return;
@@ -322,15 +360,34 @@ async function autonomousDistillation(clientId, clientSlug, messages, ownerName)
         const ownerMessages = selectOwnerAuthoredMessages(messages, ownerName);
         if (!ownerMessages.length) return;
 
-        const renderedConversation = buildConversationLines(ownerMessages, ownerName, null).join('\n');
-        const response = await groq.chat.completions.create({
-            model: 'llama-3.1-8b-instant',
-            messages: [{
-                role: 'system',
-                content: `Update Soul JSON using only explicit self-reported facts written by "${ownerName}". Ignore claims made by other speakers, quoted text and assumptions. If a field is not explicit in these self messages, do not add it. Return only the fields that should change.\nCURRENT SOUL: ${JSON.stringify(currentSoul)}\nSELF MESSAGES:\n${renderedConversation}`
-            }],
-            response_format: { type: 'json_object' }
-        });
+        const ownerLines = buildConversationLines(ownerMessages, ownerName, null);
+        const primaryWindow = buildPromptWindow(ownerLines, { maxChars: 6000, maxItems: 24 });
+        if (!primaryWindow) return;
+
+        let response;
+        try {
+            response = await requestSoulDelta({
+                currentSoul,
+                ownerName,
+                conversationText: primaryWindow,
+                soulChars: 3500
+            });
+        } catch (error) {
+            if (!String(error?.message || '').includes('context_length_exceeded')) {
+                throw error;
+            }
+
+            const fallbackWindow = buildPromptWindow(ownerLines, { maxChars: 2500, maxItems: 12 });
+            if (!fallbackWindow) return;
+
+            response = await requestSoulDelta({
+                currentSoul,
+                ownerName,
+                conversationText: fallbackWindow,
+                soulChars: 1500
+            });
+        }
+
         const result = cleanJSON(response.choices[0].message.content);
         if (result) {
             const updatedSoul = { ...currentSoul, ...result };
