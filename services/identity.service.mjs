@@ -150,6 +150,28 @@ function sanitizeIdentityAliases(values = [], preserve = []) {
         });
 }
 
+function sanitizePersonalIdentityAliases(canonicalName, values = [], preserve = []) {
+    const normalizedCanonical = normalizeIdentityName(canonicalName);
+    const preserved = new Set(
+        [
+            ...(preserve || []),
+            normalizedCanonical?.canonical
+        ]
+            .map(value => normalizeComparableText(value))
+            .filter(Boolean)
+    );
+
+    return mergeAliases(values)
+        .filter(alias => {
+            const normalized = normalizeComparableText(alias);
+            if (!normalized) return false;
+            if (preserved.has(normalized)) return true;
+            if (isLowValueIdentityAlias(alias)) return false;
+            if (looksHumanIdentityLabel(normalizedCanonical?.canonical || '') && isLikelyGroupLabel(alias)) return false;
+            return true;
+        });
+}
+
 function sanitizeOwnerIdentityAliases(canonicalName) {
     const normalized = normalizeIdentityName(canonicalName);
     return normalized ? [normalized.canonical] : [];
@@ -237,7 +259,7 @@ function buildIdentityAliasSet(row) {
     if (isLikelyGroupConversation(row?.remote_id)) {
         return sanitizeGroupIdentityAliases(canonical, merged);
     }
-    return sanitizeIdentityAliases(merged, canonical ? [canonical] : []);
+    return sanitizePersonalIdentityAliases(canonical, merged, canonical ? [canonical] : []);
 }
 
 function buildAliasOwnershipMap(rows = []) {
@@ -411,7 +433,7 @@ export async function upsertContactIdentity(clientId, remoteId, canonicalName, a
             ? sanitizeOwnerIdentityAliases(ownerPreferredName || normalized.canonical)
             : (isLikelyGroupConversation(remoteId)
                 ? sanitizeGroupIdentityAliases(normalized.canonical, rawAliasList)
-                : sanitizeIdentityAliases(rawAliasList, [normalized.canonical]));
+                : sanitizePersonalIdentityAliases(normalized.canonical, rawAliasList, [normalized.canonical]));
         const nextConfidence = Math.max(Number(existing?.confidence || 0), Number(confidence || 0));
         const nextSourceDetails = {
             ...(existing?.source_details || {}),
@@ -647,6 +669,7 @@ async function collectIdentitySignals(clientId) {
 
         for (const memory of (memories || [])) {
             const remoteId = memory.metadata?.remoteId;
+            if (isLikelyGroupConversation(remoteId)) continue;
             const canonicalName = pickBestHumanName(memory.sender, memory.metadata?.contactName);
             if (!remoteId || !canonicalName) continue;
             signals.push({
