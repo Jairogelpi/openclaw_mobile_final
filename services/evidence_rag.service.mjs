@@ -517,6 +517,33 @@ function dedupeCandidates(candidates) {
     });
 }
 
+function normalizeIdentityEvidenceCandidate(candidate) {
+    if (!candidate || candidate.source_kind !== 'fact') return candidate;
+    if (candidate.metadata?.fact_type !== 'contact_identity') return candidate;
+
+    const remoteId = String(candidate.remote_id || '').trim();
+    const isGroupIdentity = remoteId.endsWith('@g.us') || candidate.metadata?.identity_kind === 'group';
+    const nextText = String(candidate.evidence_text || '').trim();
+    if (!nextText) return candidate;
+
+    const normalizedText = isGroupIdentity
+        ? nextText.replace(' es un contacto identificado en tu memoria.', ' es un grupo identificado en tu memoria.')
+        : nextText.replace(' es un grupo identificado en tu memoria.', ' es un contacto identificado en tu memoria.');
+
+    if (normalizedText === nextText && candidate.metadata?.identity_kind === (isGroupIdentity ? 'group' : 'contact')) {
+        return candidate;
+    }
+
+    return {
+        ...candidate,
+        evidence_text: normalizedText,
+        metadata: {
+            ...(candidate.metadata || {}),
+            identity_kind: isGroupIdentity ? 'group' : 'contact'
+        }
+    };
+}
+
 function assignCitationLabels(candidates) {
     return (candidates || []).map((candidate, index) => ({
         ...candidate,
@@ -867,7 +894,7 @@ export async function collectEvidenceCandidates(clientId, queryText, queryVector
         ...mediaCandidates,
         ...semanticCandidates,
         ...graphCandidates
-    ]);
+    ]).map(normalizeIdentityEvidenceCandidate);
 
     const rankedBase = rerankerEnabled
         ? await rerankEvidenceCandidates({
