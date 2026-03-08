@@ -130,7 +130,7 @@ async function main() {
         fetchRows('knowledge_nodes', 'id, entity_name, entity_type, description'),
         fetchRows('knowledge_edges', 'id, source_node, target_node, relation_type, context, weight'),
         fetchRows('contact_identities', 'id, remote_id, canonical_name, aliases, source_details'),
-        fetchRows('knowledge_communities', 'id, summary, size, density')
+        fetchRows('knowledge_communities', 'id, community_name, summary, temporal_horizon, created_at')
     ]);
 
     const nodeCommunityCount = await fetchNodeCommunityCount();
