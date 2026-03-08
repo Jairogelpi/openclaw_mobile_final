@@ -87,14 +87,36 @@ function isSuspiciousEdge(edge) {
     return false;
 }
 
-async function fetchRows(table, select) {
-    const { data, error } = await supabase
+async function fetchRows(table, select, { pageSize = 1000 } = {}) {
+    const rows = [];
+    let from = 0;
+
+    while (true) {
+        const to = from + pageSize - 1;
+        const { data, error } = await supabase
+            .from(table)
+            .select(select)
+            .eq('client_id', clientId)
+            .range(from, to);
+
+        if (error) throw error;
+        const batch = data || [];
+        rows.push(...batch);
+        if (batch.length < pageSize) break;
+        from += pageSize;
+    }
+
+    return rows;
+}
+
+async function fetchCount(table) {
+    const { count, error } = await supabase
         .from(table)
-        .select(select)
+        .select('*', { head: true, count: 'exact' })
         .eq('client_id', clientId);
 
     if (error) throw error;
-    return data || [];
+    return Number(count || 0);
 }
 
 async function fetchNodeCommunityCount() {
@@ -123,14 +145,26 @@ async function main() {
         knowledgeNodes,
         knowledgeEdges,
         contactIdentities,
-        knowledgeCommunities
+        knowledgeCommunities,
+        rawMessageCount,
+        userMemoryCount,
+        knowledgeNodeCount,
+        knowledgeEdgeCount,
+        contactIdentityCount,
+        knowledgeCommunityCount
     ] = await Promise.all([
         fetchRows('raw_messages', 'id, sender_role, remote_id, metadata, processed'),
         fetchRows('user_memories', 'id, sender, metadata'),
         fetchRows('knowledge_nodes', 'id, entity_name, entity_type, description'),
         fetchRows('knowledge_edges', 'id, source_node, target_node, relation_type, context, weight'),
         fetchRows('contact_identities', 'id, remote_id, canonical_name, aliases, source_details'),
-        fetchRows('knowledge_communities', 'id, community_name, summary, temporal_horizon, created_at')
+        fetchRows('knowledge_communities', 'id, community_name, summary, temporal_horizon, created_at'),
+        fetchCount('raw_messages'),
+        fetchCount('user_memories'),
+        fetchCount('knowledge_nodes'),
+        fetchCount('knowledge_edges'),
+        fetchCount('contact_identities'),
+        fetchCount('knowledge_communities')
     ]);
 
     const nodeCommunityCount = await fetchNodeCommunityCount();
@@ -161,13 +195,13 @@ async function main() {
     const report = {
         client_id: clientId,
         totals: {
-            raw_messages: rawMessages.length,
+            raw_messages: rawMessageCount,
             pending_raw_messages: pendingRaw,
-            user_memories: userMemories.length,
-            knowledge_nodes: knowledgeNodes.length,
-            knowledge_edges: knowledgeEdges.length,
-            contact_identities: contactIdentities.length,
-            knowledge_communities: knowledgeCommunities.length,
+            user_memories: userMemoryCount,
+            knowledge_nodes: knowledgeNodeCount,
+            knowledge_edges: knowledgeEdgeCount,
+            contact_identities: contactIdentityCount,
+            knowledge_communities: knowledgeCommunityCount,
             node_communities: nodeCommunityCount
         },
         generic_sender_roles: genericSenderRoles,
@@ -175,9 +209,9 @@ async function main() {
             suspicious_nodes: suspiciousNodes.length,
             suspicious_edges: suspiciousEdges.length,
             suspicious_identities: suspiciousIdentities.length,
-            suspicious_node_rate: knowledgeNodes.length ? Number((suspiciousNodes.length / knowledgeNodes.length).toFixed(4)) : 0,
-            suspicious_edge_rate: knowledgeEdges.length ? Number((suspiciousEdges.length / knowledgeEdges.length).toFixed(4)) : 0,
-            suspicious_identity_rate: contactIdentities.length ? Number((suspiciousIdentities.length / contactIdentities.length).toFixed(4)) : 0
+            suspicious_node_rate: knowledgeNodeCount ? Number((suspiciousNodes.length / knowledgeNodeCount).toFixed(4)) : 0,
+            suspicious_edge_rate: knowledgeEdgeCount ? Number((suspiciousEdges.length / knowledgeEdgeCount).toFixed(4)) : 0,
+            suspicious_identity_rate: contactIdentityCount ? Number((suspiciousIdentities.length / contactIdentityCount).toFixed(4)) : 0
         },
         samples: {
             suspicious_nodes: suspiciousNodes.slice(0, 20),
