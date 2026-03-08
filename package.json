@@ -13,7 +13,8 @@
         "migrate:evidence-rag": "node scripts/apply_evidence_first_rag.mjs",
         "seed:evidence-rag": "node scripts/build_rag_eval_cases.mjs",
         "eval:evidence-rag": "node scripts/eval_evidence_rag.mjs",
-        "repair:owner-identity": "node scripts/repair_owner_identity.mjs"
+        "repair:owner-identity": "node scripts/repair_owner_identity.mjs",
+        "bench:brain-admin": "node scripts/benchmark_brain_admin.mjs"
     },
     "dependencies": {
         "@huggingface/transformers": "^3.8.1",
