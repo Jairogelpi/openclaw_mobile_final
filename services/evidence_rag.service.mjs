@@ -1516,6 +1516,43 @@ function stripRepeatedSpeakerPrefixes(body = '', speaker = '') {
         .trim();
 }
 
+function detectTemporalThemes(bodies = []) {
+    const haystack = normalizeComparableText((bodies || []).join(' '));
+    if (!haystack) return [];
+
+    const themes = [];
+    const pushTheme = (id, text) => {
+        if (themes.some(theme => theme.id === id)) return;
+        themes.push({ id, text });
+    };
+
+    if (/\b(discutiendo|discuten|discuten|discutir|problemas|agobio|agobias|mierda)\b/.test(haystack)) {
+        pushTheme('discussion', 'habla de discusiones o problemas');
+    }
+    if (/\b(te amo|amarme|amemos|amor|te quiero|quererte)\b/.test(haystack)) {
+        pushTheme('affection', 'expresa afecto');
+    }
+    if (/\b(estabilidad|tranquilidad|bien contigo|feliz|felicidad)\b/.test(haystack)) {
+        pushTheme('stability', 'transmite estabilidad o bienestar');
+    }
+    if (/\b(comuniquemos|comunicarnos|hablando|comunicativo)\b/.test(haystack)) {
+        pushTheme('communication', 'destaca la importancia de comunicarse');
+    }
+    if (/\b(llorar|ansiedad|triste|espalda fatal)\b/.test(haystack)) {
+        pushTheme('distress', 'menciona malestar emocional o cansancio');
+    }
+
+    return themes;
+}
+
+function joinNaturalLanguage(parts = []) {
+    const values = (parts || []).filter(Boolean);
+    if (!values.length) return '';
+    if (values.length === 1) return values[0];
+    if (values.length === 2) return `${values[0]} y ${values[1]}`;
+    return `${values.slice(0, -1).join(', ')} y ${values[values.length - 1]}`;
+}
+
 function composeTemporalReply(verification) {
     const claims = verification.supportedClaims || [];
     if (!claims.length) return null;
@@ -1549,6 +1586,11 @@ function composeTemporalReply(verification) {
         if (uniqueBodies.some(item => normalizeComparableText(item) === normalized)) continue;
         uniqueBodies.push(body);
         if (uniqueBodies.length >= 2) break;
+    }
+
+    const themes = detectTemporalThemes(uniqueBodies);
+    if (sameDate && sameSpeaker && themes.length >= 2) {
+        return `El ${parsed[0].parsed.date}, ${parsed[0].parsed.speaker} ${joinNaturalLanguage(themes.slice(0, 3).map(theme => theme.text))}. ${citationText}`.trim();
     }
 
     if (sameDate && sameSpeaker) {
