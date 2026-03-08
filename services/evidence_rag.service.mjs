@@ -472,7 +472,20 @@ async function collectHybridRecall(clientId, queryText, queryVector, queryVarian
 function dedupeCandidates(candidates) {
     const seen = new Set();
     return (candidates || []).filter(candidate => {
-        const key = `${candidate.source_kind}:${candidate.source_id}`;
+        let key = `${candidate.source_kind}:${candidate.source_id}`;
+        if (candidate?.source_kind === 'memory_chunk') {
+            const remoteId = normalizeComparableText(candidate.remote_id || candidate.metadata?.remoteId || candidate.metadata?.remote_id || '');
+            const timestamp = String(candidate.timestamp || '').slice(0, 19);
+            const signature = normalizeComparableText(
+                String(candidate.evidence_text || '')
+                    .replace(/\[[^\]]+\]/g, ' ')
+                    .replace(/\s+/g, ' ')
+                    .trim()
+            ).slice(0, 260);
+            if (signature) {
+                key = `${candidate.source_kind}:${remoteId}:${timestamp}:${signature}`;
+            }
+        }
         if (seen.has(key)) return false;
         seen.add(key);
         return true;
@@ -916,12 +929,129 @@ function normalizeSentence(text, maxLength = 220) {
         .slice(0, maxLength);
 }
 
-function extractMemorySnippet(text, speaker = null, maxLength = 180) {
-    const lines = String(text || '')
+function cleanConversationLines(text) {
+    return String(text || '')
         .split('\n')
         .map(line => line.replace(/\[[^\]]+\]/g, '').trim())
-        .filter(Boolean);
-    const preferred = (lines.filter(line => line.includes(':')).slice(0, 2).join(' ') || lines.slice(0, 2).join(' '));
+        .filter(Boolean)
+        .filter(line => {
+            const normalized = normalizeComparableText(line);
+            if (!normalized) return false;
+            if (normalized.includes('fragmento conversacional')) return false;
+            if (normalized.startsWith('contacto:')) return false;
+            if (normalized.startsWith('id:')) return false;
+            if (normalized.startsWith('fecha:')) return false;
+            return true;
+        });
+}
+
+function isWeakConversationLine(line) {
+    const normalized = normalizeComparableText(line);
+    if (!normalized) return true;
+    if (normalized.length < 8) return true;
+    if (/^(ja|jaja|jajaja|ajaj|ajajaja|xd)+$/i.test(normalized.replace(/\s+/g, ''))) return true;
+    return [
+        'hola',
+        'venga',
+        'acho',
+        'claro',
+        'bueno',
+        'vale',
+        'si',
+        'no',
+        'ok',
+        'okey',
+        'juato',
+        'justooo',
+        'bieeeeeen',
+        'perdon'
+    ].includes(normalized);
+}
+
+function scoreConversationLine(line) {
+    const normalized = normalizeComparableText(line);
+    if (!normalized) return -10;
+
+    let score = 0;
+    const hasSpeakerPrefix = /^[^:\n]{2,32}:/.test(String(line || '').trim());
+    if (hasSpeakerPrefix) score += 4;
+
+    if (normalized.length >= 20) score += 2;
+    if (normalized.length >= 45) score += 2;
+    if (normalized.length >= 90) score += 1;
+
+    if (/\b(te amo|te quiero|feliz|triste|llorar|ansiedad|madre|padres|trabaj|curro|comiendo|cenado|ceno|comer|pueblo|badajoz|caceres|caceres|verte|llame|dormir|estabilidad|amor|gracias)\b/i.test(normalized)) {
+        score += 4;
+    }
+
+    if (/\b(hoy|ayer|jueves|viernes|lunes|martes|miercoles|miércoles|sabado|sábado|domingo)\b/i.test(normalized)) {
+        score += 2;
+    }
+
+    if (isWeakConversationLine(line)) score -= 6;
+    return score;
+}
+
+function scoreTemporalSnippetForPlan(plan, candidate) {
+    if (!(plan?.temporal_window && candidate?.source_kind === 'memory_chunk')) return -1;
+
+    const snippet = extractMemorySnippet(candidate.evidence_text, candidate.speaker, 220);
+    const normalizedSnippet = normalizeComparableText(snippet);
+    let score = scoreConversationLine(snippet);
+
+    const requestedDay = normalizeComparableText(plan.temporal_window?.label || '');
+    const weekdays = ['lunes', 'martes', 'miercoles', 'miércoles', 'jueves', 'viernes', 'sabado', 'sábado', 'domingo'];
+
+    if (requestedDay && normalizedSnippet.includes(requestedDay)) {
+        score += 3;
+    }
+
+    for (const weekday of weekdays) {
+        if (!normalizedSnippet.includes(weekday)) continue;
+        if (weekday !== requestedDay) score -= 5;
+    }
+
+    if (/\b(te amo|amor|feliz|triste|llorar|verte|abrazarte|gracias|estabilidad|ansiedad|padres|madre|trabaj|curro|comer|cena|dormir)\b/i.test(normalizedSnippet)) {
+        score += 2;
+    }
+
+    return score;
+}
+
+function extractMemorySnippet(text, speaker = null, maxLength = 180) {
+    const lines = cleanConversationLines(text);
+    if (!lines.length) return '';
+
+    const scored = lines
+        .map((line, index) => ({
+            line,
+            index,
+            score: scoreConversationLine(line)
+        }))
+        .sort((a, b) => b.score - a.score || a.index - b.index);
+
+    const lead = scored[0] || null;
+    const chosenIndexes = new Set();
+    if (lead) chosenIndexes.add(lead.index);
+
+    if (lead) {
+        const adjacentIndexes = [lead.index - 1, lead.index + 1]
+            .filter(index => index >= 0 && index < lines.length);
+
+        for (const index of adjacentIndexes) {
+            const adjacentLine = lines[index];
+            if (isWeakConversationLine(adjacentLine)) continue;
+            if (scoreConversationLine(adjacentLine) < Math.max(1, lead.score - 4)) continue;
+            chosenIndexes.add(index);
+            if (chosenIndexes.size >= 2) break;
+        }
+    }
+
+    const preferred = [...chosenIndexes]
+        .sort((a, b) => a - b)
+        .map(index => lines[index])
+        .join(' ') || lines.slice(0, 2).join(' ');
+
     let snippet = normalizeSentence(preferred, maxLength);
 
     if (speaker) {
@@ -937,10 +1067,7 @@ function extractMemorySnippet(text, speaker = null, maxLength = 180) {
 }
 
 function extractMediaSnippet(text, speaker = null, maxLength = 180) {
-    const lines = String(text || '')
-        .split('\n')
-        .map(line => line.replace(/\[[^\]]+\]/g, '').trim())
-        .filter(Boolean);
+    const lines = cleanConversationLines(text);
     const mediaLine = lines.find(line => /\b(audio|nota de voz|voz|foto|imagen|video|documento|pdf|archivo)\b/i.test(line));
     if (mediaLine) {
         return extractMemorySnippet(mediaLine, speaker, maxLength);
@@ -1043,7 +1170,9 @@ function buildDeterministicClaims(plan, directCandidates) {
                 if (candidate.source_kind === 'memory_chunk') return 5;
                 return 9;
             };
-            return candidatePriority(a) - candidatePriority(b) || Number(b.final_score || 0) - Number(a.final_score || 0);
+            return candidatePriority(a) - candidatePriority(b)
+                || scoreTemporalSnippetForPlan(plan, b) - scoreTemporalSnippetForPlan(plan, a)
+                || Number(b.final_score || 0) - Number(a.final_score || 0);
         });
 
         if (plan.intent === 'media_lookup') {
@@ -1174,10 +1303,11 @@ ${buildEvidenceBlock(directCandidates)}`;
     const forceDeterministicIdentity = plan.intent === 'identity_lookup' &&
         directCandidates.some(candidate => candidate.source_kind === 'fact' &&
             (candidate.metadata?.owner_identity || candidate.metadata?.fact_type === 'contact_identity'));
+    const forceDeterministicTemporal = Boolean(plan.temporal_window && deterministicClaims.length > 0);
     const forceDeterministicMedia = plan.intent === 'media_lookup' && deterministicClaims.length > 0;
     const forceDeterministicRelationship = plan.intent === 'relationship_lookup' && deterministicClaims.length > 0;
 
-    if ((forceDeterministicIdentity || forceDeterministicMedia || forceDeterministicRelationship) && deterministicClaims.length) {
+    if ((forceDeterministicIdentity || forceDeterministicTemporal || forceDeterministicMedia || forceDeterministicRelationship) && deterministicClaims.length) {
         return {
             verdict: 'answer',
             answer: '',
@@ -1325,7 +1455,9 @@ function composeFinalReply(verification) {
 }
 
 function compactSupportedClaims(plan, claims = []) {
-    const maxClaims = plan?.intent === 'relationship_lookup' ? 2 : 1;
+    const maxClaims = plan?.intent === 'relationship_lookup'
+        ? 2
+        : (plan?.intent === 'temporal_lookup' ? 2 : 1);
     const maxCitations = plan?.intent === 'media_lookup' ? 2 : 3;
     return (claims || [])
         .slice(0, maxClaims)
@@ -1342,7 +1474,7 @@ export async function runEvidenceFirstRag({ clientId, queryText, queryVector, tr
     trace?.setQueryPlan?.(plan);
     const candidates = await collectEvidenceCandidates(clientId, queryText, queryVector, plan, trace);
     const draft = await draftEvidenceAnswer(queryText, plan, candidates, trace);
-    const bypassClaimVerifier = ['media_lookup', 'relationship_lookup'].includes(plan.intent);
+    const bypassClaimVerifier = ['temporal_lookup', 'media_lookup', 'relationship_lookup'].includes(plan.intent);
     const verification = (claimVerifierEnabled && !bypassClaimVerifier)
         ? await verifyDraftedClaims(queryText, draft, candidates, trace)
         : {
