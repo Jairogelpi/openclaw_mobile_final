@@ -61,6 +61,8 @@ const BLOCKED_EXACT_ENTITY_NAMES = new Set([
     'su madre',
     'su padre',
     'el medico',
+    'casa',
+    'mr',
     'él',
     'ella',
     'ellos',

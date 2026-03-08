@@ -148,6 +148,11 @@ function sanitizeIdentityAliases(values = [], preserve = []) {
         });
 }
 
+function sanitizeOwnerIdentityAliases(canonicalName) {
+    const normalized = normalizeIdentityName(canonicalName);
+    return normalized ? [normalized.canonical] : [];
+}
+
 function addScoredName(scores, value, weight = 1) {
     const normalized = normalizeIdentityName(value);
     if (!normalized || isLowValueIdentityAlias(normalized.canonical)) return;
@@ -222,7 +227,9 @@ export async function upsertContactIdentity(clientId, remoteId, canonicalName, a
             aliases,
             [fallbackNameFromRemoteId(remoteId)]
         );
-        const nextAliases = sanitizeIdentityAliases(rawAliasList, [normalized.canonical]);
+        const nextAliases = selfSignal
+            ? sanitizeOwnerIdentityAliases(ownerPreferredName || normalized.canonical)
+            : sanitizeIdentityAliases(rawAliasList, [normalized.canonical]);
         const nextConfidence = Math.max(Number(existing?.confidence || 0), Number(confidence || 0));
         const nextSourceDetails = {
             ...(existing?.source_details || {}),
@@ -358,10 +365,7 @@ export async function repairOwnerIdentity(clientId, preferredName = null) {
 
     for (const row of targetRows) {
         remoteIds.add(row.remote_id);
-        const aliases = sanitizeIdentityAliases(
-            [normalizedOwner.canonical, ...(row.aliases || []), ...(ownerProfile.aliases || [])],
-            [normalizedOwner.canonical]
-        );
+        const aliases = sanitizeOwnerIdentityAliases(normalizedOwner.canonical);
 
         const { error } = await supabase
             .from('contact_identities')
@@ -387,7 +391,7 @@ export async function repairOwnerIdentity(clientId, preferredName = null) {
         clientId,
         'self',
         normalizedOwner.canonical,
-        [normalizedOwner.canonical, ...(ownerProfile.aliases || [])],
+        sanitizeOwnerIdentityAliases(normalizedOwner.canonical),
         1,
         {
             owner_identity: true,
