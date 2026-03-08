@@ -3,6 +3,7 @@ import { Worker } from 'bullmq';
 import { outgoingQueue } from './config/queues.mjs';
 import { processMessage } from './core_engine.mjs';
 import { warmupEmbedder } from './services/local_ai.mjs';
+import { preloadConfigCache } from './services/config.service.mjs';
 import IORedis from 'ioredis';
 import redisClient from './config/redis.mjs';
 import supabase from './config/supabase.mjs';
@@ -14,6 +15,11 @@ const redisConnection = new IORedis({
 });
 
 console.log('🧠 [Brain Worker] Iniciando servicio neuro-cognitivo (AI Microservice)...');
+try {
+    await preloadConfigCache();
+} catch (err) {
+    console.warn(`[Brain Worker] Config preload skipped: ${err.message}`);
+}
 warmupEmbedder('brain_worker_boot').catch(err => {
     console.warn(`[Brain Worker] Warmup skipped: ${err.message}`);
 });

@@ -33,6 +33,7 @@ import { handleWhatsAppPair, handleWhatsAppStatus, handleWhatsAppLogout, handleW
 import { handleSoulGet, handleSoulRefine } from './controllers/soul.controller.mjs';
 import { handleUpdateSettings } from './controllers/settings.controller.mjs';
 import { handleAccountDelete } from './controllers/account.controller.mjs';
+import { preloadConfigCache } from './services/config.service.mjs';
 
 const upload = multer({ dest: 'uploads/' });
 
@@ -678,6 +679,11 @@ httpServer.on('upgrade', async (request, socket, head) => {
 });
 
 httpServer.listen(PORT, '0.0.0.0', async () => {
+    try {
+        await preloadConfigCache();
+    } catch (err) {
+        console.warn(`[Gateway Boot] Config preload skipped: ${err.message}`);
+    }
     console.log(`🚀 SaaS Bridge listening on http://0.0.0.0:${PORT}`);
 
     // --- 🚀 AUTO-RECONNECT WHATSAPP CLIENTS ---

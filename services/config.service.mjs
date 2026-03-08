@@ -68,6 +68,14 @@ async function refreshConfigCache() {
     }
 }
 
+export async function preloadConfigCache({ force = false } = {}) {
+    if (!force && Date.now() - lastFetchTime <= CACHE_TTL_MS && Object.keys(configCache).length) {
+        return { ...DEFAULTS, ...configCache };
+    }
+    await refreshConfigCache();
+    return { ...DEFAULTS, ...configCache };
+}
+
 /**
  * Obtiene un valor de configuración. Si el caché ha caducado (60s), lo recarga.
  * Si la key no existe, devuelve el default hardcodeado.
