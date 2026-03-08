@@ -1,5 +1,5 @@
 import supabase from '../config/supabase.mjs';
-import { normalizeComparableText } from '../utils/message_guard.mjs';
+import { fallbackNameFromRemoteId, normalizeComparableText } from '../utils/message_guard.mjs';
 
 const clientId = process.argv[2];
 
@@ -90,6 +90,20 @@ function isSuspiciousEdge(edge) {
     if (SUSPICIOUS_CONTEXT_PATTERNS.some(pattern => pattern.test(context))) return true;
     if (!String(edge.relation_type || '').trim()) return true;
     return false;
+}
+
+function isFallbackNumericIdentity(row) {
+    const remoteId = String(row?.remote_id || '').trim();
+    if (!remoteId || String(remoteId).endsWith('@g.us')) return false;
+
+    const fallbackName = fallbackNameFromRemoteId(remoteId);
+    const canonical = String(row?.canonical_name || '').trim();
+    const aliases = Array.isArray(row?.aliases) ? row.aliases.map(alias => String(alias || '').trim()).filter(Boolean) : [];
+
+    if (!fallbackName || canonical !== fallbackName) return false;
+    if (!/^\d{6,}$/.test(canonical)) return false;
+
+    return aliases.length <= 1 && (!aliases.length || aliases[0] === fallbackName);
 }
 
 async function fetchRows(table, select, { pageSize = 1000 } = {}) {
@@ -187,6 +201,7 @@ async function main() {
     const suspiciousNodes = knowledgeNodes.filter(node => isBlockedNodeName(node.entity_name));
     const suspiciousEdges = knowledgeEdges.filter(edge => isSuspiciousEdge(edge));
     const suspiciousIdentities = contactIdentities.filter(row => {
+        if (isFallbackNumericIdentity(row)) return false;
         const aliases = Array.isArray(row.aliases) ? row.aliases : [];
         if (String(row.remote_id || '').endsWith('@g.us')) {
             return aliases.some(alias => {
