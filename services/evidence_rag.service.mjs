@@ -929,6 +929,15 @@ function normalizeSentence(text, maxLength = 220) {
         .slice(0, maxLength);
 }
 
+function normalizeReadableSnippetText(text = '') {
+    return String(text || '')
+        .replace(/\bde(ll[a-záéíóúñ]+)/gi, 'de $1')
+        .replace(/\s+,/g, ',')
+        .replace(/\s+\./g, '.')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
 function cleanConversationLines(text) {
     return String(text || '')
         .split('\n')
@@ -1120,8 +1129,9 @@ function buildMediaClaimText(candidate) {
 }
 
 function extractMediaBody(candidate) {
-    const mediaSnippet = String(candidate?.metadata?.mediaSnippet || '').trim()
-        || extractMediaSnippet(candidate?.evidence_text, candidate?.speaker, 220);
+    const mediaSnippet = normalizeReadableSnippetText(
+        String(candidate?.metadata?.mediaSnippet || '').trim()
+    ) || extractMediaSnippet(candidate?.evidence_text, candidate?.speaker, 220);
     if (!mediaSnippet) return '';
 
     const participants = (candidate?.metadata?.mediaParticipants || []).filter(Boolean);
@@ -1135,10 +1145,10 @@ function extractMediaBody(candidate) {
         body = stripRepeatedSpeakerPrefixes(body, speaker);
     }
 
-    return body
+    return normalizeReadableSnippetText(body
         .replace(/\b(audio|nota de voz|voz|foto|imagen|video|documento|pdf|archivo)\b\s*(de|del)?\s*/gi, match => match.trim())
         .replace(/\s+/g, ' ')
-        .trim();
+        .trim());
 }
 
 function isWeakMediaClause(clause = '') {
@@ -1572,9 +1582,7 @@ function parseTemporalClaim(claimText = '') {
 }
 
 function shortenTemporalBody(body = '') {
-    const text = String(body || '')
-        .replace(/\s+/g, ' ')
-        .trim();
+    const text = normalizeReadableSnippetText(body);
     if (!text) return '';
 
     const clauses = text
@@ -1592,7 +1600,7 @@ function shortenTemporalBody(body = '') {
         if (picked.length >= 2) break;
     }
 
-    return picked.join('; ') || normalizeSentence(text, 160);
+    return normalizeReadableSnippetText(picked.join('; ') || normalizeSentence(text, 160));
 }
 
 function stripRepeatedSpeakerPrefixes(body = '', speaker = '') {
