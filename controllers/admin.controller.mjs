@@ -8,7 +8,7 @@ import redisClient from '../config/redis.mjs';
 import { processMessage } from '../core_engine.mjs';
 import { getAggregatedMetrics } from '../services/rag_metrics.mjs';
 import { getAllConfig, setConfig } from '../services/config.service.mjs';
-import { adminNeuralQueue } from '../config/queues.mjs';
+import { adminNeuralQueue, adminNeuralQueueEvents } from '../config/queues.mjs';
 
 const execPromise = util.promisify(exec);
 
@@ -559,20 +559,30 @@ export async function adminNeuralChat(req, res) {
 
         console.log(`🧠 [Neural Terminal] Testing for ${clientId} (${clientSlug}): "${text.slice(0, 30)}..."`);
         if (adminNeuralQueue && redisClient) {
-            await adminNeuralQueue.add('admin_probe', payload, {
+            const job = await adminNeuralQueue.add('admin_probe', payload, {
                 jobId: requestId,
                 removeOnComplete: true,
                 attempts: 1
             });
 
-            const result = await waitForAdminNeuralResult(requestId, 35000);
-            if (!result) {
-                return res.status(504).json({ error: 'Timeout esperando respuesta del brain worker.' });
+            try {
+                const result = await job.waitUntilFinished(adminNeuralQueueEvents, 35000);
+                if (result && typeof result === 'object' && 'reply' in result) {
+                    return res.json({
+                        reply: result.reply,
+                        trace: result.trace || null
+                    });
+                }
+            } catch (error) {
+                const fallback = await waitForAdminNeuralResult(requestId, 1500);
+                if (fallback?.ok) {
+                    return res.json({ reply: fallback.reply, trace: fallback.trace || null });
+                }
+                if (error?.message?.includes('timed out')) {
+                    return res.status(504).json({ error: 'Timeout esperando respuesta del brain worker.' });
+                }
+                return res.status(500).json({ error: error.message || 'Fallo procesando admin probe.' });
             }
-            if (!result.ok) {
-                return res.status(500).json({ error: result.error || 'Fallo procesando admin probe.' });
-            }
-            return res.json({ reply: result.reply, trace: result.trace || null });
         }
 
         const reply = await processMessage(payload);

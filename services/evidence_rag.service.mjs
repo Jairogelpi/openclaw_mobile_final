@@ -486,6 +486,23 @@ function assignCitationLabels(candidates) {
     }));
 }
 
+function buildIdentityResolutionMapFromMatches(identityMatches = []) {
+    const resolved = new Map();
+    for (const row of (identityMatches || [])) {
+        const aliases = [...new Set([row.canonical_name, ...(row.aliases || [])].filter(Boolean))];
+        for (const alias of aliases) {
+            const normalized = normalizeComparableText(alias);
+            if (!normalized || resolved.has(normalized)) continue;
+            resolved.set(normalized, {
+                canonicalName: row.canonical_name,
+                remoteId: row.remote_id,
+                aliases
+            });
+        }
+    }
+    return resolved;
+}
+
 export async function buildRagQueryPlan(clientId, userQuery, trace = null) {
     await hydrateContactIdentities(clientId).catch(() => null);
 
@@ -543,7 +560,8 @@ Responde solo con el JSON del plan.`;
         relation_filter: relationFromQueryV2(userQuery),
         need_exact_entity_match: identityMatches.length > 0 || inferredEntities.length > 0,
         allow_graph_hops: !hasMediaSignal(userQuery),
-        allow_web: false
+        allow_web: false,
+        identity_match_count: identityMatches.length
     };
 
     let plan = null;
@@ -595,11 +613,19 @@ Responde solo con el JSON del plan.`;
         nextPlan.relation_filter = 'ANY_RELATION';
     }
 
-    const identityMap = await resolveIdentityNames(clientId, nextPlan.entities || []).catch(() => new Map());
+    let identityMap = buildIdentityResolutionMapFromMatches(identityMatches);
+    const unresolvedEntities = (nextPlan.entities || []).filter(entity => !identityMap.has(normalizeComparableText(entity)));
+    if (unresolvedEntities.length) {
+        const resolvedIdentityMap = await resolveIdentityNames(clientId, unresolvedEntities).catch(() => new Map());
+        for (const [key, value] of resolvedIdentityMap.entries()) {
+            if (!identityMap.has(key)) identityMap.set(key, value);
+        }
+    }
     nextPlan.entities = [...new Set((nextPlan.entities || []).map(entity => {
         const normalized = normalizeComparableText(entity);
         return identityMap.get(normalized)?.canonicalName || entity;
     }).filter(Boolean))];
+    nextPlan.identity_match_count = Number(identityMatches.length || nextPlan.identity_match_count || 0);
 
     return nextPlan;
 }
@@ -675,17 +701,17 @@ export async function collectEvidenceCandidates(clientId, queryText, queryVector
     const maxQueryVariants = Number(await getConfig('rag_max_query_variants')) || 4;
     const rerankerEnabled = await getConfig('rag_reranker_enabled');
     const entities = plan.entities || [];
-    const rawEntityMatches = await detectIdentityMatchesFromQueryFast(clientId, queryText).catch(() => []);
+    const rawEntityMatchCount = Number(plan.identity_match_count || 0);
     const strictUnknownExactLookup = Boolean(
         plan.need_exact_entity_match &&
         ['identity_lookup', 'fact_lookup', 'media_lookup'].includes(plan.intent) &&
         entities.length &&
-        rawEntityMatches.length === 0
+        rawEntityMatchCount === 0
     );
     const ghostOnlyExactLookup = Boolean(
         plan.need_exact_entity_match &&
         entities.length &&
-        rawEntityMatches.length === 0 &&
+        rawEntityMatchCount === 0 &&
         entities.every(entity => isGhostName(entity))
     );
     if (ghostOnlyExactLookup) {

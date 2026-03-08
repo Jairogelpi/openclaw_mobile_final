@@ -8,6 +8,7 @@ import {
 
 const REGISTRY_TTL_MS = 5 * 60 * 1000;
 const registryCache = new Map();
+const identityRowsCache = new Map();
 const STRONG_SELF_MARKERS = new Set([
     'user sent',
     'user_sent',
@@ -102,6 +103,26 @@ function mergeAliases(...aliasSets) {
     return [...seen.values()];
 }
 
+function cloneIdentityRows(rows = []) {
+    return (rows || []).map(row => ({
+        ...row,
+        aliases: Array.isArray(row.aliases) ? [...row.aliases] : row.aliases,
+        source_details: row.source_details ? { ...row.source_details } : row.source_details
+    }));
+}
+
+function setIdentityRowsCache(clientId, rows = []) {
+    identityRowsCache.set(clientId, {
+        at: Date.now(),
+        rows: cloneIdentityRows(rows)
+    });
+}
+
+function invalidateIdentityCache(clientId) {
+    registryCache.delete(clientId);
+    identityRowsCache.delete(clientId);
+}
+
 export async function upsertContactIdentity(clientId, remoteId, canonicalName, aliases = [], confidence = 0.75, sourceDetails = {}) {
     let normalized = normalizeIdentityName(canonicalName || fallbackNameFromRemoteId(remoteId));
     if (!clientId || !remoteId || !normalized) return null;
@@ -160,6 +181,15 @@ export async function upsertContactIdentity(clientId, remoteId, canonicalName, a
             .single();
 
         if (error) throw error;
+        const cached = identityRowsCache.get(clientId);
+        if (cached?.rows?.length) {
+            const nextRows = cached.rows.filter(row => row.remote_id !== remoteId);
+            nextRows.push(data);
+            setIdentityRowsCache(clientId, nextRows);
+        } else {
+            invalidateIdentityCache(clientId);
+        }
+        registryCache.set(clientId, Date.now());
         return data;
     } catch (error) {
         console.warn('[Identity Registry] Upsert skipped:', error.message);
@@ -296,6 +326,7 @@ export async function repairOwnerIdentity(clientId, preferredName = null) {
     );
 
     registryCache.set(clientId, Date.now());
+    identityRowsCache.delete(clientId);
     return {
         updated,
         preferredName: normalizedOwner.canonical,
@@ -394,7 +425,8 @@ async function collectIdentitySignals(clientId) {
 
 export async function hydrateContactIdentities(clientId, { force = false } = {}) {
     const cachedAt = registryCache.get(clientId);
-    if (!force && cachedAt && (Date.now() - cachedAt) < REGISTRY_TTL_MS) {
+    const cachedRows = identityRowsCache.get(clientId);
+    if (!force && cachedAt && (Date.now() - cachedAt) < REGISTRY_TTL_MS && cachedRows?.rows?.length) {
         return true;
     }
 
@@ -407,6 +439,7 @@ export async function hydrateContactIdentities(clientId, { force = false } = {})
 
             if (!error && Number(count || 0) > 0) {
                 registryCache.set(clientId, Date.now());
+                identityRowsCache.delete(clientId);
                 return true;
             }
         } catch (error) {
@@ -427,17 +460,25 @@ export async function hydrateContactIdentities(clientId, { force = false } = {})
     }
 
     registryCache.set(clientId, Date.now());
+    identityRowsCache.delete(clientId);
     return true;
 }
 
 export async function getIdentityRows(clientId) {
+    const cached = identityRowsCache.get(clientId);
+    if (cached && (Date.now() - cached.at) < REGISTRY_TTL_MS) {
+        return cloneIdentityRows(cached.rows);
+    }
+
     try {
         const { data, error } = await supabase
             .from('contact_identities')
             .select('*')
             .eq('client_id', clientId);
         if (error) throw error;
-        return data || [];
+        const rows = data || [];
+        setIdentityRowsCache(clientId, rows);
+        return cloneIdentityRows(rows);
     } catch (error) {
         console.warn('[Identity Registry] Read skipped:', error.message);
         return [];

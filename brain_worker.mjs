@@ -150,7 +150,7 @@ const adminNeuralWorker = new Worker('adminNeuralQueue', async (job) => {
             trace: result.trace,
             requestId: data.adminRequestId
         });
-        return result.reply;
+        return result;
     } catch (error) {
         await storeAdminResult(data.adminRequestId, {
             ok: false,

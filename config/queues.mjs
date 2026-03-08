@@ -1,4 +1,4 @@
-import { Queue } from 'bullmq';
+import { Queue, QueueEvents } from 'bullmq';
 import IORedis from 'ioredis';
 
 const redisConnection = new IORedis({
@@ -22,5 +22,6 @@ export const mediaQueue = new Queue('mediaProcessingQueue', { connection: redisC
 
 // Cola Admin: probes del terminal/admin van al brain worker, no al proceso gateway.
 export const adminNeuralQueue = new Queue('adminNeuralQueue', { connection: redisConnection });
+export const adminNeuralQueueEvents = new QueueEvents('adminNeuralQueue', { connection: redisConnection });
 
 console.log('📦 [Queues] Colas BullMQ inicializadas (incoming, outgoing, media, admin) sobre Redis.');
