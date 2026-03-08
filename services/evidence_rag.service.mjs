@@ -1119,6 +1119,108 @@ function buildMediaClaimText(candidate) {
     return `${datePrefix} aparece un recuerdo sobre un ${mediaKind}.`;
 }
 
+function extractMediaBody(candidate) {
+    const mediaSnippet = String(candidate?.metadata?.mediaSnippet || '').trim()
+        || extractMediaSnippet(candidate?.evidence_text, candidate?.speaker, 220);
+    if (!mediaSnippet) return '';
+
+    const participants = (candidate?.metadata?.mediaParticipants || []).filter(Boolean);
+    const speakerHints = [...new Set([
+        ...participants,
+        candidate?.speaker
+    ].filter(Boolean))];
+
+    let body = mediaSnippet;
+    for (const speaker of speakerHints) {
+        body = stripRepeatedSpeakerPrefixes(body, speaker);
+    }
+
+    return body
+        .replace(/\b(audio|nota de voz|voz|foto|imagen|video|documento|pdf|archivo)\b\s*(de|del)?\s*/gi, match => match.trim())
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function isWeakMediaClause(clause = '') {
+    const normalized = normalizeComparableText(clause);
+    if (!normalized) return true;
+    if (normalized.length < 12) return true;
+    if (/^(y|pero|pues|bueno|ah|ay)\b/.test(normalized) && normalized.length < 40) return true;
+    return [
+        'audio',
+        'el audio',
+        'nota de voz',
+        'foto',
+        'video',
+        'archivo',
+        'documento',
+        'pdf',
+        'mira el audio',
+        'esto era al audio'
+    ].includes(normalized);
+}
+
+function scoreMediaClause(clause = '') {
+    const normalized = normalizeComparableText(clause);
+    if (!normalized) return -10;
+
+    let score = 0;
+    if (normalized.length >= 20) score += 1;
+    if (normalized.length >= 45) score += 2;
+    if (/\b(audio|nota de voz|escuchaste|grabacion|grabación|voz)\b/.test(normalized)) score += 4;
+    if (/\b(llor|amor|te amo|gracias|feliz|triste|ayudas|problemas|comuniquemos)\b/.test(normalized)) score += 2;
+    if (/^(y|pero|pues|bueno|ah|ay)\b/.test(normalized)) score -= 3;
+    if (isWeakMediaClause(clause)) score -= 6;
+    return score;
+}
+
+function summarizeMediaCandidates(mediaCandidates = []) {
+    const candidates = (mediaCandidates || []).filter(Boolean);
+    if (!candidates.length) return null;
+
+    const lead = candidates[0];
+    const mediaKind = inferMediaKind(lead);
+    const speakers = (lead?.metadata?.mediaParticipants || []).length
+        ? lead.metadata.mediaParticipants.slice(0, 2)
+        : extractSpeakersFromDialog(lead?.metadata?.mediaSnippet || lead?.evidence_text || '');
+    const datePrefix = lead?.timestamp ? `El ${String(lead.timestamp).slice(0, 10)}` : 'En tus recuerdos';
+
+    const clauses = [];
+    for (const candidate of candidates.slice(0, 2)) {
+        const body = extractMediaBody(candidate);
+        const parts = String(body || '')
+            .split(/\s*[.;]\s*/g)
+            .map(part => normalizeSentence(part, 120))
+            .filter(Boolean)
+            .filter(part => !isWeakMediaClause(part));
+
+        for (const part of parts) {
+            const normalized = normalizeComparableText(part);
+            if (!normalized) continue;
+            if (clauses.some(item => normalizeComparableText(item) === normalized)) continue;
+            clauses.push(part);
+        }
+    }
+
+    const bestClauses = clauses
+        .slice()
+        .sort((a, b) => scoreMediaClause(b) - scoreMediaClause(a))
+        .slice(0, 2);
+
+    if (!bestClauses.length) return buildMediaClaimText(lead);
+
+    if (speakers.length >= 2) {
+        return `${datePrefix}, ${speakers[0]} y ${speakers[1]} hablan sobre un ${mediaKind}: ${bestClauses.join('; ')}.`;
+    }
+    if (speakers.length === 1) {
+        return `${datePrefix}, ${speakers[0]} menciona un ${mediaKind}: ${bestClauses.join('; ')}.`;
+    }
+    if (lead?.speaker) {
+        return `${datePrefix}, ${lead.speaker} menciona un ${mediaKind}: ${bestClauses.join('; ')}.`;
+    }
+    return `${datePrefix} aparece un ${mediaKind}: ${bestClauses.join('; ')}.`;
+}
+
 function humanizeRelationType(relationType) {
     const normalized = normalizeComparableText(String(relationType || '').replace(/[\[\]]/g, ' '));
     if (!normalized) return 'tiene relacion con';
@@ -1179,9 +1281,8 @@ function buildDeterministicClaims(plan, directCandidates) {
             const mediaCandidates = preferred.filter(candidate => candidate.source_kind === 'memory_chunk').slice(0, 3);
             if (mediaCandidates.length) {
                 const citationLabels = [...new Set(mediaCandidates.map(candidate => candidate.citation_label))].slice(0, 2);
-                const lead = mediaCandidates[0];
                 return [{
-                    text: normalizeSentence(buildMediaClaimText(lead), 180),
+                    text: normalizeSentence(summarizeMediaCandidates(mediaCandidates), 220),
                     citations: citationLabels
                 }];
         }
