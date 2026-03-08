@@ -1447,11 +1447,119 @@ function composeFinalReply(verification) {
         return `Veo evidencia contradictoria sobre esto:\n${claims.map(claim => `- ${claim.text} ${claim.citations.map(label => `[${label}]`).join(' ')}`).join('\n')}`;
     }
 
+    const temporalReply = composeTemporalReply(verification);
+    if (temporalReply) return temporalReply;
+
     if (claims.length === 1) {
         return `${claims[0].text} ${claims[0].citations.map(label => `[${label}]`).join(' ')}`.trim();
     }
 
     return `Segun tus recuerdos:\n${claims.map(claim => `- ${claim.text} ${claim.citations.map(label => `[${label}]`).join(' ')}`).join('\n')}`;
+}
+
+function parseTemporalClaim(claimText = '') {
+    const raw = String(claimText || '').trim();
+    const match = raw.match(/^(\d{4}-\d{2}-\d{2}):\s*([^:]+):\s*(.+)$/);
+    if (!match) return null;
+
+    const [, date, speaker, body] = match;
+    return {
+        date: String(date).trim(),
+        speaker: normalizeSentence(speaker, 40),
+        body: normalizeSentence(body, 220)
+    };
+}
+
+function shortenTemporalBody(body = '') {
+    const text = String(body || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+    if (!text) return '';
+
+    const clauses = text
+        .split(/\s*[.;]\s*/g)
+        .map(part => normalizeSentence(part, 140))
+        .filter(Boolean)
+        .filter(part => !isWeakConversationLine(part));
+
+    const picked = [];
+    for (const clause of clauses) {
+        const normalized = normalizeComparableText(clause);
+        if (!normalized) continue;
+        if (picked.some(item => normalizeComparableText(item) === normalized)) continue;
+        picked.push(clause);
+        if (picked.length >= 2) break;
+    }
+
+    return picked.join('; ') || normalizeSentence(text, 160);
+}
+
+function stripRepeatedSpeakerPrefixes(body = '', speaker = '') {
+    let next = String(body || '').trim();
+    const speakerName = String(speaker || '').trim();
+    if (!next || !speakerName) return next;
+
+    const variants = [...new Set([
+        speakerName,
+        speakerName.split(/\s+/)[0]
+    ].filter(Boolean))];
+
+    for (const variant of variants) {
+        const pattern = new RegExp(`(?:^|\\s+|;\\s*)${escapeRegex(variant)}\\s*:`, 'gi');
+        next = next.replace(pattern, '; ');
+    }
+
+    return next
+        .replace(/\s*;\s*/g, '; ')
+        .replace(/^;\s*/, '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function composeTemporalReply(verification) {
+    const claims = verification.supportedClaims || [];
+    if (!claims.length) return null;
+
+    const parsed = claims
+        .map(claim => ({
+            claim,
+            parsed: parseTemporalClaim(claim.text)
+        }))
+        .filter(item => item.parsed);
+
+    if (!parsed.length) return null;
+
+    const sameDate = parsed.every(item => item.parsed.date === parsed[0].parsed.date);
+    const sameSpeaker = parsed.every(item => normalizeComparableText(item.parsed.speaker) === normalizeComparableText(parsed[0].parsed.speaker));
+    const allCitations = [...new Set(parsed.flatMap(item => item.claim.citations || []).filter(Boolean))].slice(0, 3);
+    const citationText = allCitations.map(label => `[${label}]`).join(' ');
+
+    const bodies = parsed
+        .map(item => stripRepeatedSpeakerPrefixes(
+            shortenTemporalBody(item.parsed.body),
+            item.parsed.speaker
+        ))
+        .filter(Boolean);
+
+    if (!bodies.length) return null;
+
+    const uniqueBodies = [];
+    for (const body of bodies) {
+        const normalized = normalizeComparableText(body);
+        if (uniqueBodies.some(item => normalizeComparableText(item) === normalized)) continue;
+        uniqueBodies.push(body);
+        if (uniqueBodies.length >= 2) break;
+    }
+
+    if (sameDate && sameSpeaker) {
+        return `El ${parsed[0].parsed.date}, ${parsed[0].parsed.speaker} dice: ${uniqueBodies.join('; ')}. ${citationText}`.trim();
+    }
+
+    if (sameDate) {
+        return `El ${parsed[0].parsed.date} aparece esto en la conversación: ${uniqueBodies.join('; ')}. ${citationText}`.trim();
+    }
+
+    return null;
 }
 
 function compactSupportedClaims(plan, claims = []) {
