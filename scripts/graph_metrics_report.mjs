@@ -133,6 +133,18 @@ async function main() {
     const provisionalStableEdges = totalEdges - candidateEdges;
     const stableEdges = edges.filter(edge => ['provisional', 'stable'].includes(String(edge.stability_tier || '').trim().toLowerCase()));
     const stableGenericEdges = stableEdges.filter(edge => ['[RELACIONADO_CON]', '[HABLA_DE]'].includes(edge.relation_type)).length;
+    const stableGenericEdgeSamples = stableEdges
+        .filter(edge => ['[RELACIONADO_CON]', '[HABLA_DE]'].includes(edge.relation_type))
+        .slice(0, 10)
+        .map(edge => ({
+            source_node: edge.source_node,
+            relation_type: edge.relation_type,
+            target_node: edge.target_node,
+            context: edge.context,
+            stability_tier: edge.stability_tier,
+            support_count: edge.support_count,
+            stable_score: edge.stable_score
+        }));
 
     const nodeCommunityCount = communityIds.length
         ? await supabase.from('node_communities').select('*', { head: true, count: 'exact' }).in('community_id', communityIds)
@@ -172,7 +184,8 @@ async function main() {
         },
         samples: {
             suspicious_nodes: weakNodes.slice(0, 10),
-            suspicious_edges: weakEdges.slice(0, 10)
+            suspicious_edges: weakEdges.slice(0, 10),
+            stable_generic_or_talk_edges: stableGenericEdgeSamples
         }
     }, null, 2));
 }

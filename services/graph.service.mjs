@@ -8,6 +8,7 @@ import {
     sanitizeEntityType,
     sanitizeRelationType
 } from '../utils/knowledge_guard.mjs';
+import { isPhoneLikeGraphName } from '../utils/graph_admissibility_policy.mjs';
 import { normalizeComparableText } from '../utils/message_guard.mjs';
 import {
     computeEdgeStability,
@@ -402,6 +403,9 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
     if (!finalEntityName) return null;
 
     const finalEntityType = sanitizeEntityType(entityType);
+    if (finalEntityType === 'PERSONA' && isPhoneLikeGraphName(finalEntityName)) {
+        return null;
+    }
     const finalDescription = String(description || '').trim().slice(0, 1000);
 
     const { data: exactNode } = await supabase
