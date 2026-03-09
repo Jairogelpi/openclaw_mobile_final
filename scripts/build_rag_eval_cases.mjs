@@ -261,6 +261,7 @@ function buildAbstainCases(count = 24) {
             style_tag: 'adversarial',
             query: `quien es ${fakeName}`,
             expected_mode: 'abstain',
+            expected_citation_min: 0,
             expected_entities: [fakeName],
             expected_remote_ids: [],
             expected_substrings: [],

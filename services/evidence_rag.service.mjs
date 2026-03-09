@@ -413,6 +413,7 @@ function inferRawEntitiesFromQuery(queryText) {
         /\bque sabes de\s+(.+?)$/i,
         /\bque recuerdas de\s+(.+?)$/i,
         /\brecuerdas (?:el|la|los|las)?\s*(?:audio|nota de voz|foto|imagen|video|documento|pdf|archivo)?\s*(?:de|sobre)?\s+(.+?)$/i,
+        /\bque paso en\s+(.+?)\s+(?:el|la)?\s*(hoy|ayer|anoche|semana pasada|lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b/i,
         /\bque paso con\s+(.+?)\s+(?:el|la)?\s*(hoy|ayer|anoche|semana pasada|lunes|martes|miercoles|jueves|viernes|sabado|domingo)\b/i,
         /\bque relacion hay entre\s+(.+?)\s+y\s+(.+?)$/i,
         /\bcomo se relacionan\s+(.+?)\s+y\s+(.+?)$/i
