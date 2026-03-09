@@ -610,7 +610,8 @@ export function validateGroundedGraph({
             relationType === '[HABLA_DE]'
             && isGroup
             && (
-                sanitizeEntityType(sourceEntity.type) === 'GRUPO'
+                !isPersonLikeEntityType(sourceEntity.type)
+                || sanitizeEntityType(sourceEntity.type) === 'GRUPO'
                 || normalizeComparableText(sourceEntity.name) === normalizeComparableText(contactName)
             )
             && isPersonLikeEntityType(targetEntity.type)

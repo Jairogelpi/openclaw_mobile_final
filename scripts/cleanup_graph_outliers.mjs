@@ -52,7 +52,7 @@ async function main() {
     const groupTalkEdges = (allEdges || []).filter(edge =>
         String(edge.relation_type || '').trim() === '[HABLA_DE]'
         && (
-            nodeTypeByName.get(edge.source_node) === 'GRUPO'
+            nodeTypeByName.get(edge.source_node) !== 'PERSONA'
             || groupNames.has(edge.source_node)
         )
         && nodeTypeByName.get(edge.target_node) === 'PERSONA'
