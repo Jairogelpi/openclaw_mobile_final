@@ -139,13 +139,13 @@ Analiza y responde ÚNICAMENTE en JSON ESTRICTO.`;
 
         for (const ent of (quads.entities || [])) {
             const description = `${ent.desc || ''} ${ent.traits?.length ? `[Traits: ${ent.traits.join(', ')}]` : ''} `.trim();
-            await upsertKnowledgeNode(clientId, ent.name, ent.type || 'ENTITY', description);
+            await upsertKnowledgeNode(clientId, ent.name, ent.type || 'ENTITY', description, { source: 'legacy_hyper_extraction' });
             explicit++;
         }
         for (const rel of (quads.relationships || [])) {
             const enrichedType = rel.sentiment ? `${rel.type} (${rel.sentiment})` : rel.type;
             const finalWeight = rel.weight ? Math.min(10, Math.max(1, Math.round(rel.weight * 10))) : 1; // Normalize to 1-10 scale for the DB if they return 0-1
-            await upsertKnowledgeEdge(clientId, rel.source, rel.target, enrichedType, finalWeight, rel.context);
+            await upsertKnowledgeEdge(clientId, rel.source, rel.target, enrichedType, finalWeight, rel.context, ['direct'], { source: 'legacy_hyper_extraction' });
             implicit++;
         }
 
@@ -234,7 +234,7 @@ async function processConversationDepthStrict(clientId, remoteId, userName, cont
         let relationshipCount = 0;
 
         for (const entity of groundedGraph.entities) {
-            const nodeId = await upsertKnowledgeNode(clientId, entity.name, entity.type || 'ENTITY', entity.desc || '');
+            const nodeId = await upsertKnowledgeNode(clientId, entity.name, entity.type || 'ENTITY', entity.desc || '', { source: 'grounded_extraction' });
             if (nodeId) entityCount++;
         }
 
@@ -245,7 +245,9 @@ async function processConversationDepthStrict(clientId, remoteId, userName, cont
                 relationship.target,
                 relationship.type,
                 relationship.weight,
-                relationship.context
+                relationship.context,
+                ['grounded', 'direct'],
+                { source: 'grounded_extraction' }
             );
             if (saved) relationshipCount++;
         }
@@ -393,7 +395,7 @@ async function autonomousDistillation(clientId, clientSlug, messages, ownerName)
         if (result) {
             const updatedSoul = { ...currentSoul, ...result };
             await supabase.from('user_souls').update({ soul_json: updatedSoul }).eq('client_id', clientId);
-            await upsertKnowledgeNode(clientId, pickBestHumanName(updatedSoul.nombre, ownerName) || ownerName, 'PERSONA', `[ALMA] ${updatedSoul.bio || ''} `);
+            await upsertKnowledgeNode(clientId, pickBestHumanName(updatedSoul.nombre, ownerName) || ownerName, 'PERSONA', `[ALMA] ${updatedSoul.bio || ''} `, { source: 'auto_soul' });
 
             // --- SYNC PHYSICAL MD FILES ---
             try {
@@ -457,11 +459,11 @@ function repairJson(str) {
 
 async function saveGraphData(clientId, graphData) {
     for (const ent of (graphData.entities || [])) {
-        await upsertKnowledgeNode(clientId, ent.name, ent.type || 'ENTITY', ent.desc || '');
+        await upsertKnowledgeNode(clientId, ent.name, ent.type || 'ENTITY', ent.desc || '', { source: 'legacy_depth' });
     }
     for (const rel of (graphData.relationships || [])) {
         const weight = rel.weight ? Math.min(10, Math.max(1, Math.round(rel.weight * 10))) : 1;
-        await upsertKnowledgeEdge(clientId, rel.source, rel.target, rel.type, weight, rel.context || '');
+        await upsertKnowledgeEdge(clientId, rel.source, rel.target, rel.type, weight, rel.context || '', ['direct'], { source: 'legacy_depth' });
     }
 }
 
@@ -675,9 +677,9 @@ async function dreamCycle(clientId) {
         const discovery = parseLLMJson(dreamResponse.choices[0].message.content);
         for (const conn of (discovery?.latent_connections || [])) {
             if (conn.confidence > 0.7) {
-                await upsertKnowledgeNode(clientId, conn.source, 'ENTITY', 'Deducido');
-                await upsertKnowledgeNode(clientId, conn.target, 'ENTITY', 'Deducido');
-                await upsertKnowledgeEdge(clientId, conn.source, conn.target, conn.relation, 0.5, conn.reasoning);
+                await upsertKnowledgeNode(clientId, conn.source, 'ENTITY', 'Deducido', { source: 'dream_cycle' });
+                await upsertKnowledgeNode(clientId, conn.target, 'ENTITY', 'Deducido', { source: 'dream_cycle' });
+                await upsertKnowledgeEdge(clientId, conn.source, conn.target, conn.relation, 0.5, conn.reasoning, ['derived', 'dream_cycle'], { source: 'dream_cycle' });
             }
         }
     } catch (e) { }

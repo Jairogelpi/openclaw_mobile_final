@@ -186,9 +186,9 @@ async function distillKnowledgeFromContent(clientId, text) {
         if (triplets && triplets.length > 0) {
             const { upsertKnowledgeNode, upsertKnowledgeEdge } = await import('./services/graph.service.mjs');
             for (const [s, p, o] of triplets) {
-                await upsertKnowledgeNode(clientId, s, 'ENTITY', '');
-                await upsertKnowledgeNode(clientId, o, 'ENTITY', '');
-                await upsertKnowledgeEdge(clientId, s, o, p);
+                await upsertKnowledgeNode(clientId, s, 'ENTITY', '', { source: 'scraper' });
+                await upsertKnowledgeNode(clientId, o, 'ENTITY', '', { source: 'scraper' });
+                await upsertKnowledgeEdge(clientId, s, o, p, 1, null, ['direct'], { source: 'scraper' });
             }
             console.log(`✅ [Scraper Graph] ${triplets.length} conexiones añadidas.`);
         }

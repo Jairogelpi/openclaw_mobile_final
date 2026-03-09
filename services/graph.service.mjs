@@ -9,6 +9,11 @@ import {
     sanitizeRelationType
 } from '../utils/knowledge_guard.mjs';
 import { normalizeComparableText } from '../utils/message_guard.mjs';
+import {
+    computeEdgeStability,
+    computeNodeStability,
+    isStableTier
+} from '../utils/stable_graph_policy.mjs';
 
 function buildCitationLabel(prefix, id) {
     return `${prefix}${String(id || '').slice(0, 8)}`;
@@ -338,7 +343,7 @@ export async function traverseGraphV2(clientId, queryText, queryVector, matchCou
 /**
  * Stores or updates a knowledge node using deterministic normalization.
  */
-export async function upsertKnowledgeNode(clientId, entityName, entityType, description) {
+export async function upsertKnowledgeNode(clientId, entityName, entityType, description, options = {}) {
     const { data: soulRow } = await supabase
         .from('user_souls')
         .select('soul_json')
@@ -354,18 +359,42 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
 
     const { data: exactNode } = await supabase
         .from('knowledge_nodes')
-        .select('id, description')
+        .select('id, description, support_count, stable_score, stability_tier, entity_type')
         .eq('client_id', clientId)
         .eq('entity_name', finalEntityName)
         .maybeSingle();
 
+    const nextSupportCount = Number(exactNode?.support_count || 0) + 1;
+    const stability = computeNodeStability({
+        entityName: finalEntityName,
+        entityType: finalEntityType,
+        description: finalDescription,
+        supportCount: nextSupportCount,
+        source: options.source || '',
+        existingScore: exactNode?.stable_score || 0,
+        existingTier: exactNode?.stability_tier || 'candidate'
+    });
+
     if (exactNode?.id) {
+        const patch = {
+            support_count: nextSupportCount,
+            stable_score: stability.score,
+            stability_tier: stability.tier,
+            last_seen: new Date().toISOString()
+        };
         if (finalDescription && finalDescription.length > String(exactNode.description || '').length) {
-            await supabase
-                .from('knowledge_nodes')
-                .update({ description: finalDescription })
-                .eq('id', exactNode.id);
+            patch.description = finalDescription;
         }
+        if (finalEntityType && finalEntityType !== String(exactNode.entity_type || '').trim()) {
+            patch.entity_type = finalEntityType;
+        }
+        if (stability.promote) {
+            patch.embedding = await generateEmbedding(`${finalEntityName} ${patch.description || finalDescription || exactNode.description || ''}`);
+        }
+        await supabase
+            .from('knowledge_nodes')
+            .update(patch)
+            .eq('id', exactNode.id);
         return exactNode.id;
     }
 
@@ -392,14 +421,20 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
         }
     }
 
-    const embedding = await generateEmbedding(`${finalEntityName} ${finalDescription}`);
+    const embedding = stability.promote
+        ? await generateEmbedding(`${finalEntityName} ${finalDescription}`)
+        : null;
 
     const { data: inserted, error } = await supabase.from('knowledge_nodes').upsert({
         client_id: clientId,
         entity_name: finalEntityName,
         entity_type: finalEntityType,
         description: finalDescription,
-        embedding
+        embedding,
+        support_count: nextSupportCount,
+        stable_score: stability.score,
+        stability_tier: stability.tier,
+        last_seen: new Date().toISOString()
     }, { onConflict: 'client_id, entity_name' }).select('id').single();
 
     if (error) {
@@ -413,7 +448,7 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
 /**
  * Creates or updates an edge between two normalized entity names.
  */
-export async function upsertKnowledgeEdge(clientId, sourceName, targetName, relationType, weight = 1, context = null, flags = {}) {
+export async function upsertKnowledgeEdge(clientId, sourceName, targetName, relationType, weight = 1, context = null, flags = {}, options = {}) {
     const flagsPayload = Array.isArray(flags) ? flags : [flags];
     const canonicalSource = normalizeEntityName(sourceName) || String(sourceName || '').trim();
     const canonicalTarget = normalizeEntityName(targetName) || String(targetName || '').trim();
@@ -438,14 +473,45 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
     }
 
     intWeight = Math.min(10, Math.max(1, intWeight || 5));
+    const canonicalContext = String(context || '').trim().slice(0, 500) || null;
+    const { data: exactEdge } = await supabase
+        .from('knowledge_edges')
+        .select('id, support_count, stable_score, stability_tier, weight, context, cognitive_flags')
+        .eq('client_id', clientId)
+        .eq('source_node', canonicalSource)
+        .eq('relation_type', canonicalRelationType)
+        .eq('target_node', canonicalTarget)
+        .maybeSingle();
+
+    const nextSupportCount = Number(exactEdge?.support_count || 0) + 1;
+    const mergedFlags = [
+        ...new Set([
+            ...(Array.isArray(exactEdge?.cognitive_flags) ? exactEdge.cognitive_flags : []),
+            ...flagsPayload.filter(Boolean)
+        ])
+    ];
+    const stability = computeEdgeStability({
+        relationType: canonicalRelationType,
+        context: canonicalContext || exactEdge?.context || '',
+        weight: intWeight,
+        supportCount: nextSupportCount,
+        source: options.source || '',
+        flags: mergedFlags,
+        existingScore: exactEdge?.stable_score || 0,
+        existingTier: exactEdge?.stability_tier || 'candidate'
+    });
+
     const { error } = await supabase.from('knowledge_edges').upsert({
         client_id: clientId,
         source_node: canonicalSource,
         target_node: canonicalTarget,
         relation_type: canonicalRelationType,
-        weight: intWeight,
-        context: String(context || '').trim().slice(0, 500) || null,
-        cognitive_flags: flagsPayload,
+        weight: Math.max(intWeight, Number(exactEdge?.weight || 0)),
+        context: canonicalContext || exactEdge?.context || null,
+        cognitive_flags: mergedFlags,
+        support_count: nextSupportCount,
+        stable_score: stability.score,
+        stability_tier: stability.tier,
         last_seen: new Date().toISOString()
     }, { onConflict: 'client_id, source_node, relation_type, target_node' });
 
@@ -647,8 +713,9 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
         for (const alias of [...candidateNodeNames].slice(0, 10)) {
             const { data: nodes } = await supabase
                 .from('knowledge_nodes')
-                .select('id, entity_name, entity_type, description, created_at, updated_at')
+                .select('id, entity_name, entity_type, description, created_at, updated_at, stable_score, stability_tier')
                 .eq('client_id', clientId)
+                .in('stability_tier', ['provisional', 'stable'])
                 .ilike('entity_name', alias)
                 .limit(4);
 
@@ -678,15 +745,17 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
             const edgeQueries = await Promise.all([
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier')
                     .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', entityName)
                     .order('last_seen', { ascending: false })
                     .limit(4),
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier')
                     .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
                     .eq('target_node', entityName)
                     .order('last_seen', { ascending: false })
                     .limit(4)
@@ -897,16 +966,18 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
             const queries = await Promise.all([
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier')
                     .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', left)
                     .eq('target_node', right)
                     .order('last_seen', { ascending: false })
                     .limit(6),
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier')
                     .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', right)
                     .eq('target_node', left)
                     .order('last_seen', { ascending: false })
@@ -992,6 +1063,7 @@ export async function hybridSearch(clientId, queryText, queryVector, matchCount 
                 .from('knowledge_nodes')
                 .select('entity_name')
                 .eq('client_id', clientId)
+                .in('stability_tier', ['provisional', 'stable'])
                 .eq('entity_type', 'PERSONA');
             for (const node of (personaNodes || [])) {
                 if (node.entity_name) knownNamePool.add(node.entity_name);
