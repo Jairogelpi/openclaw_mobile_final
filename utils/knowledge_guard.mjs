@@ -387,6 +387,35 @@ function matchesWeakEntityDescriptionPattern(value) {
     ].some(pattern => pattern.test(normalized));
 }
 
+function matchesWeakPersonDescriptionPattern(value) {
+    const normalized = normalizeComparableText(value);
+    if (!normalized) return true;
+
+    return [
+        /^interlocutor\b/,
+        /^usuario del chat\b/,
+        /^mencionado en la conversacion\b/,
+        /^mencionado en la conversación\b/,
+        /^persona que\b/,
+        /^(hijo|hija|hermano|hermana|novio|novia|pareja|amigo|amiga)\b/
+    ].some(pattern => pattern.test(normalized));
+}
+
+function isWeakRelationshipContext(value) {
+    const normalized = normalizeComparableText(value);
+    if (!normalized) return true;
+
+    return [
+        'conversacion',
+        'conversación',
+        'chat',
+        'mensaje',
+        'mensajes',
+        'hablan',
+        'comentario'
+    ].includes(normalized);
+}
+
 function isWeakStandaloneEntity({
     name,
     type,
@@ -407,6 +436,18 @@ function isWeakStandaloneEntity({
     }
 
     if (known) return false;
+
+    if (entityType === 'PERSONA') {
+        const descriptionText = desc || evidence || '';
+        const weakArticlePerson =
+            hasLeadingArticle(name)
+            && (
+                hasLowercaseArticleEntityShape(name)
+                || matchesWeakPersonDescriptionPattern(descriptionText)
+                || isWeakEntityDescription(descriptionText)
+            );
+        if (weakArticlePerson) return true;
+    }
 
     if (['LUGAR', 'ORGANIZACION', 'EVENTO', 'TEMA', 'ENTITY', 'OBJETO'].includes(entityType)) {
         const descriptionText = desc || evidence || '';
@@ -544,6 +585,17 @@ export function validateGroundedGraph({
         if (!evidence || !snippetExistsInText(chunkText, evidence)) continue;
         if (relationType === '[HABLA_DE]') {
             if (isPhoneLikeEntityName(targetEntity.name)) continue;
+            if (isWeakRelationshipContext(relationship?.context) && isWeakStandaloneEntity({
+                name: targetEntity.name,
+                type: targetEntity.type,
+                desc: targetEntity.desc,
+                evidence,
+                knownNames,
+                remoteId,
+                isGroup
+            })) {
+                continue;
+            }
             if (isGroup && isWeakStandaloneEntity({
                 name: targetEntity.name,
                 type: targetEntity.type,

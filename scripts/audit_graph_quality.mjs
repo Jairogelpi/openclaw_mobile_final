@@ -53,7 +53,7 @@ const BLOCKED_NODE_NAMES = new Set([
 const ROLE_LIKE_NODE_PATTERNS = [
     /^mi\s+(madre|padre|hermano|hermana|primo|prima|jefe|jefa|medico|médico)$/i,
     /^su\s+(madre|padre|hermano|hermana|primo|prima)$/i,
-    /^(el|la)\s+[a-záéíóúñ]{3,}$/i
+    /^(el|la)\s+(jefe|jefa|nino|niño|china|chino|tipo|tio|tío|piky|moraga|azid)$/i
 ];
 
 const ARTICLE_ACRONYM_ENTITY_PATTERN = /^(el|la|los|las)\s+[A-ZÁÉÍÓÚÑ0-9]{2,}(?:\s+[A-ZÁÉÍÓÚÑ0-9]{2,})*$/;
@@ -81,6 +81,20 @@ function isBlockedNodeName(value) {
     if (normalized.includes('@')) return true;
     if (ROLE_LIKE_NODE_PATTERNS.some(pattern => pattern.test(raw))) return true;
     return false;
+}
+
+function isWeakGenericDescription(value) {
+    const normalized = normalize(value);
+    if (!normalized) return true;
+
+    return [
+        'interlocutor',
+        'usuario del chat',
+        'mencionado en la conversacion',
+        'mencionado en la conversación',
+        'conversacion',
+        'conversación'
+    ].includes(normalized);
 }
 
 function isSuspiciousEdge(edge) {
@@ -198,7 +212,10 @@ async function main() {
         return acc;
     }, {});
 
-    const suspiciousNodes = knowledgeNodes.filter(node => isBlockedNodeName(node.entity_name));
+    const suspiciousNodes = knowledgeNodes.filter(node =>
+        isBlockedNodeName(node.entity_name) ||
+        (['PERSONA', 'OBJETO', 'LUGAR', 'ORGANIZACION', 'EVENTO'].includes(String(node.entity_type || '').trim()) && isWeakGenericDescription(node.description))
+    );
     const suspiciousEdges = knowledgeEdges.filter(edge => isSuspiciousEdge(edge));
     const suspiciousIdentities = contactIdentities.filter(row => {
         if (isFallbackNumericIdentity(row)) return false;
