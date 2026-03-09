@@ -1,5 +1,7 @@
 import supabase from '../config/supabase.mjs';
 import { distillAndVectorize } from '../memory_worker.mjs';
+import { hydrateContactIdentities, repairOwnerIdentity } from '../services/identity.service.mjs';
+import { detectAndSaveCommunities } from '../services/community.service.mjs';
 
 const clientId = process.argv[2];
 
@@ -103,10 +105,19 @@ async function rebuild() {
     console.log(`[Rebuild] raw_messages pendientes: ${remaining}`);
 
     while (remaining > 0) {
-        await distillAndVectorize(clientId);
+        await distillAndVectorize(clientId, {
+            mode: 'rebuild',
+            skipAutonomousDistillation: true,
+            skipCommunityDetection: true,
+            skipIdentityHydration: true
+        });
         remaining = await remainingRawMessages();
         console.log(`[Rebuild] raw_messages pendientes: ${remaining}`);
     }
+
+    await hydrateContactIdentities(clientId, { force: true });
+    await repairOwnerIdentity(clientId);
+    await detectAndSaveCommunities(clientId);
 
     await supabase
         .from('user_souls')

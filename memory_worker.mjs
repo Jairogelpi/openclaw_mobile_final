@@ -11,6 +11,7 @@ import util from 'util';
 const execPromise = util.promisify(exec);
 import { encrypt, decrypt } from './security.mjs';
 import crypto from 'node:crypto';
+import os from 'node:os';
 import { generateEmbedding, cosineSimilarity, invalidateSemanticCache } from './services/local_ai.mjs';
 import redisClient from './config/redis.mjs';
 import { upsertKnowledgeNode, upsertKnowledgeEdge } from './services/graph.service.mjs';
@@ -37,6 +38,37 @@ import {
 import cron from 'node-cron';
 
 const ENABLE_DREAM_CYCLE = String(process.env.OPENCLAW_ENABLE_DREAM_CYCLE || '').toLowerCase() === 'true';
+
+function parsePositiveInt(value, fallback) {
+    const parsed = Number.parseInt(String(value ?? ''), 10);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+function getWorkerTuning(mode = 'normal') {
+    const totalMemGiB = os.totalmem() / (1024 ** 3);
+    const lowMemoryHost = totalMemGiB <= 6;
+
+    const defaults = {
+        limit: lowMemoryHost ? 80 : 200,
+        maxPerRun: lowMemoryHost ? 240 : 1000,
+        chunkSize: lowMemoryHost ? 40 : 50,
+        concurrencyLimit: lowMemoryHost ? 2 : 10
+    };
+
+    if (mode === 'rebuild') {
+        defaults.limit = Math.min(defaults.limit, 60);
+        defaults.maxPerRun = Math.min(defaults.maxPerRun, 180);
+        defaults.chunkSize = Math.min(defaults.chunkSize, 30);
+        defaults.concurrencyLimit = 1;
+    }
+
+    return {
+        limit: parsePositiveInt(process.env.OPENCLAW_MEMORY_BATCH_LIMIT, defaults.limit),
+        maxPerRun: parsePositiveInt(process.env.OPENCLAW_MEMORY_MAX_PER_RUN, defaults.maxPerRun),
+        chunkSize: parsePositiveInt(process.env.OPENCLAW_MEMORY_CHUNK_SIZE, defaults.chunkSize),
+        concurrencyLimit: parsePositiveInt(process.env.OPENCLAW_MEMORY_CONCURRENCY, defaults.concurrencyLimit)
+    };
+}
 
 // === HYPER-ROBUST HELPERS ===
 function cleanJSON(text) {
@@ -471,7 +503,7 @@ async function saveGraphData(clientId, graphData) {
  * Main Logic for Distillation and Vectorization
  */
 // === MAIN PROCESS: DISTILL + VECTORIZE + INBOX ===
-export async function distillAndVectorize(clientId) {
+export async function distillAndVectorize(clientId, options = {}) {
     const { data: soulData } = await supabase.from('user_souls').select('slug, soul_json').eq('client_id', clientId).single();
     if (!soulData) return;
     const clientSlug = soulData.slug;
@@ -488,11 +520,16 @@ export async function distillAndVectorize(clientId) {
     */
 
     try {
+        const mode = options.mode === 'rebuild' ? 'rebuild' : 'normal';
+        const tuning = getWorkerTuning(mode);
+        const skipAutonomousDistillation = options.skipAutonomousDistillation === true;
+        const skipCommunityDetection = options.skipCommunityDetection === true;
+        const skipIdentityHydration = options.skipIdentityHydration === true;
         let totalProcessedThisRun = 0;
         let hasMore = true;
-        const LIMIT = 200;
+        const LIMIT = tuning.limit;
 
-        while (hasMore && totalProcessedThisRun < 1000) {
+        while (hasMore && totalProcessedThisRun < tuning.maxPerRun) {
             const { data: messages } = await supabase.from('raw_messages').select('*').eq('client_id', clientId).eq('processed', false).order('created_at', { ascending: true }).limit(LIMIT);
 
             if (!messages?.length) {
@@ -543,7 +580,7 @@ export async function distillAndVectorize(clientId) {
                 const userName = ownerName;
                 const isGroupConversation = String(remoteId || '').endsWith('@g.us');
 
-                const CHUNK_SIZE = 50;
+                const CHUNK_SIZE = tuning.chunkSize;
                 const msgCount = conv.raw.length;
 
                 // Preparar todos los chunks
@@ -555,8 +592,8 @@ export async function distillAndVectorize(clientId) {
                     });
                 }
 
-                // Procesar en lotes paralelos (concurrencia de 10) para no saturar APIs
-                const CONCURRENCY_LIMIT = 10;
+                // En hosts pequeños priorizamos estabilidad sobre throughput.
+                const CONCURRENCY_LIMIT = tuning.concurrencyLimit;
                 for (let b = 0; b < allChunks.length; b += CONCURRENCY_LIMIT) {
                     const batchChunks = allChunks.slice(b, b + CONCURRENCY_LIMIT);
 
@@ -634,22 +671,28 @@ export async function distillAndVectorize(clientId) {
             totalProcessedThisRun += messages.length;
 
             console.log(`[Worker] 🍶 Iniciando Destilación Autónoma...`);
-            await autonomousDistillation(clientId, soulData.slug, eligibleMessages.slice(-50), ownerName);
+            if (!skipAutonomousDistillation) {
+                await autonomousDistillation(clientId, soulData.slug, eligibleMessages.slice(-50), ownerName);
+            }
             console.log(`[Worker] ✅ Batch finalizado (Acumulado: ${totalProcessedThisRun})`);
         }
         await invalidateSemanticCache(clientId);
         if (totalProcessedThisRun > 0) {
-            try {
-                await hydrateContactIdentities(clientId, { force: true });
-                await repairOwnerIdentity(clientId);
-            } catch (identityErr) {
-                console.warn(`[Identity Registry] Post-process skipped: ${identityErr.message}`);
+            if (!skipIdentityHydration) {
+                try {
+                    await hydrateContactIdentities(clientId, { force: true });
+                    await repairOwnerIdentity(clientId);
+                } catch (identityErr) {
+                    console.warn(`[Identity Registry] Post-process skipped: ${identityErr.message}`);
+                }
             }
 
-            try {
-                await detectAndSaveCommunities(clientId);
-            } catch (communityErr) {
-                console.warn(`[Community Detection] Post-process skipped: ${communityErr.message}`);
+            if (!skipCommunityDetection) {
+                try {
+                    await detectAndSaveCommunities(clientId);
+                } catch (communityErr) {
+                    console.warn(`[Community Detection] Post-process skipped: ${communityErr.message}`);
+                }
             }
         }
     } catch (e) {
