@@ -121,6 +121,25 @@ function cryptoRandomId() {
     return `tmp_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function mergeSourceTags(...sets) {
+    const merged = new Set();
+    for (const sourceSet of sets) {
+        const values = Array.isArray(sourceSet) ? sourceSet : [sourceSet];
+        for (const value of values) {
+            const tag = String(value || '').trim();
+            if (!tag) continue;
+            merged.add(tag);
+        }
+    }
+    return [...merged];
+}
+
+function hasConflictFlag(flags = []) {
+    return (Array.isArray(flags) ? flags : [flags])
+        .map(flag => normalizeComparableText(flag))
+        .includes('conflicted');
+}
+
 async function hasConflictingExclusiveEdge(clientId, sourceNode, relationType, targetNode) {
     if (!EXCLUSIVE_RELATION_TYPES.has(String(relationType || '').trim())) return false;
 
@@ -387,18 +406,20 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
 
     const { data: exactNode } = await supabase
         .from('knowledge_nodes')
-        .select('id, description, support_count, stable_score, stability_tier, entity_type')
+        .select('id, description, support_count, stable_score, stability_tier, entity_type, source_tags')
         .eq('client_id', clientId)
         .eq('entity_name', finalEntityName)
         .maybeSingle();
 
     const nextSupportCount = Number(exactNode?.support_count || 0) + 1;
+    const nextSourceTags = mergeSourceTags(exactNode?.source_tags || [], options.source || '');
     const stability = computeNodeStability({
         entityName: finalEntityName,
         entityType: finalEntityType,
         description: finalDescription,
         supportCount: nextSupportCount,
         source: options.source || '',
+        sourceTags: nextSourceTags,
         existingScore: exactNode?.stable_score || 0,
         existingTier: exactNode?.stability_tier || 'candidate'
     });
@@ -408,6 +429,7 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
             support_count: nextSupportCount,
             stable_score: stability.score,
             stability_tier: stability.tier,
+            source_tags: nextSourceTags,
             last_seen: new Date().toISOString()
         };
         if (finalDescription && finalDescription.length > String(exactNode.description || '').length) {
@@ -462,6 +484,7 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
         support_count: nextSupportCount,
         stable_score: stability.score,
         stability_tier: stability.tier,
+        source_tags: nextSourceTags,
         last_seen: new Date().toISOString()
     }, { onConflict: 'client_id, entity_name' }).select('id').single();
 
@@ -504,7 +527,7 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
     const canonicalContext = String(context || '').trim().slice(0, 500) || null;
     const { data: exactEdge } = await supabase
         .from('knowledge_edges')
-        .select('id, support_count, stable_score, stability_tier, weight, context, cognitive_flags')
+        .select('id, support_count, stable_score, stability_tier, weight, context, cognitive_flags, source_tags')
         .eq('client_id', clientId)
         .eq('source_node', canonicalSource)
         .eq('relation_type', canonicalRelationType)
@@ -518,6 +541,7 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
             ...flagsPayload.filter(Boolean)
         ])
     ];
+    const mergedSourceTags = mergeSourceTags(exactEdge?.source_tags || [], options.source || '');
     const conflictingExclusiveEdge = await hasConflictingExclusiveEdge(
         clientId,
         canonicalSource,
@@ -533,6 +557,7 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
         weight: intWeight,
         supportCount: nextSupportCount,
         source: options.source || '',
+        sourceTags: mergedSourceTags,
         flags: mergedFlags,
         existingScore: exactEdge?.stable_score || 0,
         existingTier: exactEdge?.stability_tier || 'candidate'
@@ -546,6 +571,7 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
         weight: Math.max(intWeight, Number(exactEdge?.weight || 0)),
         context: canonicalContext || exactEdge?.context || null,
         cognitive_flags: mergedFlags,
+        source_tags: mergedSourceTags,
         support_count: nextSupportCount,
         stable_score: stability.score,
         stability_tier: stability.tier,
@@ -757,6 +783,7 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
                 .limit(4);
 
             for (const node of (nodes || [])) {
+                if (!isStableTier(node.stability_tier)) continue;
                 const normalizedName = normalizeComparableText(node.entity_name);
                 if (!lookup.normalizedAliases.has(normalizedName)) continue;
                 exactNodeNames.add(node.entity_name);
@@ -782,7 +809,7 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
             const edgeQueries = await Promise.all([
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
                     .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', entityName)
@@ -790,7 +817,7 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
                     .limit(4),
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
                     .in('stability_tier', ['provisional', 'stable'])
                     .eq('target_node', entityName)
@@ -800,6 +827,7 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
 
             for (const queryResult of edgeQueries) {
                 for (const edge of (queryResult.data || [])) {
+                    if (!isStableTier(edge.stability_tier) || hasConflictFlag(edge.cognitive_flags)) continue;
                     pushResult(toFactEvidenceCandidate({
                         fact_type: 'knowledge_edge',
                         source_id: `knowledge_edge:${edge.source_node}:${edge.relation_type}:${edge.target_node}`,
@@ -1003,7 +1031,7 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
             const queries = await Promise.all([
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
                     .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', left)
@@ -1012,7 +1040,7 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
                     .limit(6),
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
                     .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', right)
@@ -1023,6 +1051,7 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
 
             for (const queryResult of queries) {
                 for (const edge of (queryResult.data || [])) {
+                    if (!isStableTier(edge.stability_tier) || hasConflictFlag(edge.cognitive_flags)) continue;
                     pushCandidate(toFactEvidenceCandidate({
                         fact_type: 'relationship_edge',
                         source_id: `relationship_edge:${edge.source_node}:${edge.relation_type}:${edge.target_node}`,

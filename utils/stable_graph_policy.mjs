@@ -95,6 +95,7 @@ export function computeNodeStability({
     description,
     supportCount = 1,
     source = '',
+    sourceTags = [],
     existingScore = 0,
     existingTier = 'candidate'
 } = {}) {
@@ -106,6 +107,7 @@ export function computeNodeStability({
     let score = entityTypeScore(entityType);
     score += Math.min(Number(supportCount || 1), 5) - 1;
     score += sourceBonus(source);
+    score += Math.min(new Set((sourceTags || []).map(normalizedText).filter(Boolean)).size, 3) - 1;
     score += descriptionPenalty(description);
     score += articlePenalty(entityName);
     score += mediaPenalty(description);
@@ -134,6 +136,7 @@ export function computeEdgeStability({
     weight = 1,
     supportCount = 1,
     source = '',
+    sourceTags = [],
     flags = [],
     existingScore = 0,
     existingTier = 'candidate'
@@ -146,6 +149,7 @@ export function computeEdgeStability({
     score += Math.min(Number(weight || 1), 5) - 1;
     score += Math.min(Number(supportCount || 1), 5) - 1;
     score += sourceBonus(source);
+    score += Math.min(new Set((sourceTags || []).map(normalizedText).filter(Boolean)).size, 3) - 1;
 
     if (!normalizedContext) score -= 2;
     else if (normalizedContext.length >= 20) score += 1;
