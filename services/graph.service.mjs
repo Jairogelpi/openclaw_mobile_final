@@ -15,6 +15,13 @@ import {
     isStableTier
 } from '../utils/stable_graph_policy.mjs';
 
+const EXCLUSIVE_RELATION_TYPES = new Set([
+    '[PAREJA_DE]',
+    '[VIVE_EN]',
+    '[TRABAJA_EN]',
+    '[ESTUDIA_EN]'
+]);
+
 function buildCitationLabel(prefix, id) {
     return `${prefix}${String(id || '').slice(0, 8)}`;
 }
@@ -112,6 +119,27 @@ function toFactEvidenceCandidate(payload, overrides = {}) {
 
 function cryptoRandomId() {
     return `tmp_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+async function hasConflictingExclusiveEdge(clientId, sourceNode, relationType, targetNode) {
+    if (!EXCLUSIVE_RELATION_TYPES.has(String(relationType || '').trim())) return false;
+
+    const { data, error } = await supabase
+        .from('knowledge_edges')
+        .select('target_node')
+        .eq('client_id', clientId)
+        .eq('source_node', sourceNode)
+        .eq('relation_type', relationType)
+        .neq('target_node', targetNode)
+        .in('stability_tier', ['provisional', 'stable'])
+        .limit(1);
+
+    if (error) {
+        console.warn('[Graph Service] exclusive edge conflict check skipped:', error.message);
+        return false;
+    }
+
+    return Boolean((data || []).length);
 }
 
 function addAliasToMap(aliasMap, value) {
@@ -490,6 +518,15 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
             ...flagsPayload.filter(Boolean)
         ])
     ];
+    const conflictingExclusiveEdge = await hasConflictingExclusiveEdge(
+        clientId,
+        canonicalSource,
+        canonicalRelationType,
+        canonicalTarget
+    );
+    if (conflictingExclusiveEdge && !mergedFlags.includes('conflicted')) {
+        mergedFlags.push('conflicted');
+    }
     const stability = computeEdgeStability({
         relationType: canonicalRelationType,
         context: canonicalContext || exactEdge?.context || '',

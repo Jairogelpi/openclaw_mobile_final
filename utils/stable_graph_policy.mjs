@@ -29,6 +29,18 @@ const RELATION_TYPE_BONUS = new Map([
     ['[EVENTO_CON]', -1]
 ]);
 
+const MEDIA_CONTEXT_PATTERNS = [
+    /\b(audio|nota de voz|voz|video|foto|imagen|documento|archivo|pdf|clip)\b/,
+    /\bpersonaje de un video\b/,
+    /\bconversacion sobre un video\b/,
+    /\bconversación sobre un video\b/
+];
+
+const TEMPORAL_EPHEMERAL_PATTERNS = [
+    /\b(hoy|ayer|anoche|mañana|manana|esta tarde|esta noche|este finde|este jueves|este viernes|este sabado|este sábado)\b/,
+    /\b(esta semana|la semana pasada|el otro dia|el otro día)\b/
+];
+
 function normalizedText(value) {
     return normalizeComparableText(String(value || ''));
 }
@@ -65,6 +77,18 @@ function sourceBonus(source = '') {
     return 0;
 }
 
+function mediaPenalty(text = '') {
+    const raw = String(text || '');
+    if (!raw) return 0;
+    return MEDIA_CONTEXT_PATTERNS.some(pattern => pattern.test(raw)) ? -3 : 0;
+}
+
+function temporalPenalty(text = '') {
+    const raw = String(text || '');
+    if (!raw) return 0;
+    return TEMPORAL_EPHEMERAL_PATTERNS.some(pattern => pattern.test(raw)) ? -2 : 0;
+}
+
 export function computeNodeStability({
     entityName,
     entityType,
@@ -84,6 +108,8 @@ export function computeNodeStability({
     score += sourceBonus(source);
     score += descriptionPenalty(description);
     score += articlePenalty(entityName);
+    score += mediaPenalty(description);
+    score += temporalPenalty(description);
 
     if (description && description.startsWith('[ALMA]')) score += 5;
     if (normalizedName.length >= 5) score += 1;
@@ -127,6 +153,14 @@ export function computeEdgeStability({
 
     if (flagsText.some(flag => ['derived', 'latent', 'dream_cycle'].includes(flag))) score -= 4;
     if (flagsText.some(flag => ['direct', 'grounded'].includes(flag))) score += 1;
+    if (flagsText.some(flag => ['conflicted', 'temporal_only', 'media_only'].includes(flag))) score -= 3;
+
+    score += mediaPenalty(context);
+    score += temporalPenalty(context);
+
+    if (['[RELACIONADO_CON]', '[HABLA_DE]'].includes(normalizedRelation) && Number(supportCount || 1) < 2) {
+        score -= 3;
+    }
 
     score = Math.max(score, Number(existingScore || 0));
 
