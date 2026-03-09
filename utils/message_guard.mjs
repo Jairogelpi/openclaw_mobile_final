@@ -40,6 +40,7 @@ const BOT_TEXT_PATTERNS = [
 
 export function normalizeComparableText(value) {
     return String(value || '')
+        .normalize('NFKC')
         .normalize('NFD')
         .replace(/[\u0300-\u036f]/g, '')
         .replace(/\s+/g, ' ')
@@ -49,10 +50,26 @@ export function normalizeComparableText(value) {
 
 export function stripDecorativeText(value) {
     return String(value || '')
+        .normalize('NFKC')
         .replace(/[\p{Extended_Pictographic}\uFE0F\u200D\u2600-\u27BF]/gu, ' ')
         .replace(/[*_~|]+/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
+}
+
+export function normalizeEntityLikeText(value) {
+    const cleaned = stripDecorativeText(value)
+        .replace(/\s+/g, ' ')
+        .trim();
+
+    if (!cleaned) return '';
+
+    const tokens = cleaned.split(' ').filter(Boolean);
+    if (tokens.length >= 2 && tokens.every(token => /^[\p{L}\p{N}]$/u.test(token))) {
+        return tokens.join('');
+    }
+
+    return cleaned;
 }
 
 export function isGenericSpeakerLabel(value) {

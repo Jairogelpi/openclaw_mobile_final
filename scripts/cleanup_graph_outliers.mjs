@@ -206,11 +206,26 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
             || (!looksHumanIdentityLabel(entityName) && (!description || isWeakEntityDescription(description)))
         );
     });
+    const groupLabelPersonNodes = allNodes.filter(node =>
+        String(node?.entity_type || '').trim().toUpperCase() === 'PERSONA'
+        && classifyIdentityLikeName(String(node?.entity_name || '').trim()) === 'group_label'
+    );
 
     let deletedEdges = 0;
     let deletedNodes = 0;
 
     if (apply) {
+        for (const node of groupLabelPersonNodes) {
+            const { error: retypeError } = await supabase
+                .from('knowledge_nodes')
+                .update({
+                    entity_type: 'GRUPO',
+                    updated_at: new Date().toISOString()
+                })
+                .eq('id', node.id);
+            if (retypeError) throw retypeError;
+        }
+
         const edgeIds = [...edgeIdsToDelete];
         if (edgeIds.length) {
             const { error: edgeDeleteError } = await supabase
@@ -267,6 +282,15 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
             stability_tier: node.stability_tier
         })),
         weak_unanchored_person_nodes: weakUnanchoredPersonNodes.map(node => ({
+            id: node.id,
+            entity_name: node.entity_name,
+            entity_type: node.entity_type,
+            description: node.description,
+            support_count: node.support_count,
+            stable_score: node.stable_score,
+            stability_tier: node.stability_tier
+        })),
+        retyped_group_label_person_nodes: groupLabelPersonNodes.map(node => ({
             id: node.id,
             entity_name: node.entity_name,
             entity_type: node.entity_type,

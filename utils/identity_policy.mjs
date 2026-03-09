@@ -1,6 +1,7 @@
 import {
     fallbackNameFromRemoteId,
     looksLikeWhatsAppRemoteId,
+    normalizeEntityLikeText,
     normalizeComparableText,
     pickBestHumanName,
     stripDecorativeText
@@ -62,7 +63,7 @@ const GROUPISH_NAME_PATTERNS = [
 ];
 
 export function normalizeIdentityName(value) {
-    const cleaned = stripDecorativeText(String(value || ''))
+    const cleaned = normalizeEntityLikeText(String(value || ''))
         .replace(/\s+/g, ' ')
         .trim();
     if (!cleaned) return null;

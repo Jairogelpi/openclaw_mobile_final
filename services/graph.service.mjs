@@ -3,6 +3,7 @@ import { generateEmbedding } from './local_ai.mjs';
 import redisClient from '../config/redis.mjs';
 import { resolveIdentityCandidates } from './identity.service.mjs';
 import {
+    deriveEffectiveEntityType,
     expandDetectedNamesConservatively,
     normalizeEntityName,
     sanitizeEntityType,
@@ -402,7 +403,8 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
     const finalEntityName = normalizeEntityName(entityName, ownerCanonicalName);
     if (!finalEntityName) return null;
 
-    const finalEntityType = sanitizeEntityType(entityType);
+    const finalEntityType = deriveEffectiveEntityType(finalEntityName, entityType);
+    if (!finalEntityType) return null;
     if (finalEntityType === 'PERSONA' && isPhoneLikeGraphName(finalEntityName)) {
         return null;
     }

@@ -1,9 +1,11 @@
 import {
     fallbackNameFromRemoteId,
     isGenericSpeakerLabel,
+    normalizeEntityLikeText,
     normalizeComparableText,
     stripDecorativeText
 } from './message_guard.mjs';
+import { classifyIdentityLikeName } from './identity_policy.mjs';
 import {
     compactDigits,
     evaluateEntityAdmissibility,
@@ -470,7 +472,7 @@ function isWeakStandaloneEntity({
 }
 
 export function normalizeEntityName(value, ownerName = null) {
-    const rawValue = trimEntityEdges(stripDecorativeText(value));
+    const rawValue = trimEntityEdges(normalizeEntityLikeText(value));
     if (!rawValue) return null;
 
     const comparable = normalizeComparableText(rawValue);
@@ -488,6 +490,21 @@ export function sanitizeEntityType(value) {
     const normalized = normalizeComparableText(value);
     if (!normalized) return 'ENTITY';
     return ENTITY_TYPE_ALIASES.get(normalized) || 'ENTITY';
+}
+
+export function deriveEffectiveEntityType(entityName, entityType) {
+    const normalizedType = sanitizeEntityType(entityType);
+    const identityKind = classifyIdentityLikeName(entityName);
+
+    if (normalizedType === 'PERSONA' && identityKind === 'group_label') {
+        return 'GRUPO';
+    }
+
+    if (normalizedType === 'PERSONA' && identityKind === 'role_mention') {
+        return null;
+    }
+
+    return normalizedType;
 }
 
 export function sanitizeRelationType(value) {

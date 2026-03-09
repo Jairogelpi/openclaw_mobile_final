@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { evaluateEntityAdmissibility } from '../utils/graph_admissibility_policy.mjs';
-import { validateGroundedGraph } from '../utils/knowledge_guard.mjs';
+import { deriveEffectiveEntityType, normalizeEntityName, validateGroundedGraph } from '../utils/knowledge_guard.mjs';
 import { computeEdgeStability } from '../utils/stable_graph_policy.mjs';
 
 function validateGraph(input) {
@@ -159,4 +159,14 @@ test('downgrades friendship edges with generic reference context', () => {
 
     assert.equal(result.tier, 'candidate');
     assert.equal(result.promote, false);
+});
+
+test('retypes group-like person labels to GRUPO and blocks role mentions as PERSONA', () => {
+    assert.equal(deriveEffectiveEntityType('Máster INESDI', 'PERSONA'), 'GRUPO');
+    assert.equal(deriveEffectiveEntityType('mi colega', 'PERSONA'), null);
+});
+
+test('normalizes spaced or decorated entity names before graph insertion', () => {
+    assert.equal(normalizeEntityName('y o', 'Jairo'), 'Jairo');
+    assert.equal(normalizeEntityName('𝑇𝑒𝑗𝑒𝑟𝑜'), 'Tejero');
 });
