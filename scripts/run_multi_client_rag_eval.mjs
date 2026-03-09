@@ -124,5 +124,7 @@ if (import.meta.url === new URL(process.argv[1], 'file:').href) {
     main().catch(error => {
         console.error('[Multi Eval] Failed:', error.message);
         process.exitCode = 1;
+    }).then(() => {
+        if (!process.exitCode) process.exit(0);
     });
 }
