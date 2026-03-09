@@ -24,9 +24,9 @@ const RELATION_TYPE_BONUS = new Map([
     ['[USA]', 2],
     ['[POSEE]', 2],
     ['[CONOCE_A]', 1],
-    ['[HABLA_DE]', 0],
-    ['[RELACIONADO_CON]', -2],
-    ['[EVENTO_CON]', -1]
+    ['[HABLA_DE]', -2],
+    ['[RELACIONADO_CON]', -5],
+    ['[EVENTO_CON]', -3]
 ]);
 
 const MEDIA_CONTEXT_PATTERNS = [
@@ -39,6 +39,26 @@ const MEDIA_CONTEXT_PATTERNS = [
 const TEMPORAL_EPHEMERAL_PATTERNS = [
     /\b(hoy|ayer|anoche|mañana|manana|esta tarde|esta noche|este finde|este jueves|este viernes|este sabado|este sábado)\b/,
     /\b(esta semana|la semana pasada|el otro dia|el otro día)\b/
+];
+
+const RELATION_CONTEXT_CUES = new Map([
+    ['[HABLA_DE]', ['habla de', 'hablar de', 'sobre', 'menciona', 'comenta', 'pregunta por', 'dice de']],
+    ['[RELACIONADO_CON]', ['relacionado con', 'conectado con', 'asociado con', 'vinculado con', 'tiene que ver con']],
+    ['[EVENTO_CON]', ['con', 'junto a', 'acompanado de', 'acompañado de']]
+]);
+
+const NEGATIVE_TALKS_ABOUT_PATTERNS = [
+    /\bhablar con\b/,
+    /\bquiere hablar con\b/,
+    /\bhablo con\b/,
+    /\bhabló con\b/,
+    /\brespuesta sobre\b/,
+    /\brespuesta a\b/,
+    /\bcontesta a\b/,
+    /\bcontestó a\b/,
+    /\bgracias\b/,
+    /\bexpresion de afecto\b/,
+    /\bexpresión de afecto\b/
 ];
 
 function normalizedText(value) {
@@ -87,6 +107,19 @@ function temporalPenalty(text = '') {
     const raw = String(text || '');
     if (!raw) return 0;
     return TEMPORAL_EPHEMERAL_PATTERNS.some(pattern => pattern.test(raw)) ? -2 : 0;
+}
+
+function hasRelationCue(relationType = '', text = '') {
+    const cues = RELATION_CONTEXT_CUES.get(String(relationType || '').trim());
+    if (!cues?.length) return false;
+    const haystack = normalizedText(text);
+    return cues.some(cue => haystack.includes(normalizedText(cue)));
+}
+
+function hasNegativeTalkCue(text = '') {
+    const raw = String(text || '');
+    if (!raw) return false;
+    return NEGATIVE_TALKS_ABOUT_PATTERNS.some(pattern => pattern.test(raw));
 }
 
 export function computeNodeStability({
@@ -144,10 +177,11 @@ export function computeEdgeStability({
     const normalizedRelation = String(relationType || '').trim();
     const normalizedContext = normalizedText(context);
     const flagsText = (Array.isArray(flags) ? flags : [flags]).map(normalizedText).filter(Boolean);
+    const support = Number(supportCount || 1);
 
     let score = RELATION_TYPE_BONUS.get(normalizedRelation) ?? 0;
     score += Math.min(Number(weight || 1), 5) - 1;
-    score += Math.min(Number(supportCount || 1), 5) - 1;
+    score += Math.min(support, 5) - 1;
     score += sourceBonus(source);
     score += Math.min(new Set((sourceTags || []).map(normalizedText).filter(Boolean)).size, 3) - 1;
 
@@ -162,8 +196,26 @@ export function computeEdgeStability({
     score += mediaPenalty(context);
     score += temporalPenalty(context);
 
-    if (['[RELACIONADO_CON]', '[HABLA_DE]'].includes(normalizedRelation) && Number(supportCount || 1) < 2) {
+    if (['[RELACIONADO_CON]', '[HABLA_DE]'].includes(normalizedRelation) && support < 2) {
         score -= 3;
+    }
+
+    if (normalizedRelation === '[RELACIONADO_CON]') {
+        if (support < 3) score -= 4;
+        if (!normalizedContext || normalizedContext.length < 24) score -= 2;
+        if (!hasRelationCue(normalizedRelation, context)) score -= 4;
+    }
+
+    if (normalizedRelation === '[HABLA_DE]') {
+        if (support < 3) score -= 2;
+        if (!normalizedContext || normalizedContext.length < 16) score -= 1;
+        if (!hasRelationCue(normalizedRelation, context)) score -= 3;
+        if (hasNegativeTalkCue(context)) score -= 4;
+    }
+
+    if (normalizedRelation === '[EVENTO_CON]' && support < 2) {
+        score -= 2;
+        if (!hasRelationCue(normalizedRelation, context)) score -= 2;
     }
 
     score = Math.max(score, Number(existingScore || 0));
@@ -171,7 +223,28 @@ export function computeEdgeStability({
     let tier = 'candidate';
     if (score >= 9) tier = 'stable';
     else if (score >= 5) tier = 'provisional';
-    else if (existingTier === 'stable' || existingTier === 'provisional') tier = existingTier;
+    else if (
+        !['[RELACIONADO_CON]', '[HABLA_DE]', '[EVENTO_CON]'].includes(normalizedRelation)
+        && (existingTier === 'stable' || existingTier === 'provisional')
+    ) {
+        tier = existingTier;
+    }
+
+    if (normalizedRelation === '[RELACIONADO_CON]' && support < 3) {
+        tier = 'candidate';
+    }
+
+    if (normalizedRelation === '[HABLA_DE]' && support < 2) {
+        tier = 'candidate';
+    }
+
+    if (normalizedRelation === '[HABLA_DE]' && hasNegativeTalkCue(context)) {
+        tier = 'candidate';
+    }
+
+    if (normalizedRelation === '[EVENTO_CON]' && support < 2) {
+        tier = 'candidate';
+    }
 
     return {
         score,

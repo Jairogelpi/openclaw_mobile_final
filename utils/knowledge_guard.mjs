@@ -185,7 +185,10 @@ const EXPLICIT_RELATION_CUES = new Map([
     ['[POSEE]', ['tiene', 'tengo', 'posee', 'lleva', 'he pillado']],
     ['[PLANEA]', ['voy a', 'quiero', 'planeo', 'plan', 'vamos a']],
     ['[PREFIERE]', ['prefiero', 'me gusta', 'me encanta']],
-    ['[EVITA]', ['evita', 'no quiero', 'odio', 'paso de']]
+    ['[EVITA]', ['evita', 'no quiero', 'odio', 'paso de']],
+    ['[HABLA_DE]', ['habla de', 'hablar de', 'sobre', 'menciona', 'comenta', 'pregunta por', 'dice de']],
+    ['[RELACIONADO_CON]', ['relacionado con', 'conectado con', 'asociado con', 'vinculado con', 'tiene que ver con']],
+    ['[EVENTO_CON]', ['con', 'junto a', 'acompanado de', 'acompañado de']]
 ]);
 
 function trimEntityEdges(value) {
@@ -269,6 +272,23 @@ function hasExplicitCue(relationType, evidenceText, contextText = '') {
     return cues.some(cue => haystack.includes(normalizeComparableText(cue)));
 }
 
+function hasNegativeTalkCue(evidenceText, contextText = '') {
+    const haystack = normalizeComparableText(`${evidenceText || ''} ${contextText || ''}`);
+    return [
+        'hablar con',
+        'quiere hablar con',
+        'hablo con',
+        'habló con',
+        'respuesta sobre',
+        'respuesta a',
+        'contesta a',
+        'contestó a',
+        'gracias',
+        'expresion de afecto',
+        'expresión de afecto'
+    ].some(cue => haystack.includes(normalizeComparableText(cue)));
+}
+
 function relationshipHasStrongEvidence({
     relationType,
     sourceName,
@@ -298,11 +318,18 @@ function relationshipHasStrongEvidence({
         [sourceKey, targetKey].includes(contactKey);
 
     if (relationType === '[HABLA_DE]') {
-        return mentionsTarget && (mentionsSource || speakerMatchesSource);
+        if (hasNegativeTalkCue(evidence, context)) {
+            return false;
+        }
+        return hasExplicitCue(relationType, evidence, context)
+            && mentionsTarget
+            && (mentionsSource || speakerMatchesSource);
     }
 
     if (relationType === '[RELACIONADO_CON]' || relationType === '[EVENTO_CON]') {
-        return (mentionsSource || speakerMatchesSource || speakerMatchesTarget) && mentionsTarget;
+        return hasExplicitCue(relationType, evidence, context)
+            && (mentionsSource || speakerMatchesSource || speakerMatchesTarget)
+            && mentionsTarget;
     }
 
     if (mentionsSource && mentionsTarget) {

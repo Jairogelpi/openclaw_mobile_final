@@ -567,6 +567,13 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
         existingTier: exactEdge?.stability_tier || 'candidate'
     });
 
+    if (
+        ['[RELACIONADO_CON]', '[HABLA_DE]', '[EVENTO_CON]'].includes(canonicalRelationType)
+        && stability.tier === 'candidate'
+    ) {
+        return false;
+    }
+
     const { error } = await supabase.from('knowledge_edges').upsert({
         client_id: clientId,
         source_node: canonicalSource,
