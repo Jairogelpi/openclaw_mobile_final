@@ -6,9 +6,10 @@ import { cleanupGraphOutliers } from './cleanup_graph_outliers.mjs';
 
 const clientId = process.argv[2];
 const resumeMode = process.argv.includes('--resume');
+const forceReprocessMode = process.argv.includes('--force-reprocess');
 
 if (!clientId) {
-    console.error('Usage: node scripts/rebuild_whatsapp_relations.mjs <client_id> [--resume]');
+    console.error('Usage: node scripts/rebuild_whatsapp_relations.mjs <client_id> [--resume] [--force-reprocess]');
     process.exit(1);
 }
 
@@ -93,14 +94,17 @@ async function countClientRows(tableName) {
 }
 
 async function rebuild() {
-    console.log(`[Rebuild] Iniciando saneado de relaciones para ${clientId}${resumeMode ? ' (resume)' : ''}...`);
+    console.log(`[Rebuild] Iniciando saneado de relaciones para ${clientId}${resumeMode ? ' (resume)' : ''}${forceReprocessMode ? ' (force-reprocess)' : ''}...`);
 
     await supabase
         .from('user_souls')
-        .update({ is_processing: true, worker_status: resumeMode ? 'Resuming clean WhatsApp rebuild...' : 'Rebuilding clean WhatsApp relations...' })
+        .update({ is_processing: true, worker_status: (resumeMode && !forceReprocessMode) ? 'Resuming clean WhatsApp rebuild...' : 'Rebuilding clean WhatsApp relations...' })
         .eq('client_id', clientId);
 
-    let effectiveResumeMode = resumeMode;
+    let effectiveResumeMode = resumeMode && !forceReprocessMode;
+    if (forceReprocessMode) {
+        console.log('[Rebuild] Modo force-reprocess activo: se reprocesara todo el corpus.');
+    }
     if (resumeMode) {
         const [entityMentions, relationMentions, pending] = await Promise.all([
             countClientRows('entity_mentions').catch(() => 0),
