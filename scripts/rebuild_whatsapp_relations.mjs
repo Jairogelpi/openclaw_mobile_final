@@ -4,9 +4,10 @@ import { hydrateContactIdentities, repairOwnerIdentity } from '../services/ident
 import { detectAndSaveCommunities } from '../services/community.service.mjs';
 
 const clientId = process.argv[2];
+const resumeMode = process.argv.includes('--resume');
 
 if (!clientId) {
-    console.error('Usage: node scripts/rebuild_whatsapp_relations.mjs <client_id>');
+    console.error('Usage: node scripts/rebuild_whatsapp_relations.mjs <client_id> [--resume]');
     process.exit(1);
 }
 
@@ -76,35 +77,39 @@ async function remainingRawMessages() {
 }
 
 async function rebuild() {
-    console.log(`[Rebuild] Iniciando saneado de relaciones para ${clientId}...`);
+    console.log(`[Rebuild] Iniciando saneado de relaciones para ${clientId}${resumeMode ? ' (resume)' : ''}...`);
 
     await supabase
         .from('user_souls')
-        .update({ is_processing: true, worker_status: 'Rebuilding clean WhatsApp relations...' })
+        .update({ is_processing: true, worker_status: resumeMode ? 'Resuming clean WhatsApp rebuild...' : 'Rebuilding clean WhatsApp relations...' })
         .eq('client_id', clientId);
 
-    for (const tableName of tablesToClear) {
-        await clearClientTable(tableName);
-    }
+    if (!resumeMode) {
+        for (const tableName of tablesToClear) {
+            await clearClientTable(tableName);
+        }
 
-    const { error: resetError } = await supabase
-        .from('raw_messages')
-        .update({ processed: false })
-        .eq('client_id', clientId);
+        const { error: resetError } = await supabase
+            .from('raw_messages')
+            .update({ processed: false })
+            .eq('client_id', clientId);
 
-    if (resetError) {
-        throw resetError;
+        if (resetError) {
+            throw resetError;
+        }
     }
 
     await supabase
         .from('user_souls')
-        .update({ is_processing: false, worker_status: 'Rebuilding clean WhatsApp relations...' })
+        .update({ is_processing: true, worker_status: resumeMode ? 'Resuming clean WhatsApp rebuild...' : 'Rebuilding clean WhatsApp relations...' })
         .eq('client_id', clientId);
 
     let remaining = await remainingRawMessages();
     console.log(`[Rebuild] raw_messages pendientes: ${remaining}`);
+    let iteration = 0;
 
     while (remaining > 0) {
+        iteration += 1;
         await distillAndVectorize(clientId, {
             mode: 'rebuild',
             skipAutonomousDistillation: true,
@@ -112,6 +117,13 @@ async function rebuild() {
             skipIdentityHydration: true
         });
         remaining = await remainingRawMessages();
+        await supabase
+            .from('user_souls')
+            .update({
+                is_processing: true,
+                worker_status: `Rebuild loop ${iteration}: ${remaining} raw_messages pendientes`
+            })
+            .eq('client_id', clientId);
         console.log(`[Rebuild] raw_messages pendientes: ${remaining}`);
     }
 
