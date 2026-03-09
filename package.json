@@ -14,6 +14,7 @@
         "migrate:graphrag-v7": "node scripts/apply_graphrag_v7.mjs",
         "seed:evidence-rag": "node scripts/build_rag_eval_cases.mjs",
         "eval:evidence-rag": "node scripts/eval_evidence_rag.mjs",
+        "eval:evidence-rag:multi": "node scripts/run_multi_client_rag_eval.mjs",
         "repair:owner-identity": "node scripts/repair_owner_identity.mjs",
         "bench:brain-admin": "node scripts/benchmark_brain_admin.mjs",
         "retain:recent-raw": "node scripts/retain_recent_raw_messages.mjs",

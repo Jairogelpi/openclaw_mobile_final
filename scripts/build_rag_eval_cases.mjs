@@ -306,12 +306,12 @@ function buildGroupCases(memories = []) {
     return cases;
 }
 
-async function main() {
-    const clientId = getArg('client') || process.env.CLIENT_ID;
-    const targetCount = Number(getArg('count', '160'));
-    const shouldReset = process.argv.includes('--reset');
-    const shouldRehydrate = process.argv.includes('--rehydrate');
-
+export async function seedEvalCasesForClient({
+    clientId,
+    targetCount = 160,
+    shouldReset = false,
+    shouldRehydrate = false
+} = {}) {
     if (!clientId) {
         throw new Error('Missing client id. Use --client=<uuid> or CLIENT_ID env.');
     }
@@ -397,11 +397,23 @@ async function main() {
         return acc;
     }, {});
 
+    const summary = { total: payload.length, breakdown };
     console.log(`[RAG Eval Seed] Inserted ${payload.length} cases for ${clientId}.`);
-    console.log(JSON.stringify({ total: payload.length, breakdown }, null, 2));
+    console.log(JSON.stringify(summary, null, 2));
+    return summary;
 }
 
-main().catch(error => {
-    console.error('[RAG Eval Seed] Failed:', error.message);
-    process.exitCode = 1;
-});
+async function main() {
+    const clientId = getArg('client') || process.env.CLIENT_ID;
+    const targetCount = Number(getArg('count', '160'));
+    const shouldReset = process.argv.includes('--reset');
+    const shouldRehydrate = process.argv.includes('--rehydrate');
+    await seedEvalCasesForClient({ clientId, targetCount, shouldReset, shouldRehydrate });
+}
+
+if (import.meta.url === new URL(process.argv[1], 'file:').href) {
+    main().catch(error => {
+        console.error('[RAG Eval Seed] Failed:', error.message);
+        process.exitCode = 1;
+    });
+}

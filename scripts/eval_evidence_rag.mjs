@@ -150,11 +150,11 @@ function evaluateCase(testCase, result, latencyMs) {
     };
 }
 
-async function main() {
-    const clientId = getArg('client') || process.env.CLIENT_ID;
-    const runName = getArg('run-name', `evidence-first-${new Date().toISOString()}`);
-    const limit = Number(getArg('limit', '200'));
-
+export async function runEvalForClient({
+    clientId,
+    runName = `evidence-first-${new Date().toISOString()}`,
+    limit = 200
+} = {}) {
     if (!clientId) {
         throw new Error('Missing client id. Use --client=<uuid> or CLIENT_ID env.');
     }
@@ -234,10 +234,19 @@ async function main() {
     if (insertError) throw insertError;
 
     console.log(JSON.stringify(summary, null, 2));
-    process.exit(0);
+    return summary;
 }
 
-main().catch(error => {
-    console.error('[RAG Eval] Failed:', error.message);
-    process.exitCode = 1;
-});
+async function main() {
+    const clientId = getArg('client') || process.env.CLIENT_ID;
+    const runName = getArg('run-name', `evidence-first-${new Date().toISOString()}`);
+    const limit = Number(getArg('limit', '200'));
+    await runEvalForClient({ clientId, runName, limit });
+}
+
+if (import.meta.url === new URL(process.argv[1], 'file:').href) {
+    main().catch(error => {
+        console.error('[RAG Eval] Failed:', error.message);
+        process.exitCode = 1;
+    });
+}
