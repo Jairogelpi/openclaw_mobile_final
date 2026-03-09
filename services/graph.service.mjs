@@ -514,6 +514,175 @@ function isMeaningfulAlias(alias) {
     return true;
 }
 
+const RELATION_MEMORY_CUES = new Map([
+    ['FAMILIA_DE', ['madre', 'padre', 'hermano', 'hermana', 'hijo', 'hija', 'familia', 'primo', 'prima']],
+    ['PAREJA_DE', ['pareja', 'novia', 'novio', 'amor', 'mi vida', 'te amo', 'cariño', 'carino']],
+    ['AMISTAD', ['amigo', 'amiga', 'colega', 'bro']],
+    ['TRABAJA_EN', ['trabaja', 'curro', 'empleo', 'empresa', 'oficina', 'jefe', 'jefa']],
+    ['VIVE_EN', ['vive', 'casa', 'piso', 'mudado', 'mudarse']],
+    ['ESTUDIA_EN', ['estudia', 'universidad', 'instituto', 'master', 'máster', 'curso']],
+    ['CONOCE_A', ['conoce', 'quede con', 'quedé con', 'he hablado con', 'hablé con']]
+]);
+
+function normalizeRelationFilterKey(value) {
+    const normalized = normalizeComparableText(String(value || '').replace(/[\[\]]/g, ''));
+    if (!normalized) return null;
+    if (normalized === 'any_relation') return 'ANY_RELATION';
+    return normalized.toUpperCase();
+}
+
+function buildRelationCueMap(relationFilter = null) {
+    const requested = normalizeRelationFilterKey(relationFilter);
+    if (requested && requested !== 'ANY_RELATION' && RELATION_MEMORY_CUES.has(requested)) {
+        return new Map([[requested, RELATION_MEMORY_CUES.get(requested)]]);
+    }
+    return RELATION_MEMORY_CUES;
+}
+
+function textContainsAlias(text = '', aliases = []) {
+    const haystack = normalizeComparableText(text);
+    if (!haystack) return false;
+    return aliases.some(alias => {
+        const needle = normalizeComparableText(alias);
+        return Boolean(needle) && haystack.includes(needle);
+    });
+}
+
+function inferRelationTypeFromText(text = '', relationFilter = null) {
+    const haystack = normalizeComparableText(text);
+    if (!haystack) return null;
+
+    for (const [relationType, cues] of buildRelationCueMap(relationFilter).entries()) {
+        if (cues.some(cue => haystack.includes(normalizeComparableText(cue)))) {
+            return `[${relationType}]`;
+        }
+    }
+
+    return null;
+}
+
+function extractRelationshipSnippet(content = '', aliases = []) {
+    const lines = String(content || '')
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean);
+    if (!lines.length) return '';
+
+    const scored = lines
+        .map((line, index) => {
+            const normalized = normalizeComparableText(line);
+            let score = inferRelationTypeFromText(line, 'ANY_RELATION') ? 4 : 0;
+            for (const alias of aliases) {
+                const needle = normalizeComparableText(alias);
+                if (needle && normalized.includes(needle)) score += 2;
+            }
+            if (line.includes(':')) score += 1;
+            return { line, index, score };
+        })
+        .sort((a, b) => b.score - a.score || a.index - b.index);
+
+    const best = scored[0];
+    const neighbor = scored.find(item => Math.abs(item.index - best.index) === 1 && item.score >= Math.max(1, best.score - 2));
+    return [best.line, neighbor?.line].filter(Boolean).join(' ').trim().slice(0, 240);
+}
+
+function buildRelationshipAliasMap(lookup, canonicalEntities = []) {
+    const aliasMap = new Map();
+
+    for (const entity of canonicalEntities) {
+        const normalizedEntity = normalizeComparableText(entity);
+        const aliases = new Set([entity]);
+
+        for (const row of (lookup.identityMatches || [])) {
+            const rowAliases = [row.canonical_name, ...(row.aliases || [])]
+                .map(value => String(value || '').trim())
+                .filter(isMeaningfulAlias);
+            const matchesEntity =
+                normalizeComparableText(row.canonical_name) === normalizedEntity ||
+                rowAliases.some(alias => normalizeComparableText(alias) === normalizedEntity);
+            if (!matchesEntity) continue;
+            for (const alias of rowAliases) aliases.add(alias);
+        }
+
+        aliasMap.set(entity, [...aliases]);
+    }
+
+    return aliasMap;
+}
+
+async function exactRelationshipMemorySearch(clientId, lookup, canonicalEntities = [], relationFilter = null, matchCount = 8) {
+    if (canonicalEntities.length < 2) return [];
+
+    const aliasMap = buildRelationshipAliasMap(lookup, canonicalEntities);
+    const remoteIdSet = new Set(lookup.remoteIdList);
+    const pairs = [];
+    for (let i = 0; i < canonicalEntities.length; i += 1) {
+        for (let j = i + 1; j < canonicalEntities.length; j += 1) {
+            pairs.push([canonicalEntities[i], canonicalEntities[j]]);
+        }
+    }
+
+    const { data: rows, error } = await supabase
+        .from('user_memories')
+        .select('id, content, sender, metadata, created_at')
+        .eq('client_id', clientId)
+        .order('created_at', { ascending: false })
+        .limit(Math.max(300, matchCount * 60));
+
+    if (error) throw error;
+
+    const results = [];
+    const seen = new Set();
+
+    for (const row of (rows || [])) {
+        const content = String(row.content || '');
+        const sender = String(row.sender || '').trim();
+        const remoteId = row.metadata?.remoteId || row.metadata?.remote_id || null;
+        const senderNormalized = normalizeComparableText(sender);
+
+        for (const [left, right] of pairs) {
+            const leftAliases = aliasMap.get(left) || [left];
+            const rightAliases = aliasMap.get(right) || [right];
+            const leftPresent = textContainsAlias(content, leftAliases) || leftAliases.some(alias => normalizeComparableText(alias) === senderNormalized);
+            const rightPresent = textContainsAlias(content, rightAliases) || rightAliases.some(alias => normalizeComparableText(alias) === senderNormalized);
+            const remoteAnchored = remoteId && remoteIdSet.has(remoteId);
+
+            if (!(leftPresent && rightPresent) && !(remoteAnchored && (leftPresent || rightPresent))) continue;
+
+            const relationType = inferRelationTypeFromText(content, relationFilter);
+            if (!relationType) continue;
+
+            const sourceNode = leftPresent ? left : right;
+            const targetNode = sourceNode === left ? right : left;
+            const sourceId = `relationship_memory:${row.id}:${sourceNode}:${relationType}:${targetNode}`;
+            if (seen.has(sourceId)) continue;
+            seen.add(sourceId);
+
+            results.push(toFactEvidenceCandidate({
+                fact_type: 'relationship_memory',
+                source_id: sourceId,
+                entity_name: sourceNode,
+                speaker: sender || sourceNode,
+                remote_id: remoteId,
+                timestamp: getEventTimestamp(row),
+                relation_type: relationType,
+                source_node: sourceNode,
+                target_node: targetNode,
+                evidence_text: extractRelationshipSnippet(content, [...leftAliases, ...rightAliases]),
+                metadata: {
+                    memory_id: row.id,
+                    support_count: 1,
+                    stability_tier: 'provisional',
+                    relation_filter: relationFilter || null
+                },
+                recall_score: 0.93
+            }, { source: 'RELATIONSHIP_MEMORY_EXACT' }));
+        }
+    }
+
+    return results.slice(0, matchCount);
+}
+
 async function buildEntityLookupContext(clientId, entityNames = []) {
     const names = [...new Set((entityNames || []).map(name => String(name || '').trim()).filter(Boolean))].slice(0, 12);
     const identityMatches = await resolveIdentityCandidates(clientId, names).catch(() => []);
@@ -1260,7 +1429,7 @@ export async function mediaMemorySearch(clientId, entityNames = [], queryText = 
     }
 }
 
-export async function exactRelationshipSearch(clientId, entityNames = [], matchCount = 10) {
+export async function exactRelationshipSearch(clientId, entityNames = [], matchCount = 10, options = {}) {
     const lookup = await buildEntityLookupContext(clientId, entityNames);
     const canonicalEntities = [...new Set([
         ...lookup.names,
@@ -1285,6 +1454,8 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
             results.push(candidate);
         };
 
+        const requestedRelation = normalizeRelationFilterKey(options.relationFilter);
+
         for (const [left, right] of pairs.slice(0, 3)) {
             const queries = await Promise.all([
                 supabase
@@ -1304,12 +1475,33 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
                     .eq('source_node', right)
                     .eq('target_node', left)
                     .order('last_seen', { ascending: false })
+                    .limit(6),
+                supabase
+                    .from('relation_mentions')
+                    .select('source_node, target_node, relation_type, context, last_seen, support_count, stable_score, stability_tier, cognitive_flags')
+                    .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
+                    .eq('source_node', left)
+                    .eq('target_node', right)
+                    .order('stable_score', { ascending: false })
+                    .order('last_seen', { ascending: false })
+                    .limit(6),
+                supabase
+                    .from('relation_mentions')
+                    .select('source_node, target_node, relation_type, context, last_seen, support_count, stable_score, stability_tier, cognitive_flags')
+                    .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
+                    .eq('source_node', right)
+                    .eq('target_node', left)
+                    .order('stable_score', { ascending: false })
+                    .order('last_seen', { ascending: false })
                     .limit(6)
             ]);
 
             for (const queryResult of queries) {
                 for (const edge of (queryResult.data || [])) {
                     if (!isStableTier(edge.stability_tier)) continue;
+                    if (requestedRelation && requestedRelation !== 'ANY_RELATION' && normalizeRelationFilterKey(edge.relation_type) !== requestedRelation) continue;
                     pushCandidate(toFactEvidenceCandidate({
                         fact_type: 'relationship_edge',
                         source_id: `relationship_edge:${edge.source_node}:${edge.relation_type}:${edge.target_node}`,
@@ -1332,6 +1524,17 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
                     }, { source: 'RELATIONSHIP_EDGE_EXACT' }));
                 }
             }
+        }
+
+        const memoryCandidates = await exactRelationshipMemorySearch(
+            clientId,
+            lookup,
+            canonicalEntities,
+            options.relationFilter || null,
+            Math.max(4, Math.min(matchCount, 8))
+        );
+        for (const candidate of memoryCandidates) {
+            pushCandidate(candidate);
         }
 
         return results.slice(0, matchCount);

@@ -64,6 +64,20 @@ async function fetchRecentMemories(clientId, limit = 2500) {
     return data || [];
 }
 
+async function fetchRelationMentions(clientId, limit = 80) {
+    const { data, error } = await supabase
+        .from('relation_mentions')
+        .select('source_node, target_node, relation_type, context, last_seen, support_count, stable_score, stability_tier')
+        .eq('client_id', clientId)
+        .in('stability_tier', ['provisional', 'stable'])
+        .order('stable_score', { ascending: false })
+        .order('support_count', { ascending: false })
+        .limit(limit);
+
+    if (error) throw error;
+    return data || [];
+}
+
 function memoryRemoteId(memory) {
     return memory.metadata?.remoteId || memory.metadata?.remote_id || null;
 }
@@ -216,6 +230,28 @@ function buildRelationCases(edges) {
         }));
 }
 
+function buildRelationMentionCases(mentions) {
+    return mentions
+        .filter(item => item.source_node && item.target_node && item.relation_type)
+        .map(item => ({
+            category: 'relationship_lookup',
+            style_tag: item.support_count >= 2 ? 'relationship_graph' : 'relationship_memory',
+            query: `que relacion hay entre ${item.source_node} y ${item.target_node}`,
+            expected_mode: 'answer',
+            expected_entities: [item.source_node, item.target_node],
+            expected_remote_ids: [],
+            expected_substrings: [item.source_node, item.target_node],
+            expected_edge_keys: [`${item.source_node}|${item.relation_type}|${item.target_node}`],
+            expected_evidence_kinds: ['fact'],
+            notes: {
+                relation_type: item.relation_type,
+                context: item.context || null,
+                support_count: item.support_count || 0,
+                from_mentions: true
+            }
+        }));
+}
+
 function buildAbstainCases(count = 24) {
     const cases = [];
     for (let i = 1; i <= count; i++) {
@@ -293,10 +329,11 @@ async function main() {
         console.log(`[RAG Eval Seed] Reusing ${identityCount} existing identities for ${clientId}.`);
     }
 
-    const [identityRows, memories, relationEdges] = await Promise.all([
+    const [identityRows, memories, relationEdges, relationMentions] = await Promise.all([
         getIdentityRows(clientId),
         fetchRecentMemories(clientId),
-        fetchRelationEdges(clientId)
+        fetchRelationEdges(clientId),
+        fetchRelationMentions(clientId)
     ]);
 
     const memoriesByRemoteId = new Map();
@@ -310,6 +347,7 @@ async function main() {
     const seededCases = uniqueCases([
         ...buildIdentityCases(identityRows.slice(0, 45), memoriesByRemoteId),
         ...buildRelationCases(relationEdges.slice(0, 50)),
+        ...buildRelationMentionCases(relationMentions.slice(0, 80)),
         ...buildGroupCases(memories),
         ...buildAbstainCases(30)
     ]).slice(0, targetCount);

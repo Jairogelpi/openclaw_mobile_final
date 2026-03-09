@@ -833,7 +833,12 @@ export async function collectEvidenceCandidates(clientId, queryText, queryVector
         ? await exactEntityFactSearch(clientId, entities, Math.min(ragMaxCandidates, 12)).catch(() => [])
         : [];
     const relationshipCandidates = plan.intent === 'relationship_lookup' && entities.length >= 2
-        ? await exactRelationshipSearch(clientId, entities, Math.min(ragMaxCandidates, 10)).catch(() => [])
+        ? await exactRelationshipSearch(
+            clientId,
+            entities,
+            Math.min(ragMaxCandidates, 10),
+            { relationFilter: plan.relation_filter || null }
+        ).catch(() => [])
         : [];
     const factCandidates = filterFactCandidatesForPlan(plan, rawFactCandidates);
     const exactLookupMode = Boolean(

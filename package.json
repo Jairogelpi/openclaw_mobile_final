@@ -20,8 +20,9 @@
         "audit:graph": "node scripts/audit_graph_quality.mjs",
         "test:graph-guards": "node --test tests/graph_guards.test.mjs",
         "test:identity-guards": "node --test tests/identity_guards.test.mjs",
+        "test:community-guards": "node --test tests/community_guards.test.mjs",
         "test:reranker": "node --test tests/reranker_quality.test.mjs",
-        "test:guards": "node --test tests/graph_guards.test.mjs tests/identity_guards.test.mjs tests/reranker_quality.test.mjs"
+        "test:guards": "node --test tests/graph_guards.test.mjs tests/identity_guards.test.mjs tests/community_guards.test.mjs tests/reranker_quality.test.mjs"
     },
     "dependencies": {
         "@huggingface/transformers": "^3.8.1",
