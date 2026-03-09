@@ -376,7 +376,7 @@ async function main() {
         expected_time_start: item.expected_time_start || null,
         expected_time_end: item.expected_time_end || null,
         style_tag: item.style_tag || 'general',
-        expected_citation_min: item.expected_citation_min || 1,
+        expected_citation_min: item.expected_citation_min ?? 1,
         expected_evidence_kinds: item.expected_evidence_kinds || [],
         expected_verdict_detail: item.expected_verdict_detail || null,
         expected_memory_ids: item.expected_memory_ids || [],
