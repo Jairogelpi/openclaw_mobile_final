@@ -20,6 +20,7 @@ const OWNER_ALIASES = new Set([
     'yo',
     'me',
     'mi clon',
+    'mi clon (yo)',
     'mi clon yo',
     'titular'
 ]);

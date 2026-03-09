@@ -13,6 +13,7 @@ import { computeEdgeStability } from '../utils/stable_graph_policy.mjs';
 const clientId = process.argv[2];
 const applyMode = process.argv.includes('--apply');
 const WEAK_ORPHAN_TYPES = new Set(['OBJETO', 'ENTITY', 'EVENTO', 'TEMA']);
+const OWNER_ALIAS_NAMES = new Set(['yo', 'me', 'mi clon', 'mi clon yo', 'usuario principal', 'user sent', 'user_sent']);
 function isWeakCandidateNode(node) {
     const entityType = String(node?.entity_type || '').trim().toUpperCase();
     const entityName = String(node?.entity_name || '').trim();
@@ -206,6 +207,11 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
             || (!looksHumanIdentityLabel(entityName) && (!description || isWeakEntityDescription(description)))
         );
     });
+    const weakOwnerAliasNodes = allNodes.filter(node => {
+        if (String(node?.entity_type || '').trim().toUpperCase() !== 'PERSONA') return false;
+        const normalizedName = normalizeComparableText(String(node?.entity_name || ''));
+        return OWNER_ALIAS_NAMES.has(normalizedName);
+    });
     const groupLabelPersonNodes = allNodes.filter(node =>
         String(node?.entity_type || '').trim().toUpperCase() === 'PERSONA'
         && classifyIdentityLikeName(String(node?.entity_name || '').trim()) === 'group_label'
@@ -238,7 +244,8 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
         const nodeIds = [
             ...phoneLikePeople.map(node => node.id),
             ...weakCandidateOrphanNodes.map(node => node.id),
-            ...weakUnanchoredPersonNodes.map(node => node.id)
+            ...weakUnanchoredPersonNodes.map(node => node.id),
+            ...weakOwnerAliasNodes.map(node => node.id)
         ].filter(Boolean);
         const uniqueNodeIds = [...new Set(nodeIds)];
         if (uniqueNodeIds.length) {
@@ -281,6 +288,15 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
             stability_tier: node.stability_tier
         })),
         weak_unanchored_person_nodes: weakUnanchoredPersonNodes.map(node => ({
+            id: node.id,
+            entity_name: node.entity_name,
+            entity_type: node.entity_type,
+            description: node.description,
+            support_count: node.support_count,
+            stable_score: node.stable_score,
+            stability_tier: node.stability_tier
+        })),
+        weak_owner_alias_nodes: weakOwnerAliasNodes.map(node => ({
             id: node.id,
             entity_name: node.entity_name,
             entity_type: node.entity_type,

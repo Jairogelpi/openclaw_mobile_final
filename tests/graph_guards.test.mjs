@@ -169,4 +169,5 @@ test('retypes group-like person labels to GRUPO and blocks role mentions as PERS
 test('normalizes spaced or decorated entity names before graph insertion', () => {
     assert.equal(normalizeEntityName('y o', 'Jairo'), 'Jairo');
     assert.equal(normalizeEntityName('𝑇𝑒𝑗𝑒𝑟𝑜'), 'Tejero');
+    assert.equal(normalizeEntityName('mi clon (yo)', 'Jairo'), 'Jairo');
 });
