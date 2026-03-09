@@ -1,4 +1,5 @@
 import { normalizeComparableText } from './message_guard.mjs';
+import { looksHumanIdentityLabel } from './identity_policy.mjs';
 
 const WEAK_ENTITY_DESCRIPTIONS = new Set([
     'participante del chat',
@@ -48,6 +49,10 @@ const GENERIC_ENTITY_TYPES = new Set([
     'ENTITY',
     'OBJETO'
 ]);
+
+const ROLE_MENTION_PERSON_PATTERNS = [
+    /^(mi|mis|su|sus|tu|tus|nuestro|nuestra|nuestros|nuestras)\s+/i
+];
 
 export function compactDigits(value) {
     return String(value || '').replace(/[^\d]/g, '');
@@ -150,6 +155,25 @@ export function evaluateEntityAdmissibility({
 
     if (known) {
         return { allowed: true, reason: 'known_anchor', score, mentionCount };
+    }
+
+    if (
+        entityType === 'PERSONA'
+        && ROLE_MENTION_PERSON_PATTERNS.some(pattern => pattern.test(String(name || '').trim()))
+    ) {
+        return { allowed: false, reason: 'role_mention_person', score: score - 6, mentionCount };
+    }
+
+    if (
+        entityType === 'PERSONA'
+        && !looksHumanIdentityLabel(name)
+        && !groundedBySpeaker
+        && (
+            isWeakPersonDescription(descriptionText)
+            || (!groundedByEvidence && mentionCount < 2)
+        )
+    ) {
+        return { allowed: false, reason: 'weak_non_human_person', score: score - 4, mentionCount };
     }
 
     if (

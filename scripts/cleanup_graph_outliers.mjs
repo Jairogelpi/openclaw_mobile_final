@@ -6,12 +6,16 @@ import {
     isWeakEntityDescription,
     isWeakPersonDescription
 } from '../utils/graph_admissibility_policy.mjs';
-import { pickBestHumanName, looksLikeWhatsAppRemoteId } from '../utils/message_guard.mjs';
+import { normalizeComparableText, pickBestHumanName, looksLikeWhatsAppRemoteId } from '../utils/message_guard.mjs';
+import { looksHumanIdentityLabel } from '../utils/identity_policy.mjs';
 import { computeEdgeStability } from '../utils/stable_graph_policy.mjs';
 
 const clientId = process.argv[2];
 const applyMode = process.argv.includes('--apply');
 const WEAK_ORPHAN_TYPES = new Set(['OBJETO', 'ENTITY', 'EVENTO', 'TEMA']);
+const ROLE_MENTION_PERSON_PATTERNS = [
+    /^(mi|mis|su|sus|tu|tus|nuestro|nuestra|nuestros|nuestras)\s+/i
+];
 
 function isWeakCandidateNode(node) {
     const entityType = String(node?.entity_type || '').trim().toUpperCase();
@@ -100,6 +104,13 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
 
     if (rawError) throw rawError;
 
+    const { data: identityRows, error: identityError } = await supabase
+        .from('contact_identities')
+        .select('canonical_name, aliases')
+        .eq('client_id', targetClientId);
+
+    if (identityError) throw identityError;
+
     const groupNames = new Set(
         (rawMessages || [])
             .flatMap(message => [
@@ -108,6 +119,12 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
             ])
             .map(value => pickBestHumanName(value))
             .filter(value => value && !looksLikeWhatsAppRemoteId(value))
+    );
+    const identityAnchors = new Set(
+        (identityRows || [])
+            .flatMap(row => [row?.canonical_name, ...(Array.isArray(row?.aliases) ? row.aliases : [])])
+            .map(value => normalizeComparableText(value))
+            .filter(Boolean)
     );
 
     const groupTalkEdges = (allEdges || []).filter(edge =>
@@ -176,6 +193,21 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
         && !survivingIncidentCounts.has(String(node.entity_name || '').trim())
         && isWeakCandidateNode(node)
     );
+    const weakUnanchoredPersonNodes = allNodes.filter(node => {
+        const entityName = String(node?.entity_name || '').trim();
+        if (String(node?.entity_type || '').trim().toUpperCase() !== 'PERSONA') return false;
+        if (!entityName) return false;
+        if (identityAnchors.has(normalizeComparableText(entityName))) return false;
+        if ((survivingIncidentCounts.get(entityName) || 0) > 1) return false;
+        if (Number(node?.support_count || 0) > 2) return false;
+
+        const description = String(node?.description || '').trim();
+        return Boolean(
+            ROLE_MENTION_PERSON_PATTERNS.some(pattern => pattern.test(entityName))
+            || isWeakPersonDescription(description)
+            || (!looksHumanIdentityLabel(entityName) && (!description || isWeakEntityDescription(description)))
+        );
+    });
 
     let deletedEdges = 0;
     let deletedNodes = 0;
@@ -193,7 +225,8 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
 
         const nodeIds = [
             ...phoneLikePeople.map(node => node.id),
-            ...weakCandidateOrphanNodes.map(node => node.id)
+            ...weakCandidateOrphanNodes.map(node => node.id),
+            ...weakUnanchoredPersonNodes.map(node => node.id)
         ].filter(Boolean);
         const uniqueNodeIds = [...new Set(nodeIds)];
         if (uniqueNodeIds.length) {
@@ -227,6 +260,15 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
             stability_tier: edge.stability_tier
         })),
         weak_candidate_orphan_nodes: weakCandidateOrphanNodes.map(node => ({
+            id: node.id,
+            entity_name: node.entity_name,
+            entity_type: node.entity_type,
+            description: node.description,
+            support_count: node.support_count,
+            stable_score: node.stable_score,
+            stability_tier: node.stability_tier
+        })),
+        weak_unanchored_person_nodes: weakUnanchoredPersonNodes.map(node => ({
             id: node.id,
             entity_name: node.entity_name,
             entity_type: node.entity_type,

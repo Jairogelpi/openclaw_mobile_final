@@ -61,6 +61,15 @@ const NEGATIVE_TALKS_ABOUT_PATTERNS = [
     /\bexpresión de afecto\b/
 ];
 
+const GENERIC_RELATION_CONTEXT_PATTERNS = [
+    /\breferencia a una persona\b/i,
+    /\breferencia personal\b/i,
+    /\binterlocutor\b/i,
+    /\busuario del chat\b/i,
+    /\bmencionado en la conversacion\b/i,
+    /\bmencionado en la conversación\b/i
+];
+
 function normalizedText(value) {
     return normalizeComparableText(String(value || ''));
 }
@@ -120,6 +129,12 @@ function hasNegativeTalkCue(text = '') {
     const raw = String(text || '');
     if (!raw) return false;
     return NEGATIVE_TALKS_ABOUT_PATTERNS.some(pattern => pattern.test(raw));
+}
+
+function hasGenericRelationContext(text = '') {
+    const raw = String(text || '');
+    if (!raw) return false;
+    return GENERIC_RELATION_CONTEXT_PATTERNS.some(pattern => pattern.test(raw));
 }
 
 export function computeNodeStability({
@@ -192,6 +207,7 @@ export function computeEdgeStability({
     if (flagsText.some(flag => ['derived', 'latent', 'dream_cycle'].includes(flag))) score -= 4;
     if (flagsText.some(flag => ['direct', 'grounded'].includes(flag))) score += 1;
     if (flagsText.some(flag => ['conflicted', 'temporal_only', 'media_only'].includes(flag))) score -= 3;
+    if (hasGenericRelationContext(context)) score -= 4;
 
     score += mediaPenalty(context);
     score += temporalPenalty(context);
@@ -216,6 +232,10 @@ export function computeEdgeStability({
     if (normalizedRelation === '[EVENTO_CON]' && support < 2) {
         score -= 2;
         if (!hasRelationCue(normalizedRelation, context)) score -= 2;
+    }
+
+    if (['[AMISTAD]', '[CONOCE_A]', '[PAREJA_DE]', '[FAMILIA_DE]'].includes(normalizedRelation) && hasGenericRelationContext(context)) {
+        score -= 3;
     }
 
     score = Math.max(score, Number(existingScore || 0));
@@ -243,6 +263,14 @@ export function computeEdgeStability({
     }
 
     if (normalizedRelation === '[EVENTO_CON]' && support < 2) {
+        tier = 'candidate';
+    }
+
+    if (
+        ['[AMISTAD]', '[CONOCE_A]', '[PAREJA_DE]', '[FAMILIA_DE]'].includes(normalizedRelation)
+        && hasGenericRelationContext(context)
+        && support < 2
+    ) {
         tier = 'candidate';
     }
 

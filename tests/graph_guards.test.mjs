@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
+import { evaluateEntityAdmissibility } from '../utils/graph_admissibility_policy.mjs';
 import { validateGroundedGraph } from '../utils/knowledge_guard.mjs';
 import { computeEdgeStability } from '../utils/stable_graph_policy.mjs';
 
@@ -125,4 +126,37 @@ test('allows concrete know-person edges to stay promotable', () => {
 
     assert.notEqual(result.tier, 'candidate');
     assert.equal(result.promote, true);
+});
+
+test('rejects role-like person mentions without a real anchor', () => {
+    const result = evaluateEntityAdmissibility({
+        name: 'su hermana',
+        type: 'PERSONA',
+        desc: 'Hermana de Lydia Insta',
+        evidence: 'Lydia hablaba de su hermana.',
+        knownNames: new Set(),
+        remoteId: null,
+        isGroup: false,
+        chunkText: 'Lydia hablaba de su hermana.',
+        groundedBySpeaker: false,
+        groundedByEvidence: false,
+        groundedByMention: true
+    });
+
+    assert.equal(result.allowed, false);
+    assert.equal(result.reason, 'role_mention_person');
+});
+
+test('downgrades friendship edges with generic reference context', () => {
+    const result = computeEdgeStability({
+        relationType: '[AMISTAD]',
+        context: 'referencia a una persona',
+        supportCount: 1,
+        weight: 5,
+        sourceTags: ['grounded_extraction'],
+        flags: ['grounded']
+    });
+
+    assert.equal(result.tier, 'candidate');
+    assert.equal(result.promote, false);
 });

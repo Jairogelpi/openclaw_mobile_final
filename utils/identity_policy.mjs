@@ -107,7 +107,7 @@ function mergeAliases(...aliasSets) {
     return [...seen.values()];
 }
 
-function looksHumanIdentityLabel(value) {
+export function looksHumanIdentityLabel(value) {
     const raw = stripDecorativeText(String(value || '')).trim();
     const normalized = normalizeComparableText(raw);
     if (!normalized) return false;

@@ -101,6 +101,15 @@ function isWeakGenericDescription(value) {
     ].includes(normalized);
 }
 
+function buildIdentityAnchorSet(rows = []) {
+    return new Set(
+        (rows || [])
+            .flatMap(row => [row?.canonical_name, ...(Array.isArray(row?.aliases) ? row.aliases : [])])
+            .map(value => normalize(value))
+            .filter(Boolean)
+    );
+}
+
 function isSuspiciousEdge(edge) {
     if (!edge) return false;
     if (isBlockedNodeName(edge.source_node) || isBlockedNodeName(edge.target_node)) return true;
@@ -227,6 +236,7 @@ async function main() {
         return acc;
     }, {});
 
+    const identityAnchors = buildIdentityAnchorSet(contactIdentities);
     const suspiciousNodes = knowledgeNodes.filter(node => {
         if (isBlockedNodeName(node.entity_name)) return true;
         const admissibility = evaluateEntityAdmissibility({
@@ -234,12 +244,18 @@ async function main() {
             type: node.entity_type,
             desc: node.description || '',
             evidence: node.description || '',
-            knownNames: new Set(),
+            knownNames: identityAnchors,
             remoteId: null,
             isGroup: false,
             requireStrongAnchor: false
         });
         if (!admissibility.allowed) return true;
+        if (
+            String(node.entity_type || '').trim() === 'PERSONA'
+            && identityAnchors.has(normalize(node.entity_name))
+        ) {
+            return false;
+        }
         return ['PERSONA', 'OBJETO', 'LUGAR', 'ORGANIZACION', 'EVENTO'].includes(String(node.entity_type || '').trim())
             && isWeakGenericDescription(node.description);
     });
