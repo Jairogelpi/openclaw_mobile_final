@@ -16,6 +16,8 @@ const tablesToClear = [
     'node_communities',
     'knowledge_edges',
     'knowledge_nodes',
+    'relation_mentions',
+    'entity_mentions',
     'user_memories',
     'contact_personas',
     'contact_identities',
@@ -77,6 +79,19 @@ async function remainingRawMessages() {
     return count || 0;
 }
 
+async function countClientRows(tableName) {
+    const { count, error } = await supabase
+        .from(tableName)
+        .select('*', { head: true, count: 'exact' })
+        .eq('client_id', clientId);
+
+    if (error) {
+        throw error;
+    }
+
+    return Number(count || 0);
+}
+
 async function rebuild() {
     console.log(`[Rebuild] Iniciando saneado de relaciones para ${clientId}${resumeMode ? ' (resume)' : ''}...`);
 
@@ -85,7 +100,21 @@ async function rebuild() {
         .update({ is_processing: true, worker_status: resumeMode ? 'Resuming clean WhatsApp rebuild...' : 'Rebuilding clean WhatsApp relations...' })
         .eq('client_id', clientId);
 
-    if (!resumeMode) {
+    let effectiveResumeMode = resumeMode;
+    if (resumeMode) {
+        const [entityMentions, relationMentions, pending] = await Promise.all([
+            countClientRows('entity_mentions').catch(() => 0),
+            countClientRows('relation_mentions').catch(() => 0),
+            remainingRawMessages().catch(() => 0)
+        ]);
+
+        if (pending === 0 && entityMentions === 0 && relationMentions === 0) {
+            console.log('[Rebuild] Resume invalido para backfill: no hay menciones y no quedan raw_messages pendientes. Cambio automatico a rebuild completo.');
+            effectiveResumeMode = false;
+        }
+    }
+
+    if (!effectiveResumeMode) {
         for (const tableName of tablesToClear) {
             await clearClientTable(tableName);
         }
@@ -102,7 +131,7 @@ async function rebuild() {
 
     await supabase
         .from('user_souls')
-        .update({ is_processing: true, worker_status: resumeMode ? 'Resuming clean WhatsApp rebuild...' : 'Rebuilding clean WhatsApp relations...' })
+        .update({ is_processing: true, worker_status: effectiveResumeMode ? 'Resuming clean WhatsApp rebuild...' : 'Rebuilding clean WhatsApp relations...' })
         .eq('client_id', clientId);
 
     let remaining = await remainingRawMessages();
