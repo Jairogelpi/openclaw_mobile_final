@@ -22,12 +22,12 @@ function percentile(values, p) {
 async function discoverEligibleClients({ minRawMessages = 500, limit = 10 } = {}) {
     const { data: souls, error } = await supabase
         .from('user_souls')
-        .select('client_id, slug, created_at')
-        .order('created_at', { ascending: false })
+        .select('client_id, slug')
+        .order('client_id', { ascending: false })
         .limit(Math.max(limit * 3, 20));
 
     if (error) throw error;
-    const clientIds = (souls || []).map(row => row.client_id).filter(Boolean);
+    const clientIds = [...new Set((souls || []).map(row => row.client_id).filter(Boolean))];
     const eligible = [];
 
     for (const clientId of clientIds) {
