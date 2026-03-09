@@ -16,7 +16,8 @@
         "repair:owner-identity": "node scripts/repair_owner_identity.mjs",
         "bench:brain-admin": "node scripts/benchmark_brain_admin.mjs",
         "retain:recent-raw": "node scripts/retain_recent_raw_messages.mjs",
-        "audit:graph": "node scripts/audit_graph_quality.mjs"
+        "audit:graph": "node scripts/audit_graph_quality.mjs",
+        "test:graph-guards": "node --test tests/graph_guards.test.mjs"
     },
     "dependencies": {
         "@huggingface/transformers": "^3.8.1",
