@@ -134,7 +134,7 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
 
     const weakGenericEdges = (allEdges || []).filter(edge => {
         const relationType = String(edge.relation_type || '').trim();
-        if (!['[RELACIONADO_CON]', '[HABLA_DE]', '[EVENTO_CON]'].includes(relationType)) return false;
+        if (!['[RELACIONADO_CON]', '[HABLA_DE]', '[EVENTO_CON]', '[AMISTAD]', '[CONOCE_A]', '[PAREJA_DE]', '[FAMILIA_DE]'].includes(relationType)) return false;
 
         const normalizedContext = String(edge.context || '').toLowerCase();
         if (

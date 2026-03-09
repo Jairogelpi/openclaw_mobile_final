@@ -90,5 +90,6 @@ test('classifyIdentityLikeName separates role mention, group label and human ali
     assert.equal(classifyIdentityLikeName('Máster INESDI'), 'group_label');
     assert.equal(classifyIdentityLikeName('Ares G Smoke'), 'human_alias');
     assert.equal(classifyIdentityLikeName('Francisco Jose Sanchez'), 'human_alias');
+    assert.equal(classifyIdentityLikeName('Julio Ojeda'), 'human_alias');
     assert.equal(classifyIdentityLikeName('padrastro de Lydia Insta'), 'role_mention');
 });

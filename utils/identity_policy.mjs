@@ -58,7 +58,6 @@ const ROLE_RELATION_PATTERNS = [
 
 const GROUPISH_NAME_PATTERNS = [
     /\b(under|grupo|chat|master|máster|controles|radares)\b/i,
-    /\b(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b/i,
     /\b\d{1,2}\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b/i
 ];
 
