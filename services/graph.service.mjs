@@ -136,6 +136,196 @@ function mergeSourceTags(...sets) {
     return [...merged];
 }
 
+function nowIso() {
+    return new Date().toISOString();
+}
+
+async function upsertEntityMentionAggregate(clientId, entityName, entityType, description, options = {}) {
+    try {
+        const { data: exactMention, error: selectError } = await supabase
+            .from('entity_mentions')
+            .select('id, support_count, stable_score, stability_tier, description, source_tags, metadata')
+            .eq('client_id', clientId)
+            .eq('entity_name', entityName)
+            .maybeSingle();
+
+        if (selectError) throw selectError;
+
+        const nextSupportCount = Number(exactMention?.support_count || 0) + 1;
+        const nextSourceTags = mergeSourceTags(exactMention?.source_tags || [], options.source || '');
+        const finalDescription = String(description || '').trim() || String(exactMention?.description || '').trim();
+        const metadata = {
+            ...(exactMention?.metadata || {}),
+            ...(options.metadata || {}),
+            mention_kind: 'entity',
+            latest_source: options.source || exactMention?.metadata?.latest_source || null
+        };
+        if (options.remoteId) metadata.remote_id = options.remoteId;
+
+        const stability = computeNodeStability({
+            entityName,
+            entityType,
+            description: finalDescription,
+            supportCount: nextSupportCount,
+            source: options.source || '',
+            sourceTags: nextSourceTags,
+            existingScore: exactMention?.stable_score || 0,
+            existingTier: exactMention?.stability_tier || 'candidate'
+        });
+
+        const payload = {
+            client_id: clientId,
+            entity_name: entityName,
+            entity_type: entityType,
+            description: finalDescription || null,
+            remote_id: options.remoteId || exactMention?.metadata?.remote_id || null,
+            support_count: nextSupportCount,
+            stable_score: stability.score,
+            stability_tier: stability.tier,
+            source_tags: nextSourceTags,
+            metadata,
+            last_seen: nowIso(),
+            updated_at: nowIso()
+        };
+
+        if (!exactMention?.id) {
+            payload.first_seen = nowIso();
+        }
+
+        const { data: savedMention, error: upsertError } = await supabase
+            .from('entity_mentions')
+            .upsert(payload, { onConflict: 'client_id, entity_name' })
+            .select('id, support_count, stable_score, stability_tier, source_tags, description')
+            .single();
+
+        if (upsertError) throw upsertError;
+
+        return {
+            mentionId: savedMention.id,
+            supportCount: Number(savedMention.support_count || nextSupportCount),
+            sourceTags: savedMention.source_tags || nextSourceTags,
+            description: String(savedMention.description || finalDescription || '').trim(),
+            stability: {
+                score: Number(savedMention.stable_score || stability.score),
+                tier: String(savedMention.stability_tier || stability.tier),
+                promote: isStableTier(savedMention.stability_tier || stability.tier)
+            }
+        };
+    } catch (error) {
+        console.warn('[Graph Service] entity mention staging unavailable:', error.message);
+        return null;
+    }
+}
+
+async function upsertRelationMentionAggregate(clientId, sourceNode, targetNode, relationType, weight, context, flags = [], options = {}) {
+    try {
+        const { data: exactMention, error: selectError } = await supabase
+            .from('relation_mentions')
+            .select('id, support_count, stable_score, stability_tier, context, cognitive_flags, source_tags, metadata')
+            .eq('client_id', clientId)
+            .eq('source_node', sourceNode)
+            .eq('relation_type', relationType)
+            .eq('target_node', targetNode)
+            .maybeSingle();
+
+        if (selectError) throw selectError;
+
+        const nextSupportCount = Number(exactMention?.support_count || 0) + 1;
+        const nextSourceTags = mergeSourceTags(exactMention?.source_tags || [], options.source || '');
+        const mergedFlags = [
+            ...new Set([
+                ...(Array.isArray(exactMention?.cognitive_flags) ? exactMention.cognitive_flags : []),
+                ...(Array.isArray(flags) ? flags : [flags]).filter(Boolean)
+            ])
+        ];
+        const finalContext = String(context || '').trim().slice(0, 500) || String(exactMention?.context || '').trim() || null;
+        const metadata = {
+            ...(exactMention?.metadata || {}),
+            ...(options.metadata || {}),
+            mention_kind: 'relation',
+            latest_source: options.source || exactMention?.metadata?.latest_source || null
+        };
+        const stability = computeEdgeStability({
+            relationType,
+            context: finalContext,
+            weight,
+            supportCount: nextSupportCount,
+            source: options.source || '',
+            sourceTags: nextSourceTags,
+            flags: mergedFlags,
+            existingScore: exactMention?.stable_score || 0,
+            existingTier: exactMention?.stability_tier || 'candidate'
+        });
+
+        const payload = {
+            client_id: clientId,
+            source_node: sourceNode,
+            relation_type: relationType,
+            target_node: targetNode,
+            context: finalContext,
+            support_count: nextSupportCount,
+            stable_score: stability.score,
+            stability_tier: stability.tier,
+            cognitive_flags: mergedFlags,
+            source_tags: nextSourceTags,
+            metadata,
+            last_seen: nowIso(),
+            updated_at: nowIso()
+        };
+
+        if (!exactMention?.id) {
+            payload.first_seen = nowIso();
+        }
+
+        const { data: savedMention, error: upsertError } = await supabase
+            .from('relation_mentions')
+            .upsert(payload, { onConflict: 'client_id, source_node, relation_type, target_node' })
+            .select('id, support_count, stable_score, stability_tier, source_tags, context, cognitive_flags')
+            .single();
+
+        if (upsertError) throw upsertError;
+
+        return {
+            mentionId: savedMention.id,
+            supportCount: Number(savedMention.support_count || nextSupportCount),
+            sourceTags: savedMention.source_tags || nextSourceTags,
+            context: String(savedMention.context || finalContext || '').trim() || null,
+            cognitiveFlags: savedMention.cognitive_flags || mergedFlags,
+            stability: {
+                score: Number(savedMention.stable_score || stability.score),
+                tier: String(savedMention.stability_tier || stability.tier),
+                promote: isStableTier(savedMention.stability_tier || stability.tier)
+            }
+        };
+    } catch (error) {
+        console.warn('[Graph Service] relation mention staging unavailable:', error.message);
+        return null;
+    }
+}
+
+async function markEntityMentionPromoted(mentionId, nodeId) {
+    if (!mentionId || !nodeId) return;
+    await supabase
+        .from('entity_mentions')
+        .update({
+            promoted_to_graph: true,
+            promoted_node_id: nodeId,
+            updated_at: nowIso()
+        })
+        .eq('id', mentionId);
+}
+
+async function markRelationMentionPromoted(mentionId) {
+    if (!mentionId) return;
+    await supabase
+        .from('relation_mentions')
+        .update({
+            promoted_to_graph: true,
+            updated_at: nowIso()
+        })
+        .eq('id', mentionId);
+}
+
 function hasConflictFlag(flags = []) {
     return (Array.isArray(flags) ? flags : [flags])
         .map(flag => normalizeComparableText(flag))
@@ -221,6 +411,17 @@ function extractSpeakerLabel(line = '') {
     if (!normalized) return null;
     if (normalized.split(' ').length > 4) return null;
     return label;
+}
+
+function hasExplicitMediaAnchor(row = {}) {
+    const metadata = row.metadata || {};
+    return Boolean(
+        metadata.mediaType ||
+        metadata.attachmentType ||
+        metadata.attachmentMime ||
+        metadata.caption ||
+        /\[(media|image|audio|video|document|documento|pdf)\]/i.test(String(row.content || ''))
+    );
 }
 
 function extractMediaSnippetFromContent(content = '', matchedTerms = [], speaker = null) {
@@ -409,6 +610,11 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
         return null;
     }
     const finalDescription = String(description || '').trim().slice(0, 1000);
+    const stagedMention = await upsertEntityMentionAggregate(clientId, finalEntityName, finalEntityType, finalDescription, options);
+
+    if (stagedMention && !stagedMention.stability.promote) {
+        return null;
+    }
 
     const { data: exactNode } = await supabase
         .from('knowledge_nodes')
@@ -417,9 +623,11 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
         .eq('entity_name', finalEntityName)
         .maybeSingle();
 
-    const nextSupportCount = Number(exactNode?.support_count || 0) + 1;
-    const nextSourceTags = mergeSourceTags(exactNode?.source_tags || [], options.source || '');
-    const stability = computeNodeStability({
+    const nextSupportCount = stagedMention
+        ? Math.max(Number(exactNode?.support_count || 0), Number(stagedMention.supportCount || 0))
+        : Number(exactNode?.support_count || 0) + 1;
+    const nextSourceTags = stagedMention?.sourceTags || mergeSourceTags(exactNode?.source_tags || [], options.source || '');
+    const stability = stagedMention?.stability || computeNodeStability({
         entityName: finalEntityName,
         entityType: finalEntityType,
         description: finalDescription,
@@ -430,13 +638,17 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
         existingTier: exactNode?.stability_tier || 'candidate'
     });
 
+    if (!stability.promote) {
+        return null;
+    }
+
     if (exactNode?.id) {
         const patch = {
             support_count: nextSupportCount,
             stable_score: stability.score,
             stability_tier: stability.tier,
             source_tags: nextSourceTags,
-            last_seen: new Date().toISOString()
+            last_seen: nowIso()
         };
         if (finalDescription && finalDescription.length > String(exactNode.description || '').length) {
             patch.description = finalDescription;
@@ -451,6 +663,9 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
             .from('knowledge_nodes')
             .update(patch)
             .eq('id', exactNode.id);
+        if (stagedMention?.mentionId) {
+            await markEntityMentionPromoted(stagedMention.mentionId, exactNode.id);
+        }
         return exactNode.id;
     }
 
@@ -485,18 +700,22 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
         client_id: clientId,
         entity_name: finalEntityName,
         entity_type: finalEntityType,
-        description: finalDescription,
+        description: stagedMention?.description || finalDescription,
         embedding,
         support_count: nextSupportCount,
         stable_score: stability.score,
         stability_tier: stability.tier,
         source_tags: nextSourceTags,
-        last_seen: new Date().toISOString()
+        last_seen: nowIso()
     }, { onConflict: 'client_id, entity_name' }).select('id').single();
 
     if (error) {
         console.error('[Graph Service] Error upserting node:', error.message);
         throw error;
+    }
+
+    if (stagedMention?.mentionId) {
+        await markEntityMentionPromoted(stagedMention.mentionId, inserted.id);
     }
 
     return inserted.id;
@@ -531,6 +750,16 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
 
     intWeight = Math.min(10, Math.max(1, intWeight || 5));
     const canonicalContext = String(context || '').trim().slice(0, 500) || null;
+    const stagedMention = await upsertRelationMentionAggregate(
+        clientId,
+        canonicalSource,
+        canonicalTarget,
+        canonicalRelationType,
+        intWeight,
+        canonicalContext,
+        flagsPayload,
+        options
+    );
     const { data: exactEdge } = await supabase
         .from('knowledge_edges')
         .select('id, support_count, stable_score, stability_tier, weight, context, cognitive_flags, source_tags')
@@ -540,14 +769,17 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
         .eq('target_node', canonicalTarget)
         .maybeSingle();
 
-    const nextSupportCount = Number(exactEdge?.support_count || 0) + 1;
+    const nextSupportCount = stagedMention
+        ? Math.max(Number(exactEdge?.support_count || 0), Number(stagedMention.supportCount || 0))
+        : Number(exactEdge?.support_count || 0) + 1;
     const mergedFlags = [
         ...new Set([
             ...(Array.isArray(exactEdge?.cognitive_flags) ? exactEdge.cognitive_flags : []),
+            ...(Array.isArray(stagedMention?.cognitiveFlags) ? stagedMention.cognitiveFlags : []),
             ...flagsPayload.filter(Boolean)
         ])
     ];
-    const mergedSourceTags = mergeSourceTags(exactEdge?.source_tags || [], options.source || '');
+    const mergedSourceTags = stagedMention?.sourceTags || mergeSourceTags(exactEdge?.source_tags || [], options.source || '');
     const conflictingExclusiveEdge = await hasConflictingExclusiveEdge(
         clientId,
         canonicalSource,
@@ -557,9 +789,9 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
     if (conflictingExclusiveEdge && !mergedFlags.includes('conflicted')) {
         mergedFlags.push('conflicted');
     }
-    const stability = computeEdgeStability({
+    const stability = stagedMention?.stability || computeEdgeStability({
         relationType: canonicalRelationType,
-        context: canonicalContext || exactEdge?.context || '',
+        context: stagedMention?.context || canonicalContext || exactEdge?.context || '',
         weight: intWeight,
         supportCount: nextSupportCount,
         source: options.source || '',
@@ -569,10 +801,7 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
         existingTier: exactEdge?.stability_tier || 'candidate'
     });
 
-    if (
-        ['[RELACIONADO_CON]', '[HABLA_DE]', '[EVENTO_CON]'].includes(canonicalRelationType)
-        && stability.tier === 'candidate'
-    ) {
+    if (!stability.promote) {
         return false;
     }
 
@@ -582,18 +811,21 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
         target_node: canonicalTarget,
         relation_type: canonicalRelationType,
         weight: Math.max(intWeight, Number(exactEdge?.weight || 0)),
-        context: canonicalContext || exactEdge?.context || null,
+        context: stagedMention?.context || canonicalContext || exactEdge?.context || null,
         cognitive_flags: mergedFlags,
         source_tags: mergedSourceTags,
         support_count: nextSupportCount,
         stable_score: stability.score,
         stability_tier: stability.tier,
-        last_seen: new Date().toISOString()
+        last_seen: nowIso()
     }, { onConflict: 'client_id, source_node, relation_type, target_node' });
 
     if (error) {
         console.error('[Graph Service] Error upserting edge:', error.message);
         throw error;
+    }
+    if (stagedMention?.mentionId) {
+        await markRelationMentionPromoted(stagedMention.mentionId);
     }
     return true;
 }
@@ -745,7 +977,9 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
                     aliases,
                     confidence: row.confidence,
                     owner_identity: isOwnerIdentity,
-                    identity_kind: isGroupIdentity ? 'group' : 'contact'
+                    identity_kind: isGroupIdentity ? 'group' : 'contact',
+                    support_count: 1,
+                    stability_tier: 'stable'
                 },
                 recall_score: 0.99
             }, { source: 'CONTACT_IDENTITY' }));
@@ -774,7 +1008,9 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
                 remote_id: 'self',
                 evidence_text: `El titular de esta memoria es ${ownerNames[0]}.`,
                 metadata: {
-                    owner_names: ownerNames
+                    owner_names: ownerNames,
+                    support_count: 1,
+                    stability_tier: 'stable'
                 },
                 recall_score: 0.995
             }, { source: 'OWNER_IDENTITY' }));
@@ -811,7 +1047,10 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
                         ? `${node.entity_name}: ${description}`
                         : `${node.entity_name} aparece como entidad ${node.entity_type || 'registrada'} en tu memoria.`,
                     metadata: {
-                        entity_type: node.entity_type
+                        entity_type: node.entity_type,
+                        support_count: node.support_count || 0,
+                        stable_score: node.stable_score || 0,
+                        stability_tier: node.stability_tier || 'candidate'
                     },
                     recall_score: 0.96
                 }, { source: 'KNOWLEDGE_NODE_EXACT' }));
@@ -822,7 +1061,7 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
             const edgeQueries = await Promise.all([
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier, cognitive_flags')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, support_count, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
                     .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', entityName)
@@ -830,7 +1069,7 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
                     .limit(4),
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier, cognitive_flags')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, support_count, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
                     .in('stability_tier', ['provisional', 'stable'])
                     .eq('target_node', entityName)
@@ -840,7 +1079,7 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
 
             for (const queryResult of edgeQueries) {
                 for (const edge of (queryResult.data || [])) {
-                    if (!isStableTier(edge.stability_tier) || hasConflictFlag(edge.cognitive_flags)) continue;
+                    if (!isStableTier(edge.stability_tier)) continue;
                     pushResult(toFactEvidenceCandidate({
                         fact_type: 'knowledge_edge',
                         source_id: `knowledge_edge:${edge.source_node}:${edge.relation_type}:${edge.target_node}`,
@@ -853,7 +1092,11 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
                         evidence_text: `${edge.source_node} tiene relacion ${edge.relation_type} con ${edge.target_node}.`,
                         metadata: {
                             context: edge.context || null,
-                            weight: edge.weight || null
+                            weight: edge.weight || null,
+                            support_count: edge.support_count || 0,
+                            stable_score: edge.stable_score || 0,
+                            stability_tier: edge.stability_tier || 'candidate',
+                            cognitive_flags: edge.cognitive_flags || []
                         },
                         recall_score: 0.95
                     }, { source: 'KNOWLEDGE_EDGE_EXACT' }));
@@ -957,6 +1200,7 @@ export async function mediaMemorySearch(clientId, entityNames = [], queryText = 
                 if (!haystack) return false;
                 const matchedTerms = fallbackMediaTerms.filter(term => term && haystack.includes(term));
                 if (!matchedTerms.length) return null;
+                if (!hasExplicitMediaAnchor(row) && matchedTerms.length < 2) return null;
 
                 let entityMatched = !lookup.aliasList.length && !remoteIdSet.size;
 
@@ -980,7 +1224,7 @@ export async function mediaMemorySearch(clientId, entityNames = [], queryText = 
 
                 return {
                     row,
-                    mediaScore: matchedTerms.length + exactPhraseBoost + senderBoost + remoteBoost,
+                    mediaScore: matchedTerms.length + exactPhraseBoost + senderBoost + remoteBoost + (hasExplicitMediaAnchor(row) ? 4 : 0),
                     mediaSnippetTerms
                 };
             })
@@ -1002,7 +1246,8 @@ export async function mediaMemorySearch(clientId, entityNames = [], queryText = 
                     ...(row.metadata || {}),
                     mediaMatchedTerms: mediaSnippetTerms,
                     mediaSnippet: mediaExtraction.snippet,
-                    mediaParticipants: mediaExtraction.participants
+                    mediaParticipants: mediaExtraction.participants,
+                    explicitMediaAnchor: hasExplicitMediaAnchor(row)
                 },
                 score_vector: 0.78 + Math.min(mediaScore * 0.02, 0.12),
                 score_fts: 0.92,
@@ -1044,7 +1289,7 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
             const queries = await Promise.all([
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier, cognitive_flags')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, support_count, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
                     .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', left)
@@ -1053,7 +1298,7 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
                     .limit(6),
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight, stable_score, stability_tier, cognitive_flags')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, support_count, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
                     .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', right)
@@ -1064,7 +1309,7 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
 
             for (const queryResult of queries) {
                 for (const edge of (queryResult.data || [])) {
-                    if (!isStableTier(edge.stability_tier) || hasConflictFlag(edge.cognitive_flags)) continue;
+                    if (!isStableTier(edge.stability_tier)) continue;
                     pushCandidate(toFactEvidenceCandidate({
                         fact_type: 'relationship_edge',
                         source_id: `relationship_edge:${edge.source_node}:${edge.relation_type}:${edge.target_node}`,
@@ -1077,7 +1322,11 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
                         evidence_text: `${edge.source_node} tiene relacion ${edge.relation_type} con ${edge.target_node}.`,
                         metadata: {
                             context: edge.context || null,
-                            weight: edge.weight || null
+                            weight: edge.weight || null,
+                            support_count: edge.support_count || 0,
+                            stable_score: edge.stable_score || 0,
+                            stability_tier: edge.stability_tier || 'candidate',
+                            cognitive_flags: edge.cognitive_flags || []
                         },
                         recall_score: 0.985
                     }, { source: 'RELATIONSHIP_EDGE_EXACT' }));

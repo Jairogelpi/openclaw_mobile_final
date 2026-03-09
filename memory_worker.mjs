@@ -266,7 +266,14 @@ async function processConversationDepthStrict(clientId, remoteId, userName, cont
         let relationshipCount = 0;
 
         for (const entity of groundedGraph.entities) {
-            const nodeId = await upsertKnowledgeNode(clientId, entity.name, entity.type || 'ENTITY', entity.desc || '', { source: 'grounded_extraction' });
+            const nodeId = await upsertKnowledgeNode(clientId, entity.name, entity.type || 'ENTITY', entity.desc || '', {
+                source: 'grounded_extraction',
+                remoteId,
+                metadata: {
+                    evidence: entity.evidence || null,
+                    is_group_chat: Boolean(options.isGroup)
+                }
+            });
             if (nodeId) entityCount++;
         }
 
@@ -279,7 +286,14 @@ async function processConversationDepthStrict(clientId, remoteId, userName, cont
                 relationship.weight,
                 relationship.context,
                 ['grounded', 'direct'],
-                { source: 'grounded_extraction' }
+                {
+                    source: 'grounded_extraction',
+                    metadata: {
+                        remoteId,
+                        evidence: relationship.evidence || null,
+                        is_group_chat: Boolean(options.isGroup)
+                    }
+                }
             );
             if (saved) relationshipCount++;
         }

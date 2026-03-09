@@ -166,13 +166,17 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
 
         return stability.tier === 'candidate';
     });
+    const candidateGraphEdges = (allEdges || []).filter(edge =>
+        String(edge.stability_tier || '').trim().toLowerCase() === 'candidate'
+    );
 
     const edgeIdsToDelete = new Set([
         ...(allEdges || [])
             .filter(edge => phoneLikeNames.includes(edge.source_node) || phoneLikeNames.includes(edge.target_node))
             .map(edge => edge.id),
         ...groupTalkEdges.map(edge => edge.id),
-        ...weakGenericEdges.map(edge => edge.id)
+        ...weakGenericEdges.map(edge => edge.id),
+        ...candidateGraphEdges.map(edge => edge.id)
     ].filter(Boolean));
 
     const survivingIncidentCounts = new Map();
@@ -216,6 +220,9 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
         String(node?.entity_type || '').trim().toUpperCase() === 'PERSONA'
         && classifyIdentityLikeName(String(node?.entity_name || '').trim()) === 'group_label'
     );
+    const candidateGraphNodes = allNodes.filter(node =>
+        String(node?.stability_tier || '').trim().toLowerCase() === 'candidate'
+    );
 
     let deletedEdges = 0;
     let deletedNodes = 0;
@@ -245,7 +252,8 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
             ...phoneLikePeople.map(node => node.id),
             ...weakCandidateOrphanNodes.map(node => node.id),
             ...weakUnanchoredPersonNodes.map(node => node.id),
-            ...weakOwnerAliasNodes.map(node => node.id)
+            ...weakOwnerAliasNodes.map(node => node.id),
+            ...candidateGraphNodes.map(node => node.id)
         ].filter(Boolean);
         const uniqueNodeIds = [...new Set(nodeIds)];
         if (uniqueNodeIds.length) {
@@ -278,11 +286,27 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
             support_count: edge.support_count,
             stability_tier: edge.stability_tier
         })),
+        candidate_graph_edges: candidateGraphEdges.map(edge => ({
+            id: edge.id,
+            source_node: edge.source_node,
+            relation_type: edge.relation_type,
+            target_node: edge.target_node,
+            support_count: edge.support_count,
+            stability_tier: edge.stability_tier
+        })),
         weak_candidate_orphan_nodes: weakCandidateOrphanNodes.map(node => ({
             id: node.id,
             entity_name: node.entity_name,
             entity_type: node.entity_type,
             description: node.description,
+            support_count: node.support_count,
+            stable_score: node.stable_score,
+            stability_tier: node.stability_tier
+        })),
+        candidate_graph_nodes: candidateGraphNodes.map(node => ({
+            id: node.id,
+            entity_name: node.entity_name,
+            entity_type: node.entity_type,
             support_count: node.support_count,
             stable_score: node.stable_score,
             stability_tier: node.stability_tier

@@ -64,6 +64,26 @@ async function fetchRecentMemories(clientId, limit = 2500) {
     return data || [];
 }
 
+function memoryRemoteId(memory) {
+    return memory.metadata?.remoteId || memory.metadata?.remote_id || null;
+}
+
+function detectMediaKind(memory) {
+    const haystack = normalizeComparableText([
+        memory.content,
+        memory.metadata?.mediaType,
+        memory.metadata?.attachmentType,
+        memory.metadata?.attachmentMime,
+        memory.metadata?.caption
+    ].filter(Boolean).join(' '));
+    if (!haystack) return null;
+    if (/\b(audio|nota de voz|voice)\b/.test(haystack)) return 'audio';
+    if (/\b(foto|imagen|image)\b/.test(haystack)) return 'foto';
+    if (/\b(video|clip)\b/.test(haystack)) return 'video';
+    if (/\b(documento|archivo|pdf)\b/.test(haystack)) return 'documento';
+    return null;
+}
+
 function buildIdentityCases(identityRows, memoriesByRemoteId) {
     const cases = [];
 
@@ -75,33 +95,57 @@ function buildIdentityCases(identityRows, memoriesByRemoteId) {
 
         cases.push({
             category: 'identity_simple',
+            style_tag: 'direct_chat',
             query: `quien es ${name}`,
             expected_mode: 'answer',
             expected_entities: [name],
             expected_remote_ids: [remoteId],
             expected_substrings: [name],
+            expected_evidence_kinds: ['fact'],
             notes: { source: 'contact_identities', aliases: row.aliases || [] }
         });
 
         cases.push({
             category: 'identity_casefold',
+            style_tag: 'direct_chat',
             query: `que recuerdas de ${name.toUpperCase()}`,
             expected_mode: 'answer',
             expected_entities: [name],
             expected_remote_ids: [remoteId],
             expected_substrings: [name],
+            expected_evidence_kinds: ['fact', 'memory_chunk'],
             notes: { source: 'contact_identities', aliases: row.aliases || [] }
         });
 
         cases.push({
             category: 'identity_lower',
+            style_tag: 'direct_chat',
             query: `que sabes de ${name.toLowerCase()}`,
             expected_mode: 'answer',
             expected_entities: [name],
             expected_remote_ids: [remoteId],
             expected_substrings: [name],
+            expected_evidence_kinds: ['fact', 'memory_chunk'],
             notes: { source: 'contact_identities', aliases: row.aliases || [] }
         });
+
+        const extraAlias = (row.aliases || []).find(alias =>
+            normalizeComparableText(alias) !== normalizeComparableText(name) &&
+            String(alias || '').trim().length >= 3
+        );
+        if (extraAlias) {
+            cases.push({
+                category: 'identity_alias',
+                style_tag: 'alias_heavy',
+                query: `que sabes de ${extraAlias}`,
+                expected_mode: 'answer',
+                expected_entities: [name],
+                expected_remote_ids: [remoteId],
+                expected_substrings: [name],
+                expected_evidence_kinds: ['fact', 'memory_chunk'],
+                notes: { source: 'contact_identities', alias: extraAlias }
+            });
+        }
 
         const datedMemory = memories.find(memory => memory.created_at);
         if (datedMemory) {
@@ -109,6 +153,7 @@ function buildIdentityCases(identityRows, memoriesByRemoteId) {
             if (window) {
                 cases.push({
                     category: 'temporal_person',
+                    style_tag: String(remoteId || '').endsWith('@g.us') ? 'group_chat' : 'temporal_dense',
                     query: `que paso con ${name} el ${weekdayEs(window.start)}`,
                     expected_mode: 'answer',
                     expected_entities: [name],
@@ -116,6 +161,8 @@ function buildIdentityCases(identityRows, memoriesByRemoteId) {
                     expected_substrings: [name],
                     expected_time_start: window.start,
                     expected_time_end: window.end,
+                    expected_evidence_kinds: ['memory_chunk'],
+                    expected_memory_ids: [datedMemory.id],
                     notes: {
                         source: 'user_memories',
                         memory_id: datedMemory.id
@@ -126,13 +173,18 @@ function buildIdentityCases(identityRows, memoriesByRemoteId) {
 
         const mediaMemory = memories.find(memory => /\[(media|image|audio|video)/i.test(memory.content || ''));
         if (mediaMemory) {
+            const mediaKind = detectMediaKind(mediaMemory) || 'media';
             cases.push({
                 category: 'media_recall',
-                query: `recuerdas la imagen o audio de ${name}`,
+                style_tag: 'media_dense',
+                query: `recuerdas el ${mediaKind} de ${name}`,
                 expected_mode: 'answer',
                 expected_entities: [name],
                 expected_remote_ids: [remoteId],
                 expected_substrings: [name],
+                expected_evidence_kinds: ['memory_chunk'],
+                expected_memory_ids: [mediaMemory.id],
+                expected_media_kind: mediaKind,
                 notes: {
                     source: 'user_memories',
                     memory_id: mediaMemory.id
@@ -149,11 +201,14 @@ function buildRelationCases(edges) {
         .filter(edge => edge.source_node && edge.target_node && edge.relation_type)
         .map(edge => ({
             category: 'relationship_lookup',
+            style_tag: 'relationship_graph',
             query: `que relacion hay entre ${edge.source_node} y ${edge.target_node}`,
             expected_mode: 'answer',
             expected_entities: [edge.source_node, edge.target_node],
             expected_remote_ids: [],
             expected_substrings: [edge.source_node, edge.target_node, edge.relation_type],
+            expected_edge_keys: [`${edge.source_node}|${edge.relation_type}|${edge.target_node}`],
+            expected_evidence_kinds: ['fact', 'graph_edge'],
             notes: {
                 relation_type: edge.relation_type,
                 context: edge.context || null
@@ -167,6 +222,7 @@ function buildAbstainCases(count = 24) {
         const fakeName = buildAbstainName(i);
         cases.push({
             category: 'abstain_unknown',
+            style_tag: 'adversarial',
             query: `quien es ${fakeName}`,
             expected_mode: 'abstain',
             expected_entities: [fakeName],
@@ -174,6 +230,41 @@ function buildAbstainCases(count = 24) {
             expected_substrings: [],
             notes: { synthetic: true }
         });
+    }
+    return cases;
+}
+
+function buildGroupCases(memories = []) {
+    const grouped = new Map();
+    for (const memory of memories) {
+        const remoteId = memoryRemoteId(memory);
+        if (!String(remoteId || '').endsWith('@g.us')) continue;
+        if (!grouped.has(remoteId)) grouped.set(remoteId, []);
+        grouped.get(remoteId).push(memory);
+    }
+
+    const cases = [];
+    for (const [remoteId, groupMemories] of grouped.entries()) {
+        const sample = groupMemories.find(memory => memory.created_at);
+        const groupName = sample?.metadata?.conversationName || sample?.sender;
+        if (!sample || !groupName) continue;
+        const window = toDayWindow(sample.metadata?.date || sample.created_at);
+        if (!window) continue;
+        cases.push({
+            category: 'group_temporal',
+            style_tag: 'group_chat',
+            query: `que paso en ${groupName} el ${weekdayEs(window.start)}`,
+            expected_mode: 'answer',
+            expected_entities: [groupName],
+            expected_remote_ids: [remoteId],
+            expected_substrings: [groupName],
+            expected_time_start: window.start,
+            expected_time_end: window.end,
+            expected_evidence_kinds: ['memory_chunk'],
+            expected_memory_ids: [sample.id],
+            notes: { source: 'user_memories', memory_id: sample.id }
+        });
+        if (cases.length >= 18) break;
     }
     return cases;
 }
@@ -219,6 +310,7 @@ async function main() {
     const seededCases = uniqueCases([
         ...buildIdentityCases(identityRows.slice(0, 45), memoriesByRemoteId),
         ...buildRelationCases(relationEdges.slice(0, 50)),
+        ...buildGroupCases(memories),
         ...buildAbstainCases(30)
     ]).slice(0, targetCount);
 
@@ -244,6 +336,14 @@ async function main() {
         expected_substrings: item.expected_substrings,
         expected_time_start: item.expected_time_start || null,
         expected_time_end: item.expected_time_end || null,
+        style_tag: item.style_tag || 'general',
+        expected_citation_min: item.expected_citation_min || 1,
+        expected_evidence_kinds: item.expected_evidence_kinds || [],
+        expected_verdict_detail: item.expected_verdict_detail || null,
+        expected_memory_ids: item.expected_memory_ids || [],
+        expected_edge_keys: item.expected_edge_keys || [],
+        expected_media_kind: item.expected_media_kind || null,
+        expected_speaker: item.expected_speaker || null,
         notes: item.notes || {}
     }));
 

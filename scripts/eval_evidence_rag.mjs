@@ -54,6 +54,22 @@ function candidateRemoteIds(result) {
     return (result.candidates || []).map(candidate => candidate.remote_id).filter(Boolean);
 }
 
+function candidateSourceKinds(result) {
+    return [...new Set((result.candidates || []).map(candidate => candidate.source_kind).filter(Boolean))];
+}
+
+function candidateEdgeKeys(result) {
+    return (result.candidates || [])
+        .map(candidate => {
+            const source = candidate.metadata?.source_node;
+            const relation = candidate.metadata?.relation_type || candidate.relation_type;
+            const target = candidate.metadata?.target_node;
+            if (!source || !relation || !target) return null;
+            return `${source}|${relation}|${target}`;
+        })
+        .filter(Boolean);
+}
+
 function containsExpectedSubstrings(text, substrings = []) {
     if (!substrings.length) return 1;
     const haystack = normalizeComparableText(text);
@@ -67,9 +83,15 @@ function evaluateCase(testCase, result, latencyMs) {
     const expectedEntities = testCase.expected_entities || [];
     const expectedRemoteIds = testCase.expected_remote_ids || [];
     const expectedSubstrings = testCase.expected_substrings || [];
+    const expectedMemoryIds = testCase.expected_memory_ids || [];
+    const expectedEdgeKeys = testCase.expected_edge_keys || [];
+    const expectedEvidenceKinds = testCase.expected_evidence_kinds || [];
+    const expectedCitationMin = Number(testCase.expected_citation_min || 1);
 
     const entityAccuracy = overlapRatio(expectedEntities, candidateEntityNames(result));
     const remoteHit = overlapRatio(expectedRemoteIds, candidateRemoteIds(result));
+    const evidenceKindAccuracy = overlapRatio(expectedEvidenceKinds, candidateSourceKinds(result));
+    const edgeAccuracy = overlapRatio(expectedEdgeKeys, candidateEdgeKeys(result));
     const precisionAtK = Math.max(entityAccuracy, remoteHit);
     const temporalAccuracy = computeTemporalAccuracy(
         testCase.expected_time_start,
@@ -80,6 +102,11 @@ function evaluateCase(testCase, result, latencyMs) {
         `${result.reply}\n${(result.verification?.supportedClaims || []).map(claim => claim.text).join('\n')}`,
         expectedSubstrings
     );
+    const memoryHit = overlapRatio(
+        expectedMemoryIds,
+        (result.candidates || []).map(candidate => candidate.source_id).filter(Boolean)
+    );
+    const citationCount = [...new Set((result.verification?.supportedClaims || []).flatMap(claim => claim.citations || []))].length;
 
     const abstentionPrecision = expectedMode === 'abstain'
         ? (actualMode === 'abstain' ? 1 : 0)
@@ -93,10 +120,14 @@ function evaluateCase(testCase, result, latencyMs) {
         (expectedMode === actualMode || (expectedMode === 'answer' && actualMode === 'conflict')) &&
         precisionAtK >= 0.5 &&
         temporalAccuracy >= 0.5 &&
-        (expectedSubstrings.length === 0 || substringCoverage >= 0.34);
+        (expectedSubstrings.length === 0 || substringCoverage >= 0.34) &&
+        (expectedEvidenceKinds.length === 0 || evidenceKindAccuracy >= 0.5) &&
+        (expectedEdgeKeys.length === 0 || edgeAccuracy >= 0.5) &&
+        citationCount >= expectedCitationMin;
 
     return {
         category: testCase.category,
+        style_tag: testCase.style_tag || 'general',
         query: testCase.query,
         expected_mode: expectedMode,
         actual_mode: actualMode,
@@ -104,6 +135,9 @@ function evaluateCase(testCase, result, latencyMs) {
         precision_at_k: precisionAtK,
         entity_resolution_accuracy: entityAccuracy,
         temporal_accuracy: temporalAccuracy,
+        evidence_kind_accuracy: evidenceKindAccuracy,
+        edge_accuracy: edgeAccuracy,
+        memory_hit: memoryHit,
         citation_coverage: Number(result.citationCoverage || 0),
         abstention_precision: abstentionPrecision,
         hallucinated,
@@ -111,7 +145,8 @@ function evaluateCase(testCase, result, latencyMs) {
         substring_coverage: substringCoverage,
         top_citations: (result.verification?.supportedClaims || []).flatMap(claim => claim.citations || []).slice(0, 8),
         plan: result.plan,
-        reply: result.reply
+        reply: result.reply,
+        query_style: result.queryStyle || testCase.style_tag || 'general'
     };
 }
 
@@ -177,6 +212,14 @@ async function main() {
                 }
                 acc[item.category].total += 1;
                 acc[item.category].passed += item.passed ? 1 : 0;
+                return acc;
+            }, {}),
+            styles: caseResults.reduce((acc, item) => {
+                if (!acc[item.style_tag]) {
+                    acc[item.style_tag] = { total: 0, passed: 0 };
+                }
+                acc[item.style_tag].total += 1;
+                acc[item.style_tag].passed += item.passed ? 1 : 0;
                 return acc;
             }, {}),
             sample_failures: caseResults.filter(item => !item.passed).slice(0, 25),

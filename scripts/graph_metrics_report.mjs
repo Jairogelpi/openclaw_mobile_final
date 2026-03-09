@@ -42,6 +42,8 @@ async function main() {
         pendingRawMessages,
         nodesResult,
         edgesResult,
+        entityMentionsResult,
+        relationMentionsResult,
         memories,
         identities,
         communities,
@@ -51,6 +53,8 @@ async function main() {
         supabase.from('raw_messages').select('*', { head: true, count: 'exact' }).eq('client_id', clientId).eq('processed', false),
         supabase.from('knowledge_nodes').select('id, entity_name, entity_type, description, stability_tier, support_count, stable_score, source_tags').eq('client_id', clientId),
         supabase.from('knowledge_edges').select('id, source_node, target_node, relation_type, context, stability_tier, support_count, stable_score, cognitive_flags, source_tags').eq('client_id', clientId),
+        supabase.from('entity_mentions').select('id, stability_tier, promoted_to_graph, support_count').eq('client_id', clientId),
+        supabase.from('relation_mentions').select('id, stability_tier, promoted_to_graph, support_count').eq('client_id', clientId),
         countRows('user_memories'),
         countRows('contact_identities'),
         countRows('knowledge_communities'),
@@ -59,11 +63,15 @@ async function main() {
 
     if (nodesResult.error) throw nodesResult.error;
     if (edgesResult.error) throw edgesResult.error;
+    if (entityMentionsResult.error) throw entityMentionsResult.error;
+    if (relationMentionsResult.error) throw relationMentionsResult.error;
     if (pendingRawMessages.error) throw pendingRawMessages.error;
     if (nodeCommunities.error) throw nodeCommunities.error;
 
     const nodes = nodesResult.data || [];
     const edges = edgesResult.data || [];
+    const entityMentions = entityMentionsResult.data || [];
+    const relationMentions = relationMentionsResult.data || [];
     const communityIds = (nodeCommunities.data || []).map(row => row.id).filter(Boolean);
 
     const nodeTierCounts = {};
@@ -158,6 +166,8 @@ async function main() {
             raw_messages: rawMessages,
             pending_raw_messages: Number(pendingRawMessages.count || 0),
             user_memories: memories,
+            entity_mentions: entityMentions.length,
+            relation_mentions: relationMentions.length,
             knowledge_nodes: totalNodes,
             knowledge_edges: totalEdges,
             contact_identities: identities,
@@ -180,7 +190,15 @@ async function main() {
             generic_or_talk_relation_ratio: totalEdges ? round(genericTalkEdges / totalEdges) : 0,
             stable_generic_or_talk_relation_ratio: stableEdges.length ? round(stableGenericEdges / stableEdges.length) : 0,
             promoted_node_ratio: totalNodes ? round(provisionalStableNodes / totalNodes) : 0,
-            promoted_edge_ratio: totalEdges ? round(provisionalStableEdges / totalEdges) : 0
+            promoted_edge_ratio: totalEdges ? round(provisionalStableEdges / totalEdges) : 0,
+            mention_to_node_ratio: totalNodes ? round(entityMentions.length / totalNodes) : 0,
+            mention_to_edge_ratio: totalEdges ? round(relationMentions.length / totalEdges) : 0,
+            promoted_entity_mention_ratio: entityMentions.length
+                ? round(entityMentions.filter(row => row.promoted_to_graph).length / entityMentions.length)
+                : 0,
+            promoted_relation_mention_ratio: relationMentions.length
+                ? round(relationMentions.filter(row => row.promoted_to_graph).length / relationMentions.length)
+                : 0
         },
         samples: {
             suspicious_nodes: weakNodes.slice(0, 10),

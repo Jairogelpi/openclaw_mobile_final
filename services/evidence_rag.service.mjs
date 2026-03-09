@@ -969,6 +969,17 @@ export async function collectEvidenceCandidates(clientId, queryText, queryVector
                 }))
             }
     );
+    trace?.setRetrievalProfile?.({
+        intent: plan.intent,
+        query_variants: queryVariants,
+        strict_unknown_exact_lookup: strictUnknownExactLookup,
+        fast_paths: {
+            structured: fastPathStructured,
+            temporal: fastPathTemporal,
+            relationship: fastPathRelationship,
+            media: fastPathMedia
+        }
+    });
 
     return ranked;
 }
@@ -983,11 +994,55 @@ function buildEvidenceBlock(candidates) {
     }).join('\n\n');
 }
 
+function detectQueryStyle(plan, queryText, candidates = []) {
+    if (plan.intent === 'media_lookup') return 'media';
+    if (plan.intent === 'relationship_lookup') return 'relationship';
+    if (plan.intent === 'temporal_lookup') return 'temporal';
+    if ((plan.entities || []).length >= 2) return 'multi_entity';
+    if (String(queryText || '').length > 80) return 'long_form';
+    if ((candidates || []).some(candidate => String(candidate.remote_id || '').endsWith('@g.us'))) return 'group_chat';
+    return 'general';
+}
+
 function normalizeSentence(text, maxLength = 220) {
     return String(text || '')
         .replace(/\s+/g, ' ')
         .trim()
         .slice(0, maxLength);
+}
+
+function detectDeterministicConflictClaims(plan, directCandidates = []) {
+    if (!['relationship_lookup', 'fact_lookup'].includes(plan?.intent)) return [];
+
+    const relationshipCandidates = (directCandidates || []).filter(candidate => {
+        const relationType = candidate.metadata?.relation_type || candidate.relation_type;
+        return Boolean(relationType && (candidate.metadata?.source_node || candidate.source_kind === 'graph_edge'));
+    });
+
+    if (relationshipCandidates.length < 2) return [];
+
+    const relationGroups = new Map();
+    for (const candidate of relationshipCandidates) {
+        const sourceNode = candidate.metadata?.source_node || candidate.speaker || '';
+        const targetNode = candidate.metadata?.target_node || '';
+        const pair = [normalizeComparableText(sourceNode), normalizeComparableText(targetNode)].sort().join('::');
+        if (!pair) continue;
+        if (!relationGroups.has(pair)) relationGroups.set(pair, []);
+        relationGroups.get(pair).push(candidate);
+    }
+
+    for (const grouped of relationGroups.values()) {
+        const relationTypes = [...new Set(grouped.map(candidate => normalizeComparableText(candidate.metadata?.relation_type || candidate.relation_type)).filter(Boolean))];
+        if (relationTypes.length < 2) continue;
+        return grouped
+            .slice(0, 2)
+            .map(candidate => ({
+                text: `${candidate.metadata?.source_node || candidate.speaker} ${humanizeRelationType(candidate.metadata?.relation_type || candidate.relation_type)} ${candidate.metadata?.target_node || ''}.`.trim(),
+                citations: [candidate.citation_label]
+            }));
+    }
+
+    return [];
 }
 
 function normalizeReadableSnippetText(text = '') {
@@ -1488,6 +1543,14 @@ EVIDENCIA DISPONIBLE:
 ${buildEvidenceBlock(directCandidates)}`;
 
     const deterministicClaims = buildDeterministicClaims(plan, directCandidates);
+    const deterministicConflictClaims = detectDeterministicConflictClaims(plan, directCandidates);
+    if (deterministicConflictClaims.length >= 2) {
+        return {
+            verdict: 'conflict',
+            answer: '',
+            claims: deterministicConflictClaims
+        };
+    }
     const forceDeterministicIdentity = plan.intent === 'identity_lookup' &&
         directCandidates.some(candidate => candidate.source_kind === 'fact' &&
             (candidate.metadata?.owner_identity || candidate.metadata?.fact_type === 'contact_identity'));
@@ -1830,6 +1893,7 @@ export async function runEvidenceFirstRag({ clientId, queryText, queryVector, tr
         citationCoverage: verification.citationCoverage || 0,
         supportedClaims: compactClaims
     });
+    trace?.setQueryStyle?.(detectQueryStyle(plan, queryText, candidates));
 
     return {
         reply,
@@ -1838,6 +1902,7 @@ export async function runEvidenceFirstRag({ clientId, queryText, queryVector, tr
         draft,
         verification: finalVerification,
         verdict: verification.verdict || draft.verdict || 'abstain',
+        queryStyle: detectQueryStyle(plan, queryText, candidates),
         cacheEligible: !plan.need_exact_entity_match && !plan.temporal_window && !plan.relation_filter && !plan.entities?.length && plan.intent === 'exploratory',
         citationCoverage: verification.citationCoverage || 0
     };
