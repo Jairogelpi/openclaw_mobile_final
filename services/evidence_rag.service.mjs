@@ -376,6 +376,22 @@ function determineFallbackIntentV2(queryText, identityMatches = []) {
     return fallbackIntentV2(queryText);
 }
 
+function shouldSkipLLMPlanner(userQuery, fallbackPlan, identityMatches = [], inferredEntities = []) {
+    const normalized = normalizeComparableText(userQuery);
+    if (!normalized) return true;
+    if (isGhostName(normalized) || (inferredEntities.length > 0 && inferredEntities.every(entity => isGhostName(entity)))) return true;
+    if (isSimpleExactLookup(userQuery, identityMatches, inferredEntities)) return true;
+    if (hasMediaSignal(userQuery)) return true;
+    if (hasTemporalSignal(userQuery) && (fallbackPlan.entities || []).length > 0) return true;
+    if ((fallbackPlan.intent === 'relationship_lookup' || GENERIC_RELATION_INTENT_REGEX.test(normalized)) && (fallbackPlan.entities || []).length >= 2) {
+        return true;
+    }
+    if (['identity_lookup', 'fact_lookup'].includes(fallbackPlan.intent) && (fallbackPlan.entities || []).length > 0) {
+        return true;
+    }
+    return false;
+}
+
 function relationFromQueryV2(queryText) {
     const q = normalizeComparableText(queryText);
     if (GENERIC_RELATION_INTENT_REGEX.test(q) || /\brelacion\b/.test(q)) return 'ANY_RELATION';
@@ -639,7 +655,8 @@ Responde solo con el JSON del plan.`;
     };
 
     let plan = null;
-    if (!isSimpleExactLookup(userQuery, identityMatches, inferredEntities)) {
+    const skipLLMPlanner = shouldSkipLLMPlanner(userQuery, fallbackPlan, identityMatches, inferredEntities);
+    if (!skipLLMPlanner) {
         try {
             plan = await groqJsonWithTimeout({ systemPrompt, userPrompt }, trace, { temperature: 0, timeoutMs: 8_000 });
         } catch (error) {
