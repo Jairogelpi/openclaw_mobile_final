@@ -16,7 +16,7 @@ import {
     resolveIdentityNames
 } from './identity.service.mjs';
 import { rerankEvidenceCandidates } from './reranker.mjs';
-import { getConfig } from './config.service.mjs';
+import { getAllConfig } from './config.service.mjs';
 import { normalizeComparableText } from '../utils/message_guard.mjs';
 
 const DEFAULT_PLAN = {
@@ -517,6 +517,13 @@ function dedupeCandidates(candidates) {
     });
 }
 
+async function ensureIdentityRowsReady(clientId) {
+    const rows = await getIdentityRows(clientId).catch(() => []);
+    if (rows.length) return rows;
+    await hydrateContactIdentities(clientId).catch(() => null);
+    return getIdentityRows(clientId).catch(() => []);
+}
+
 function normalizeIdentityEvidenceCandidate(candidate) {
     if (!candidate || candidate.source_kind !== 'fact') return candidate;
     if (candidate.metadata?.fact_type !== 'contact_identity') return candidate;
@@ -569,10 +576,12 @@ function buildIdentityResolutionMapFromMatches(identityMatches = []) {
 }
 
 export async function buildRagQueryPlan(clientId, userQuery, trace = null) {
-    await hydrateContactIdentities(clientId).catch(() => null);
+    const identityRows = await ensureIdentityRowsReady(clientId);
 
     const inferredEntities = inferRawEntitiesFromQuery(userQuery);
-    const identityMatches = await detectIdentityMatchesFromQueryFast(clientId, userQuery, inferredEntities);
+    const identityMatches = identityRows.length
+        ? await detectIdentityMatchesFromQueryFast(clientId, userQuery, inferredEntities)
+        : [];
     const identityHints = identityMatches
         .slice(0, 8)
         .map(match => `${match.canonical_name} (${match.remote_id})`)
@@ -768,12 +777,25 @@ function hasDirectTemporalSupport(plan, temporalCandidates = []) {
 
 export async function collectEvidenceCandidates(clientId, queryText, queryVector, plan, trace = null) {
     const retrievalStart = Date.now();
-    const ragMaxCandidates = Number(await getConfig('rag_max_candidates')) || 24;
-    const queryExpansionEnabled = await getConfig('rag_query_expansion_enabled');
-    const semanticRerankEnabled = await getConfig('rag_semantic_rerank_enabled');
-    const semanticRerankMaxCandidates = Number(await getConfig('rag_semantic_rerank_max_candidates')) || 8;
-    const maxQueryVariants = Number(await getConfig('rag_max_query_variants')) || 4;
-    const rerankerEnabled = await getConfig('rag_reranker_enabled');
+    const config = await getAllConfig();
+    const intentProfile = (() => {
+        if (plan.intent === 'identity_lookup' || plan.intent === 'fact_lookup') {
+            return { maxCandidates: 12, maxVariants: 2, semanticMaxCandidates: 4, allowExpansion: false };
+        }
+        if (plan.intent === 'media_lookup') {
+            return { maxCandidates: 12, maxVariants: 2, semanticMaxCandidates: 4, allowExpansion: false };
+        }
+        if (plan.intent === 'relationship_lookup' || plan.intent === 'temporal_lookup') {
+            return { maxCandidates: 14, maxVariants: 2, semanticMaxCandidates: 5, allowExpansion: true };
+        }
+        return { maxCandidates: 20, maxVariants: 3, semanticMaxCandidates: 6, allowExpansion: true };
+    })();
+    const ragMaxCandidates = Math.min(Number(config.rag_max_candidates) || 24, intentProfile.maxCandidates);
+    const queryExpansionEnabled = Boolean(config.rag_query_expansion_enabled) && intentProfile.allowExpansion;
+    const semanticRerankEnabled = Boolean(config.rag_semantic_rerank_enabled);
+    const semanticRerankMaxCandidates = Math.min(Number(config.rag_semantic_rerank_max_candidates) || 8, intentProfile.semanticMaxCandidates);
+    const maxQueryVariants = Math.min(Number(config.rag_max_query_variants) || 4, intentProfile.maxVariants);
+    const rerankerEnabled = Boolean(config.rag_reranker_enabled);
     const entities = plan.entities || [];
     const rawEntityMatchCount = Number(plan.identity_match_count || 0);
     const strictUnknownExactLookup = Boolean(
@@ -1868,7 +1890,8 @@ function compactSupportedClaims(plan, claims = []) {
 
 export async function runEvidenceFirstRag({ clientId, queryText, queryVector, trace = null, precomputedPlan = null }) {
     const plan = precomputedPlan || await buildRagQueryPlan(clientId, queryText, trace);
-    const claimVerifierEnabled = await getConfig('rag_claim_verifier_enabled');
+    const config = await getAllConfig();
+    const claimVerifierEnabled = Boolean(config.rag_claim_verifier_enabled);
     trace?.setMode?.('evidence_first');
     trace?.setQueryPlan?.(plan);
     const candidates = await collectEvidenceCandidates(clientId, queryText, queryVector, plan, trace);
