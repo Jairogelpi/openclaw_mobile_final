@@ -670,8 +670,8 @@ export async function distillAndVectorize(clientId, options = {}) {
 
             totalProcessedThisRun += messages.length;
 
-            console.log(`[Worker] 🍶 Iniciando Destilación Autónoma...`);
             if (!skipAutonomousDistillation) {
+                console.log(`[Worker] 🍶 Iniciando Destilación Autónoma...`);
                 await autonomousDistillation(clientId, soulData.slug, eligibleMessages.slice(-50), ownerName);
             }
             console.log(`[Worker] ✅ Batch finalizado (Acumulado: ${totalProcessedThisRun})`);

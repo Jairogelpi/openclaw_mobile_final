@@ -126,10 +126,13 @@ async function main() {
     const totalEdges = edges.length || 0;
     const personNodes = Number(nodeTypeCounts.PERSONA || 0);
     const genericEdges = Number(edgeTypeCounts['[RELACIONADO_CON]'] || 0);
+    const genericTalkEdges = genericEdges + Number(edgeTypeCounts['[HABLA_DE]'] || 0);
     const candidateNodes = Number(nodeTierCounts.candidate || 0);
     const candidateEdges = Number(edgeTierCounts.candidate || 0);
     const provisionalStableNodes = totalNodes - candidateNodes;
     const provisionalStableEdges = totalEdges - candidateEdges;
+    const stableEdges = edges.filter(edge => ['provisional', 'stable'].includes(String(edge.stability_tier || '').trim().toLowerCase()));
+    const stableGenericEdges = stableEdges.filter(edge => ['[RELACIONADO_CON]', '[HABLA_DE]'].includes(edge.relation_type)).length;
 
     const nodeCommunityCount = communityIds.length
         ? await supabase.from('node_communities').select('*', { head: true, count: 'exact' }).in('community_id', communityIds)
@@ -162,6 +165,8 @@ async function main() {
             suspicious_edge_rate: totalEdges ? round(weakEdges.length / totalEdges) : 0,
             person_node_ratio: totalNodes ? round(personNodes / totalNodes) : 0,
             generic_relation_ratio: totalEdges ? round(genericEdges / totalEdges) : 0,
+            generic_or_talk_relation_ratio: totalEdges ? round(genericTalkEdges / totalEdges) : 0,
+            stable_generic_or_talk_relation_ratio: stableEdges.length ? round(stableGenericEdges / stableEdges.length) : 0,
             promoted_node_ratio: totalNodes ? round(provisionalStableNodes / totalNodes) : 0,
             promoted_edge_ratio: totalEdges ? round(provisionalStableEdges / totalEdges) : 0
         },

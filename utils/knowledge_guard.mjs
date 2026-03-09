@@ -298,7 +298,7 @@ function relationshipHasStrongEvidence({
         [sourceKey, targetKey].includes(contactKey);
 
     if (relationType === '[HABLA_DE]') {
-        return mentionsTarget;
+        return mentionsTarget && (mentionsSource || speakerMatchesSource);
     }
 
     if (relationType === '[RELACIONADO_CON]' || relationType === '[EVENTO_CON]') {
