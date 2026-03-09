@@ -47,6 +47,16 @@ const GROUP_LABEL_STOPWORDS = new Set([
     'radares'
 ]);
 
+const ROLE_MENTION_PATTERNS = [
+    /^(mi|mis|su|sus|tu|tus|nuestro|nuestra|nuestros|nuestras)\s+/i
+];
+
+const GROUPISH_NAME_PATTERNS = [
+    /\b(under|grupo|chat|master|máster|controles|radares)\b/i,
+    /\b(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b/i,
+    /\b\d{1,2}\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b/i
+];
+
 export function normalizeIdentityName(value) {
     const cleaned = stripDecorativeText(String(value || ''))
         .replace(/\s+/g, ' ')
@@ -129,6 +139,36 @@ export function looksHumanIdentityLabel(value) {
     return alphaTokens.every(token =>
         token.length >= 2 || ['de', 'del', 'la', 'el', 'y'].includes(token)
     );
+}
+
+export function looksHumanAliasLabel(value) {
+    const raw = stripDecorativeText(String(value || '')).trim();
+    const normalized = normalizeComparableText(raw);
+    if (!normalized) return false;
+    if (isLowValueIdentityAlias(raw)) return false;
+    if (looksLikeWhatsAppRemoteId(raw)) return false;
+    if (isLikelyGroupLabel(raw)) return false;
+    if (ROLE_MENTION_PATTERNS.some(pattern => pattern.test(raw))) return false;
+    if (GROUPISH_NAME_PATTERNS.some(pattern => pattern.test(raw))) return false;
+
+    const tokens = normalized.split(' ').filter(Boolean);
+    if (!tokens.length || tokens.length > 4) return false;
+    if (tokens.some(token => GROUP_LABEL_STOPWORDS.has(token))) return false;
+
+    const alphaLikeTokens = tokens.filter(token => /[a-záéíóúñ]/i.test(token));
+    if (!alphaLikeTokens.length) return false;
+    if (alphaLikeTokens.every(token => token.length < 2)) return false;
+
+    return /^[\p{L}\d ._'’\-]+$/u.test(raw);
+}
+
+export function classifyIdentityLikeName(value) {
+    const raw = stripDecorativeText(String(value || '')).trim();
+    if (!raw) return 'unknown';
+    if (ROLE_MENTION_PATTERNS.some(pattern => pattern.test(raw))) return 'role_mention';
+    if (isLikelyGroupLabel(raw) || GROUPISH_NAME_PATTERNS.some(pattern => pattern.test(raw))) return 'group_label';
+    if (looksHumanIdentityLabel(raw) || looksHumanAliasLabel(raw)) return 'human_alias';
+    return 'unknown';
 }
 
 function resolveOwnerPreferredName(remoteId, sourceDetails = {}, canonicalName = null) {

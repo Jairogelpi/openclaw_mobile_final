@@ -1,5 +1,6 @@
 import supabase from '../config/supabase.mjs';
 import { fallbackNameFromRemoteId, normalizeComparableText } from '../utils/message_guard.mjs';
+import { classifyIdentityLikeName } from '../utils/identity_policy.mjs';
 import {
     evaluateEntityAdmissibility,
     evaluateRelationshipAdmissibility
@@ -239,6 +240,7 @@ async function main() {
     const identityAnchors = buildIdentityAnchorSet(contactIdentities);
     const suspiciousNodes = knowledgeNodes.filter(node => {
         if (isBlockedNodeName(node.entity_name)) return true;
+        const identityKind = classifyIdentityLikeName(node.entity_name);
         const admissibility = evaluateEntityAdmissibility({
             name: node.entity_name,
             type: node.entity_type,
@@ -253,6 +255,12 @@ async function main() {
         if (
             String(node.entity_type || '').trim() === 'PERSONA'
             && identityAnchors.has(normalize(node.entity_name))
+        ) {
+            return false;
+        }
+        if (
+            String(node.entity_type || '').trim() === 'PERSONA'
+            && identityKind === 'human_alias'
         ) {
             return false;
         }

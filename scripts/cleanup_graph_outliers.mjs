@@ -7,16 +7,12 @@ import {
     isWeakPersonDescription
 } from '../utils/graph_admissibility_policy.mjs';
 import { normalizeComparableText, pickBestHumanName, looksLikeWhatsAppRemoteId } from '../utils/message_guard.mjs';
-import { looksHumanIdentityLabel } from '../utils/identity_policy.mjs';
+import { classifyIdentityLikeName, looksHumanIdentityLabel } from '../utils/identity_policy.mjs';
 import { computeEdgeStability } from '../utils/stable_graph_policy.mjs';
 
 const clientId = process.argv[2];
 const applyMode = process.argv.includes('--apply');
 const WEAK_ORPHAN_TYPES = new Set(['OBJETO', 'ENTITY', 'EVENTO', 'TEMA']);
-const ROLE_MENTION_PERSON_PATTERNS = [
-    /^(mi|mis|su|sus|tu|tus|nuestro|nuestra|nuestros|nuestras)\s+/i
-];
-
 function isWeakCandidateNode(node) {
     const entityType = String(node?.entity_type || '').trim().toUpperCase();
     const entityName = String(node?.entity_name || '').trim();
@@ -202,8 +198,10 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
         if (Number(node?.support_count || 0) > 2) return false;
 
         const description = String(node?.description || '').trim();
+        const identityKind = classifyIdentityLikeName(entityName);
         return Boolean(
-            ROLE_MENTION_PERSON_PATTERNS.some(pattern => pattern.test(entityName))
+            identityKind === 'role_mention'
+            || identityKind === 'group_label'
             || isWeakPersonDescription(description)
             || (!looksHumanIdentityLabel(entityName) && (!description || isWeakEntityDescription(description)))
         );

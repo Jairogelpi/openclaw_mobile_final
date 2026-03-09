@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 
 import {
     buildRawIdentitySignal,
+    classifyIdentityLikeName,
     isLikelyGroupConversation,
     isLikelyGroupLabel,
     normalizeIdentityName,
@@ -82,4 +83,10 @@ test('sanitizeIdentityRow strips group-like aliases from personal identities', (
 
     assert.equal(isLikelyGroupLabel('Casa'), true);
     assert.deepEqual(row.aliases, ['Mireya']);
+});
+
+test('classifyIdentityLikeName separates role mention, group label and human alias', () => {
+    assert.equal(classifyIdentityLikeName('mi colega'), 'role_mention');
+    assert.equal(classifyIdentityLikeName('Máster INESDI'), 'group_label');
+    assert.equal(classifyIdentityLikeName('Ares G Smoke'), 'human_alias');
 });

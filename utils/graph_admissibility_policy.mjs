@@ -1,5 +1,5 @@
 import { normalizeComparableText } from './message_guard.mjs';
-import { looksHumanIdentityLabel } from './identity_policy.mjs';
+import { classifyIdentityLikeName, looksHumanAliasLabel, looksHumanIdentityLabel } from './identity_policy.mjs';
 
 const WEAK_ENTITY_DESCRIPTIONS = new Set([
     'participante del chat',
@@ -49,10 +49,6 @@ const GENERIC_ENTITY_TYPES = new Set([
     'ENTITY',
     'OBJETO'
 ]);
-
-const ROLE_MENTION_PERSON_PATTERNS = [
-    /^(mi|mis|su|sus|tu|tus|nuestro|nuestra|nuestros|nuestras)\s+/i
-];
 
 export function compactDigits(value) {
     return String(value || '').replace(/[^\d]/g, '');
@@ -157,16 +153,20 @@ export function evaluateEntityAdmissibility({
         return { allowed: true, reason: 'known_anchor', score, mentionCount };
     }
 
-    if (
-        entityType === 'PERSONA'
-        && ROLE_MENTION_PERSON_PATTERNS.some(pattern => pattern.test(String(name || '').trim()))
-    ) {
+    const identityKind = classifyIdentityLikeName(name);
+
+    if (entityType === 'PERSONA' && identityKind === 'role_mention') {
         return { allowed: false, reason: 'role_mention_person', score: score - 6, mentionCount };
+    }
+
+    if (entityType === 'PERSONA' && identityKind === 'group_label' && !known) {
+        return { allowed: false, reason: 'group_label_person', score: score - 6, mentionCount };
     }
 
     if (
         entityType === 'PERSONA'
         && !looksHumanIdentityLabel(name)
+        && !looksHumanAliasLabel(name)
         && !groundedBySpeaker
         && (
             isWeakPersonDescription(descriptionText)
