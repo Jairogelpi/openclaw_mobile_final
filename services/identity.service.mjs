@@ -77,21 +77,25 @@ function isLowValueIdentityAlias(value) {
     return false;
 }
 
-function isLikelyGroupConversation(remoteId) {
+export function isLikelyGroupConversation(remoteId) {
     return String(remoteId || '').endsWith('@g.us');
 }
 
-function isLikelyGroupLabel(value) {
+export function isLikelyGroupLabel(value) {
     const raw = stripDecorativeText(String(value || '')).trim();
     const normalized = normalizeComparableText(raw);
     if (!normalized) return true;
     if (GROUP_LABEL_STOPWORDS.has(normalized)) return true;
+    const tokens = normalized.split(' ').filter(Boolean);
+    const stopwordHits = tokens.filter(token => GROUP_LABEL_STOPWORDS.has(token)).length;
+    if (stopwordHits >= 2) return true;
+    if (stopwordHits >= 1 && tokens.length >= 2) return true;
     if (normalized.length > 20 && normalized.split(' ').length >= 3) return true;
     if (/^[.〰️\-_ ]+$/.test(raw)) return true;
     return false;
 }
 
-function buildRawIdentitySignal(message) {
+export function buildRawIdentitySignal(message) {
     const metadata = message?.metadata || {};
     const isGroup = isLikelyGroupConversation(message?.remote_id);
     const participantRemoteId = String(metadata.participantJid || '').trim();
@@ -383,7 +387,7 @@ function cloneIdentityRows(rows = []) {
     }));
 }
 
-function sanitizeIdentityRow(row) {
+export function sanitizeIdentityRow(row) {
     if (!row) return row;
 
     const canonical = normalizeIdentityName(row.canonical_name)?.canonical || row.canonical_name || null;

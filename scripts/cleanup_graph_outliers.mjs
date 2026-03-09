@@ -1,21 +1,80 @@
 import supabase from '../config/supabase.mjs';
-import { isPhoneLikeGraphName } from '../utils/graph_admissibility_policy.mjs';
+import {
+    hasLeadingArticleName,
+    hasLowercaseArticleEntityShape,
+    isPhoneLikeGraphName,
+    isWeakEntityDescription,
+    isWeakPersonDescription
+} from '../utils/graph_admissibility_policy.mjs';
 import { pickBestHumanName, looksLikeWhatsAppRemoteId } from '../utils/message_guard.mjs';
 import { computeEdgeStability } from '../utils/stable_graph_policy.mjs';
 
 const clientId = process.argv[2];
 const applyMode = process.argv.includes('--apply');
+const WEAK_ORPHAN_TYPES = new Set(['OBJETO', 'ENTITY', 'EVENTO', 'TEMA']);
 
-if (!clientId) {
-    console.error('Usage: node scripts/cleanup_graph_outliers.mjs <client_id> [--apply]');
-    process.exit(1);
+function isWeakCandidateNode(node) {
+    const entityType = String(node?.entity_type || '').trim().toUpperCase();
+    const entityName = String(node?.entity_name || '').trim();
+    const description = String(node?.description || '').trim();
+    const stableScore = Number(node?.stable_score || 0);
+    const supportCount = Number(node?.support_count || 0);
+
+    if (!entityName) return false;
+
+    if (entityType === 'PERSONA') {
+        return Boolean(
+            supportCount <= 1
+            && stableScore < 4
+            && (
+                isPhoneLikeGraphName(entityName)
+                || (
+                    hasLeadingArticleName(entityName)
+                    && (
+                        hasLowercaseArticleEntityShape(entityName)
+                        || isWeakPersonDescription(description)
+                        || isWeakEntityDescription(description)
+                    )
+                )
+            )
+        );
+    }
+
+    if (WEAK_ORPHAN_TYPES.has(entityType)) {
+        return Boolean(
+            supportCount <= 1
+            && (
+                stableScore < 5
+                || isWeakEntityDescription(description)
+                || (hasLeadingArticleName(entityName) && hasLowercaseArticleEntityShape(entityName))
+            )
+        );
+    }
+
+    if (entityType === 'LUGAR' || entityType === 'ORGANIZACION') {
+        return Boolean(
+            supportCount <= 1
+            && stableScore < 4
+            && hasLeadingArticleName(entityName)
+            && (
+                hasLowercaseArticleEntityShape(entityName)
+                || isWeakEntityDescription(description)
+            )
+        );
+    }
+
+    return Boolean(supportCount <= 1 && stableScore < 2 && hasLeadingArticleName(entityName));
 }
 
-async function main() {
+export async function cleanupGraphOutliers(targetClientId, { apply = false } = {}) {
+    if (!targetClientId) {
+        throw new Error('cleanupGraphOutliers requires a clientId');
+    }
+
     const { data: nodes, error } = await supabase
         .from('knowledge_nodes')
-        .select('id, entity_name, entity_type, stability_tier, stable_score, support_count')
-        .eq('client_id', clientId);
+        .select('id, entity_name, entity_type, description, stability_tier, stable_score, support_count')
+        .eq('client_id', targetClientId);
 
     if (error) throw error;
 
@@ -24,18 +83,19 @@ async function main() {
         allNodes.map(node => [node.entity_name, String(node.entity_type || '').trim().toUpperCase()])
     );
     const phoneLikePeople = allNodes.filter(node => node.entity_type === 'PERSONA' && isPhoneLikeGraphName(node.entity_name));
-    const nodeNames = [...new Set(phoneLikePeople.map(node => node.entity_name).filter(Boolean))];
+    const phoneLikeNames = [...new Set(phoneLikePeople.map(node => node.entity_name).filter(Boolean))];
+
     const { data: allEdges, error: edgeReadError } = await supabase
         .from('knowledge_edges')
         .select('id, source_node, relation_type, target_node, context, support_count, weight, source_tags, cognitive_flags, stable_score, stability_tier')
-        .eq('client_id', clientId);
+        .eq('client_id', targetClientId);
 
     if (edgeReadError) throw edgeReadError;
 
     const { data: rawMessages, error: rawError } = await supabase
         .from('raw_messages')
         .select('remote_id, metadata')
-        .eq('client_id', clientId)
+        .eq('client_id', targetClientId)
         .like('remote_id', '%@g.us');
 
     if (rawError) throw rawError;
@@ -58,9 +118,11 @@ async function main() {
         )
         && nodeTypeByName.get(edge.target_node) === 'PERSONA'
     );
+
     const weakGenericEdges = (allEdges || []).filter(edge => {
         const relationType = String(edge.relation_type || '').trim();
         if (!['[RELACIONADO_CON]', '[HABLA_DE]', '[EVENTO_CON]'].includes(relationType)) return false;
+
         const normalizedContext = String(edge.context || '').toLowerCase();
         if (
             relationType === '[HABLA_DE]'
@@ -76,6 +138,7 @@ async function main() {
         ) {
             return true;
         }
+
         const stability = computeEdgeStability({
             relationType,
             context: edge.context || '',
@@ -86,21 +149,39 @@ async function main() {
             existingScore: 0,
             existingTier: 'candidate'
         });
+
         return stability.tier === 'candidate';
     });
+
+    const edgeIdsToDelete = new Set([
+        ...(allEdges || [])
+            .filter(edge => phoneLikeNames.includes(edge.source_node) || phoneLikeNames.includes(edge.target_node))
+            .map(edge => edge.id),
+        ...groupTalkEdges.map(edge => edge.id),
+        ...weakGenericEdges.map(edge => edge.id)
+    ].filter(Boolean));
+
+    const survivingIncidentCounts = new Map();
+    for (const edge of (allEdges || [])) {
+        if (edgeIdsToDelete.has(edge.id)) continue;
+        for (const endpoint of [edge.source_node, edge.target_node]) {
+            const key = String(endpoint || '').trim();
+            if (!key) continue;
+            survivingIncidentCounts.set(key, (survivingIncidentCounts.get(key) || 0) + 1);
+        }
+    }
+
+    const weakCandidateOrphanNodes = allNodes.filter(node =>
+        String(node.stability_tier || '').trim().toLowerCase() === 'candidate'
+        && !survivingIncidentCounts.has(String(node.entity_name || '').trim())
+        && isWeakCandidateNode(node)
+    );
 
     let deletedEdges = 0;
     let deletedNodes = 0;
 
-    if (applyMode) {
-        const edgeIds = [
-            ...(allEdges || [])
-                .filter(edge => nodeNames.includes(edge.source_node) || nodeNames.includes(edge.target_node))
-                .map(edge => edge.id),
-            ...groupTalkEdges.map(edge => edge.id),
-            ...weakGenericEdges.map(edge => edge.id)
-        ].filter(Boolean);
-
+    if (apply) {
+        const edgeIds = [...edgeIdsToDelete];
         if (edgeIds.length) {
             const { error: edgeDeleteError } = await supabase
                 .from('knowledge_edges')
@@ -110,20 +191,24 @@ async function main() {
             deletedEdges = edgeIds.length;
         }
 
-        const nodeIds = phoneLikePeople.map(node => node.id).filter(Boolean);
-        if (nodeIds.length) {
+        const nodeIds = [
+            ...phoneLikePeople.map(node => node.id),
+            ...weakCandidateOrphanNodes.map(node => node.id)
+        ].filter(Boolean);
+        const uniqueNodeIds = [...new Set(nodeIds)];
+        if (uniqueNodeIds.length) {
             const { error: nodeDeleteError } = await supabase
                 .from('knowledge_nodes')
                 .delete()
-                .in('id', nodeIds);
+                .in('id', uniqueNodeIds);
             if (nodeDeleteError) throw nodeDeleteError;
-            deletedNodes = nodeIds.length;
+            deletedNodes = uniqueNodeIds.length;
         }
     }
 
-    console.log(JSON.stringify({
-        client_id: clientId,
-        apply: applyMode,
+    return {
+        client_id: targetClientId,
+        apply,
         phone_like_person_nodes: phoneLikePeople.map(node => ({
             id: node.id,
             entity_name: node.entity_name,
@@ -141,10 +226,29 @@ async function main() {
             support_count: edge.support_count,
             stability_tier: edge.stability_tier
         })),
+        weak_candidate_orphan_nodes: weakCandidateOrphanNodes.map(node => ({
+            id: node.id,
+            entity_name: node.entity_name,
+            entity_type: node.entity_type,
+            description: node.description,
+            support_count: node.support_count,
+            stable_score: node.stable_score,
+            stability_tier: node.stability_tier
+        })),
         group_labels: [...groupNames].slice(0, 20),
         deleted_nodes: deletedNodes,
         deleted_edges: deletedEdges
-    }, null, 2));
+    };
+}
+
+if (!clientId) {
+    console.error('Usage: node scripts/cleanup_graph_outliers.mjs <client_id> [--apply]');
+    process.exit(1);
+}
+
+async function main() {
+    const report = await cleanupGraphOutliers(clientId, { apply: applyMode });
+    console.log(JSON.stringify(report, null, 2));
 }
 
 main().catch(error => {

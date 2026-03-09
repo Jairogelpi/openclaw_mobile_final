@@ -17,7 +17,9 @@
         "bench:brain-admin": "node scripts/benchmark_brain_admin.mjs",
         "retain:recent-raw": "node scripts/retain_recent_raw_messages.mjs",
         "audit:graph": "node scripts/audit_graph_quality.mjs",
-        "test:graph-guards": "node --test tests/graph_guards.test.mjs"
+        "test:graph-guards": "node --test tests/graph_guards.test.mjs",
+        "test:identity-guards": "node --test tests/identity_guards.test.mjs",
+        "test:guards": "node --test tests/graph_guards.test.mjs tests/identity_guards.test.mjs"
     },
     "dependencies": {
         "@huggingface/transformers": "^3.8.1",

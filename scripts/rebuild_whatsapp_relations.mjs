@@ -2,6 +2,7 @@ import supabase from '../config/supabase.mjs';
 import { distillAndVectorize } from '../memory_worker.mjs';
 import { hydrateContactIdentities, repairOwnerIdentity } from '../services/identity.service.mjs';
 import { detectAndSaveCommunities } from '../services/community.service.mjs';
+import { cleanupGraphOutliers } from './cleanup_graph_outliers.mjs';
 
 const clientId = process.argv[2];
 const resumeMode = process.argv.includes('--resume');
@@ -129,11 +130,16 @@ async function rebuild() {
 
     await hydrateContactIdentities(clientId, { force: true });
     await repairOwnerIdentity(clientId);
+    const cleanupReport = await cleanupGraphOutliers(clientId, { apply: true });
+    console.log(`[Rebuild] Cleanup automatico completado. Nodos borrados: ${cleanupReport.deleted_nodes}. Edges borrados: ${cleanupReport.deleted_edges}.`);
     await detectAndSaveCommunities(clientId);
 
     await supabase
         .from('user_souls')
-        .update({ is_processing: false, worker_status: 'Clean relations rebuilt' })
+        .update({
+            is_processing: false,
+            worker_status: `Clean relations rebuilt (cleanup: ${cleanupReport.deleted_nodes} nodes, ${cleanupReport.deleted_edges} edges)`
+        })
         .eq('client_id', clientId);
 
     console.log(`[Rebuild] Reconstrucción completa para ${clientId}.`);
