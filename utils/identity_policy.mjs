@@ -94,7 +94,7 @@ export function isLikelyGroupConversation(remoteId) {
 }
 
 export function isLikelyGroupLabel(value) {
-    const raw = stripDecorativeText(String(value || '')).trim();
+    const raw = normalizeEntityLikeText(String(value || ''));
     const normalized = normalizeComparableText(raw);
     if (!normalized) return true;
     if (GROUP_LABEL_STOPWORDS.has(normalized)) return true;
@@ -122,7 +122,7 @@ function mergeAliases(...aliasSets) {
 }
 
 export function looksHumanIdentityLabel(value) {
-    const raw = stripDecorativeText(String(value || '')).trim();
+    const raw = normalizeEntityLikeText(String(value || ''));
     const normalized = normalizeComparableText(raw);
     if (!normalized) return false;
     if (isLowValueIdentityAlias(raw)) return false;
@@ -146,7 +146,7 @@ export function looksHumanIdentityLabel(value) {
 }
 
 export function looksHumanAliasLabel(value) {
-    const raw = stripDecorativeText(String(value || '')).trim();
+    const raw = normalizeEntityLikeText(String(value || ''));
     const normalized = normalizeComparableText(raw);
     if (!normalized) return false;
     if (isLowValueIdentityAlias(raw)) return false;
@@ -167,7 +167,7 @@ export function looksHumanAliasLabel(value) {
 }
 
 export function classifyIdentityLikeName(value) {
-    const raw = stripDecorativeText(String(value || '')).trim();
+    const raw = normalizeEntityLikeText(String(value || ''));
     if (!raw) return 'unknown';
     if (ROLE_MENTION_PATTERNS.some(pattern => pattern.test(raw))) return 'role_mention';
     if (ROLE_RELATION_PATTERNS.some(pattern => pattern.test(raw))) return 'role_mention';

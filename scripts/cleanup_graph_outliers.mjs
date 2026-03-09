@@ -219,8 +219,7 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
             const { error: retypeError } = await supabase
                 .from('knowledge_nodes')
                 .update({
-                    entity_type: 'GRUPO',
-                    updated_at: new Date().toISOString()
+                    entity_type: 'GRUPO'
                 })
                 .eq('id', node.id);
             if (retypeError) throw retypeError;
