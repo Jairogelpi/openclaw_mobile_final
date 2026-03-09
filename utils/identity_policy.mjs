@@ -51,6 +51,11 @@ const ROLE_MENTION_PATTERNS = [
     /^(mi|mis|su|sus|tu|tus|nuestro|nuestra|nuestros|nuestras)\s+/i
 ];
 
+const ROLE_RELATION_PATTERNS = [
+    /^(padrastro|madrastra|padre|madre|hijo|hija|hermano|hermana|novio|novia|pareja|familia)\b/i,
+    /^(el|la)\s+(papa|papá|mama|mamá)\b/i
+];
+
 const GROUPISH_NAME_PATTERNS = [
     /\b(under|grupo|chat|master|máster|controles|radares)\b/i,
     /\b(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|setiembre|octubre|noviembre|diciembre)\b/i,
@@ -97,7 +102,6 @@ export function isLikelyGroupLabel(value) {
     const stopwordHits = tokens.filter(token => GROUP_LABEL_STOPWORDS.has(token)).length;
     if (stopwordHits >= 2) return true;
     if (stopwordHits >= 1 && tokens.length >= 2) return true;
-    if (normalized.length > 20 && normalized.split(' ').length >= 3) return true;
     if (/^[.\u3000\ufe0f\-_ ]+$/u.test(raw)) return true;
     return false;
 }
@@ -166,6 +170,7 @@ export function classifyIdentityLikeName(value) {
     const raw = stripDecorativeText(String(value || '')).trim();
     if (!raw) return 'unknown';
     if (ROLE_MENTION_PATTERNS.some(pattern => pattern.test(raw))) return 'role_mention';
+    if (ROLE_RELATION_PATTERNS.some(pattern => pattern.test(raw))) return 'role_mention';
     if (isLikelyGroupLabel(raw) || GROUPISH_NAME_PATTERNS.some(pattern => pattern.test(raw))) return 'group_label';
     if (looksHumanIdentityLabel(raw) || looksHumanAliasLabel(raw)) return 'human_alias';
     return 'unknown';
