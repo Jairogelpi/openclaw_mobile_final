@@ -86,7 +86,7 @@ function evaluateCase(testCase, result, latencyMs) {
     const expectedMemoryIds = testCase.expected_memory_ids || [];
     const expectedEdgeKeys = testCase.expected_edge_keys || [];
     const expectedEvidenceKinds = testCase.expected_evidence_kinds || [];
-    const expectedCitationMin = Number(testCase.expected_citation_min || 1);
+    const expectedCitationMin = Number(testCase.expected_citation_min ?? 1);
 
     const entityAccuracy = overlapRatio(expectedEntities, candidateEntityNames(result));
     const remoteHit = overlapRatio(expectedRemoteIds, candidateRemoteIds(result));
