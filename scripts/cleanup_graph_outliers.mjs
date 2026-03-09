@@ -6,7 +6,7 @@ import {
     isWeakEntityDescription,
     isWeakPersonDescription
 } from '../utils/graph_admissibility_policy.mjs';
-import { normalizeComparableText, pickBestHumanName, looksLikeWhatsAppRemoteId } from '../utils/message_guard.mjs';
+import { normalizeComparableText, normalizeEntityLikeText, pickBestHumanName, looksLikeWhatsAppRemoteId } from '../utils/message_guard.mjs';
 import { classifyIdentityLikeName, looksHumanIdentityLabel } from '../utils/identity_policy.mjs';
 import { computeEdgeStability } from '../utils/stable_graph_policy.mjs';
 
@@ -209,7 +209,7 @@ export async function cleanupGraphOutliers(targetClientId, { apply = false } = {
     });
     const weakOwnerAliasNodes = allNodes.filter(node => {
         if (String(node?.entity_type || '').trim().toUpperCase() !== 'PERSONA') return false;
-        const normalizedName = normalizeComparableText(String(node?.entity_name || ''));
+        const normalizedName = normalizeComparableText(normalizeEntityLikeText(String(node?.entity_name || '')));
         return OWNER_ALIAS_NAMES.has(normalizedName);
     });
     const groupLabelPersonNodes = allNodes.filter(node =>

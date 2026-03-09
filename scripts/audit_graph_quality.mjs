@@ -1,5 +1,5 @@
 import supabase from '../config/supabase.mjs';
-import { fallbackNameFromRemoteId, normalizeComparableText } from '../utils/message_guard.mjs';
+import { fallbackNameFromRemoteId, normalizeComparableText, normalizeEntityLikeText } from '../utils/message_guard.mjs';
 import { classifyIdentityLikeName } from '../utils/identity_policy.mjs';
 import {
     evaluateEntityAdmissibility,
@@ -72,7 +72,7 @@ const SUSPICIOUS_CONTEXT_PATTERNS = [
 ];
 
 function normalize(value) {
-    return normalizeComparableText(String(value || ''));
+    return normalizeComparableText(normalizeEntityLikeText(String(value || '')));
 }
 
 function isBlockedNodeName(value) {
