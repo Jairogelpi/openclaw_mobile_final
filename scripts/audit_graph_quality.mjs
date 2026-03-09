@@ -1,5 +1,9 @@
 import supabase from '../config/supabase.mjs';
 import { fallbackNameFromRemoteId, normalizeComparableText } from '../utils/message_guard.mjs';
+import {
+    evaluateEntityAdmissibility,
+    evaluateRelationshipAdmissibility
+} from '../utils/graph_admissibility_policy.mjs';
 
 const clientId = process.argv[2];
 
@@ -100,6 +104,17 @@ function isWeakGenericDescription(value) {
 function isSuspiciousEdge(edge) {
     if (!edge) return false;
     if (isBlockedNodeName(edge.source_node) || isBlockedNodeName(edge.target_node)) return true;
+    const relationAdmissibility = evaluateRelationshipAdmissibility({
+        relationType: edge.relation_type,
+        sourceEntity: { name: edge.source_node, type: null, desc: '' },
+        targetEntity: { name: edge.target_node, type: null, desc: '' },
+        evidence: edge.context || '',
+        context: edge.context || '',
+        knownNames: new Set(),
+        remoteId: null,
+        isGroup: false
+    });
+    if (!relationAdmissibility.allowed) return true;
     const context = String(edge.context || '');
     if (SUSPICIOUS_CONTEXT_PATTERNS.some(pattern => pattern.test(context))) return true;
     if (!String(edge.relation_type || '').trim()) return true;
@@ -212,10 +227,22 @@ async function main() {
         return acc;
     }, {});
 
-    const suspiciousNodes = knowledgeNodes.filter(node =>
-        isBlockedNodeName(node.entity_name) ||
-        (['PERSONA', 'OBJETO', 'LUGAR', 'ORGANIZACION', 'EVENTO'].includes(String(node.entity_type || '').trim()) && isWeakGenericDescription(node.description))
-    );
+    const suspiciousNodes = knowledgeNodes.filter(node => {
+        if (isBlockedNodeName(node.entity_name)) return true;
+        const admissibility = evaluateEntityAdmissibility({
+            name: node.entity_name,
+            type: node.entity_type,
+            desc: node.description || '',
+            evidence: node.description || '',
+            knownNames: new Set(),
+            remoteId: null,
+            isGroup: false,
+            requireStrongAnchor: false
+        });
+        if (!admissibility.allowed) return true;
+        return ['PERSONA', 'OBJETO', 'LUGAR', 'ORGANIZACION', 'EVENTO'].includes(String(node.entity_type || '').trim())
+            && isWeakGenericDescription(node.description);
+    });
     const suspiciousEdges = knowledgeEdges.filter(edge => isSuspiciousEdge(edge));
     const suspiciousIdentities = contactIdentities.filter(row => {
         if (isFallbackNumericIdentity(row)) return false;

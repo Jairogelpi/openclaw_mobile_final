@@ -4,6 +4,12 @@ import {
     normalizeComparableText,
     stripDecorativeText
 } from './message_guard.mjs';
+import {
+    compactDigits,
+    evaluateEntityAdmissibility,
+    evaluateRelationshipAdmissibility,
+    isPhoneLikeGraphName
+} from './graph_admissibility_policy.mjs';
 
 const OWNER_ALIASES = new Set([
     'usuario',
@@ -332,15 +338,6 @@ function resolveKnownEntity(name, entityMap, knownNames, ownerName) {
     return entity;
 }
 
-function compactDigits(value) {
-    return String(value || '').replace(/[^\d]/g, '');
-}
-
-function isPhoneLikeEntityName(value) {
-    const digits = compactDigits(value);
-    return digits.length >= 7;
-}
-
 function hasLeadingArticle(value) {
     return /^(el|la|los|las|un|una)\s+/i.test(String(value || '').trim());
 }
@@ -423,45 +420,26 @@ function isWeakStandaloneEntity({
     evidence,
     knownNames,
     remoteId,
-    isGroup
+    isGroup,
+    chunkText = '',
+    groundedBySpeaker = false,
+    groundedByEvidence = false,
+    groundedByMention = false
 }) {
-    const normalizedName = normalizeComparableText(name);
-    if (!normalizedName) return true;
-    const entityType = sanitizeEntityType(type);
-    const known = knownNames.has(normalizedName);
-
-    if (isPhoneLikeEntityName(name)) {
-        if (entityType === 'PERSONA' && !known) return true;
-        if (isGroup && compactDigits(remoteId) !== compactDigits(name)) return true;
-    }
-
-    if (known) return false;
-
-    if (entityType === 'PERSONA') {
-        const descriptionText = desc || evidence || '';
-        const weakArticlePerson =
-            hasLeadingArticle(name)
-            && (
-                hasLowercaseArticleEntityShape(name)
-                || matchesWeakPersonDescriptionPattern(descriptionText)
-                || isWeakEntityDescription(descriptionText)
-            );
-        if (weakArticlePerson) return true;
-    }
-
-    if (['LUGAR', 'ORGANIZACION', 'EVENTO', 'TEMA', 'ENTITY', 'OBJETO'].includes(entityType)) {
-        const descriptionText = desc || evidence || '';
-        const genericArticleEntity =
-            hasLeadingArticle(name)
-            && (
-                isWeakEntityDescription(descriptionText)
-                || matchesWeakEntityDescriptionPattern(descriptionText)
-                || hasLowercaseArticleEntityShape(name)
-            );
-        if (genericArticleEntity) return true;
-    }
-
-    return false;
+    const admissibility = evaluateEntityAdmissibility({
+        name,
+        type: sanitizeEntityType(type),
+        desc,
+        evidence,
+        knownNames,
+        remoteId,
+        isGroup,
+        chunkText,
+        groundedBySpeaker,
+        groundedByEvidence,
+        groundedByMention
+    });
+    return !admissibility.allowed;
 }
 
 export function normalizeEntityName(value, ownerName = null) {
@@ -555,7 +533,11 @@ export function validateGroundedGraph({
             evidence,
             knownNames,
             remoteId,
-            isGroup
+            isGroup,
+            chunkText,
+            groundedBySpeaker,
+            groundedByEvidence,
+            groundedByMention
         })) {
             continue;
         }
@@ -583,31 +565,17 @@ export function validateGroundedGraph({
 
         const evidence = pickEvidence(relationship);
         if (!evidence || !snippetExistsInText(chunkText, evidence)) continue;
-        if (relationType === '[HABLA_DE]') {
-            if (isPhoneLikeEntityName(targetEntity.name)) continue;
-            if (isWeakRelationshipContext(relationship?.context) && isWeakStandaloneEntity({
-                name: targetEntity.name,
-                type: targetEntity.type,
-                desc: targetEntity.desc,
-                evidence,
-                knownNames,
-                remoteId,
-                isGroup
-            })) {
-                continue;
-            }
-            if (isGroup && isWeakStandaloneEntity({
-                name: targetEntity.name,
-                type: targetEntity.type,
-                desc: targetEntity.desc,
-                evidence,
-                knownNames,
-                remoteId,
-                isGroup
-            })) {
-                continue;
-            }
-        }
+        const relationAdmissibility = evaluateRelationshipAdmissibility({
+            relationType,
+            sourceEntity,
+            targetEntity,
+            evidence,
+            context: relationship?.context,
+            knownNames,
+            remoteId,
+            isGroup
+        });
+        if (!relationAdmissibility.allowed) continue;
         if (!relationshipHasStrongEvidence({
             relationType,
             sourceName: sourceEntity.name,
