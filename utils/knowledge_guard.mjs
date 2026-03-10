@@ -198,9 +198,15 @@ const DETERMINISTIC_PRIVATE_RELATIONS = [
     {
         type: '[PAREJA_DE]',
         weight: 9,
-        symmetric: true,
-        cues: ['te amo', 'mi amor', 'mi vida', 'amor mio', 'amor mÃ­o']
+        cues: ['te amo', 'mi amor', 'mi vida', 'amor mio']
     }
+];
+
+const ROMANTIC_VOCATIVE_PATTERNS = [
+    /(^|[,:;!?\-]\s*)mi vida([!,. ]|$)/i,
+    /(^|[,:;!?\-]\s*)mi amor([!,. ]|$)/i,
+    /(^|[,:;!?\-]\s*)amor mio([!,. ]|$)/i,
+    /\bte amo\b/i
 ];
 
 function trimEntityEdges(value) {
@@ -720,27 +726,37 @@ export function extractDeterministicRelationships({
     for (const line of lines) {
         const normalizedLine = normalizeComparableText(line);
         if (!normalizedLine) continue;
+        const speaker = extractEvidenceSpeaker(line, ownerName);
+        const speakerKey = normalizeComparableText(speaker);
+        const ownerKey = normalizeComparableText(owner);
+        const contactKey = normalizeComparableText(contact);
+
+        if (!speakerKey) continue;
+        if (![ownerKey, contactKey].includes(speakerKey)) continue;
+        if (speakerKey === ownerKey && contactKey.includes(ownerKey)) continue;
+        if (speakerKey === contactKey && ownerKey.includes(contactKey)) continue;
+
+        const source = speakerKey === ownerKey ? owner : contact;
+        const target = speakerKey === ownerKey ? contact : owner;
 
         for (const relation of DETERMINISTIC_PRIVATE_RELATIONS) {
             const matchedCue = relation.cues.find(cue => normalizedLine.includes(normalizeComparableText(cue)));
             if (!matchedCue) continue;
-
-            const edges = [{ source: owner, target: contact }];
-            if (relation.symmetric) edges.push({ source: contact, target: owner });
-
-            for (const edge of edges) {
-                const key = `${normalizeComparableText(edge.source)}::${relation.type}::${normalizeComparableText(edge.target)}`;
-                if (seen.has(key)) continue;
-                seen.add(key);
-                results.push({
-                    source: edge.source,
-                    target: edge.target,
-                    type: relation.type,
-                    weight: relation.weight,
-                    context: clampText(`cue:${matchedCue} | ${line}`, 300),
-                    evidence: clampText(line, 300)
-                });
+            if (relation.type === '[PAREJA_DE]' && !ROMANTIC_VOCATIVE_PATTERNS.some(pattern => pattern.test(line))) {
+                continue;
             }
+
+            const key = `${normalizeComparableText(source)}::${relation.type}::${normalizeComparableText(target)}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            results.push({
+                source,
+                target,
+                type: relation.type,
+                weight: relation.weight,
+                context: clampText(`cue:${matchedCue} | ${line}`, 300),
+                evidence: clampText(line, 300)
+            });
         }
     }
 

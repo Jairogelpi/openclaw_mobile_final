@@ -11,8 +11,10 @@ test('extracts deterministic pareja relations from explicit romantic cues in pri
         isGroup: false
     });
 
-    assert.equal(relationships.length, 2);
-    assert.ok(relationships.every(relationship => relationship.type === '[PAREJA_DE]'));
+    assert.equal(relationships.length, 1);
+    assert.equal(relationships[0].type, '[PAREJA_DE]');
+    assert.equal(relationships[0].source, 'Jairo');
+    assert.equal(relationships[0].target, 'Mireya');
 });
 
 test('does not invent deterministic private-pair relations inside groups', () => {
@@ -31,6 +33,28 @@ test('does not infer pareja from generic affection words without direct romantic
         chunkText: 'Jairo: Necesitaba sentir que alguien me quiera dar cariño.',
         ownerName: 'Jairo',
         contactName: 'Naiara',
+        isGroup: false
+    });
+
+    assert.equal(relationships.length, 0);
+});
+
+test('does not infer pareja from idioms like peor etapa de mi vida', () => {
+    const relationships = extractDeterministicRelationships({
+        chunkText: 'Jairo: Pero estoy posiblemente en la peor etapa de mi vida.',
+        ownerName: 'Jairo',
+        contactName: 'Nerea',
+        isGroup: false
+    });
+
+    assert.equal(relationships.length, 0);
+});
+
+test('does not infer pareja in self-like chats where contact label is the owner name', () => {
+    const relationships = extractDeterministicRelationships({
+        chunkText: 'Jairo: Mireya te amo.',
+        ownerName: 'Jairo',
+        contactName: 'Jairo Gelpi',
         isGroup: false
     });
 
