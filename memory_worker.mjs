@@ -112,6 +112,11 @@ const sanitizeInput = (text, maxLength = 2000) => {
     return text.replace(/[<>{}\\^\`]/g, '').substring(0, maxLength).trim();
 };
 
+function shouldEmbedChunkImmediately(mode, graphPrefilter = {}) {
+    if (mode !== 'rebuild') return true;
+    return ['explicit_graph_cue', 'third_party_reference', 'deterministic_relationship_only'].includes(graphPrefilter.reason);
+}
+
 /**
  * 2026 Grounded Extraction: Semántica Cuádruple + Temporal + Thematic (GraphRAG Level 4)
  */
@@ -697,9 +702,7 @@ export async function distillAndVectorize(clientId, options = {}) {
                                 date: chunk[0]?.created_at,
                                 speakers: chunkSpeakers
                             });
-                            const shouldDeferEmbedding =
-                                mode === 'rebuild'
-                                && ['participant_only_banter', 'low_semantic_signal'].includes(graphPrefilter.reason);
+                            const shouldDeferEmbedding = !shouldEmbedChunkImmediately(mode, graphPrefilter);
                             const holographicEmbedding = shouldDeferEmbedding
                                 ? null
                                 : await generateEmbedding(embeddingText);
@@ -728,10 +731,38 @@ export async function distillAndVectorize(clientId, options = {}) {
                 try {
                     console.log(`[Worker] 🧠 [Conv: ${contactName}] Actualizando profundidad cognitiva consolidada (${msgCount} msgs)...`);
                     const fullConversationLines = buildConversationLines(conv.raw, userName, contactName);
+                    const conversationSpeakers = extractSpeakersFromLines(fullConversationLines);
                     await processConversationDepthStrict(clientId, remoteId, userName, contactName, fullConversationLines, {
                         isGroup: isGroupConversation,
-                        speakers: extractSpeakersFromLines(fullConversationLines)
+                        speakers: conversationSpeakers
                     });
+
+                    if (mode === 'rebuild') {
+                        const consolidatedText = fullConversationLines.join('\n');
+                        const consolidatedEmbeddingText = buildCompactMemoryEmbeddingText(consolidatedText, {
+                            contactName,
+                            remoteId,
+                            date: conv.raw[0]?.created_at,
+                            speakers: conversationSpeakers
+                        });
+                        const consolidatedEmbedding = await generateEmbedding(consolidatedEmbeddingText);
+                        await supabase.from('user_memories').insert({
+                            client_id: clientId,
+                            content: `[Conversacion Consolidada][Contacto: ${contactName}][ID: ${remoteId}][Fecha: ${conv.raw[0]?.created_at || '?'}]\n${consolidatedText}`,
+                            sender: dominantExternalSpeaker(conv.raw, userName, contactName),
+                            embedding: consolidatedEmbedding,
+                            metadata: {
+                                remoteId,
+                                contactName,
+                                holographic: true,
+                                conversation_consolidated: true,
+                                embedding_source: 'compact_conversation_v1',
+                                embedding_deferred: false,
+                                date: conv.raw[0]?.created_at,
+                                speakers: conversationSpeakers
+                            }
+                        });
+                    }
                 } catch (depthErr) {
                     console.error(`[Worker] ❌ [Conv: ${contactName}] Error en profundidad consolidada:`, depthErr.message);
                 }
