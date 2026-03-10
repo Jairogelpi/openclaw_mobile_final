@@ -194,6 +194,15 @@ const EXPLICIT_RELATION_CUES = new Map([
     ['[EVENTO_CON]', ['con', 'junto a', 'acompanado de', 'acompañado de']]
 ]);
 
+const DETERMINISTIC_PRIVATE_RELATIONS = [
+    {
+        type: '[PAREJA_DE]',
+        weight: 9,
+        symmetric: true,
+        cues: ['te amo', 'mi amor', 'mi vida', 'amor mio', 'amor mÃ­o']
+    }
+];
+
 function trimEntityEdges(value) {
     return String(value || '')
         .replace(/^["'`´“”‘’@#\s]+/, '')
@@ -686,6 +695,56 @@ export function validateGroundedGraph({
         entities: [...entityMap.values()],
         relationships: [...relationshipMap.values()]
     };
+}
+
+export function extractDeterministicRelationships({
+    chunkText = '',
+    ownerName = null,
+    contactName = null,
+    isGroup = false
+}) {
+    if (isGroup || !ownerName || !contactName) return [];
+
+    const owner = normalizeEntityName(ownerName, ownerName);
+    const contact = normalizeEntityName(contactName, ownerName);
+    if (!owner || !contact || owner === contact) return [];
+
+    const lines = String(chunkText || '')
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean);
+
+    const results = [];
+    const seen = new Set();
+
+    for (const line of lines) {
+        const normalizedLine = normalizeComparableText(line);
+        if (!normalizedLine) continue;
+
+        for (const relation of DETERMINISTIC_PRIVATE_RELATIONS) {
+            const matchedCue = relation.cues.find(cue => normalizedLine.includes(normalizeComparableText(cue)));
+            if (!matchedCue) continue;
+
+            const edges = [{ source: owner, target: contact }];
+            if (relation.symmetric) edges.push({ source: contact, target: owner });
+
+            for (const edge of edges) {
+                const key = `${normalizeComparableText(edge.source)}::${relation.type}::${normalizeComparableText(edge.target)}`;
+                if (seen.has(key)) continue;
+                seen.add(key);
+                results.push({
+                    source: edge.source,
+                    target: edge.target,
+                    type: relation.type,
+                    weight: relation.weight,
+                    context: clampText(`cue:${matchedCue} | ${line}`, 300),
+                    evidence: clampText(line, 300)
+                });
+            }
+        }
+    }
+
+    return results;
 }
 
 export function expandDetectedNamesConservatively(detectedNames, knownNames) {

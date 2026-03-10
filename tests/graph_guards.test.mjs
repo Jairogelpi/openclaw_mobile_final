@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import { evaluateEntityAdmissibility } from '../utils/graph_admissibility_policy.mjs';
-import { deriveEffectiveEntityType, normalizeEntityName, validateGroundedGraph } from '../utils/knowledge_guard.mjs';
+import { deriveEffectiveEntityType, extractDeterministicRelationships, normalizeEntityName, validateGroundedGraph } from '../utils/knowledge_guard.mjs';
 import { computeEdgeStability } from '../utils/stable_graph_policy.mjs';
 
 function validateGraph(input) {

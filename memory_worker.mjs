@@ -33,6 +33,7 @@ import {
     resolveStoredSpeakerName
 } from './utils/message_guard.mjs';
 import {
+    extractDeterministicRelationships,
     extractSpeakersFromLines,
     validateGroundedGraph
 } from './utils/knowledge_guard.mjs';
@@ -263,6 +264,32 @@ async function processConversationDepthStrict(clientId, remoteId, userName, cont
             speakers: options.speakers
         });
 
+        const deterministicRelationships = extractDeterministicRelationships({
+            chunkText,
+            ownerName: userName,
+            contactName,
+            isGroup: options.isGroup
+        });
+        const mergedRelationships = [...groundedGraph.relationships];
+        const mergedKeys = new Set(
+            mergedRelationships.map(relationship => [
+                normalizeComparableText(relationship.source),
+                relationship.type,
+                normalizeComparableText(relationship.target)
+            ].join('::'))
+        );
+
+        for (const relationship of deterministicRelationships) {
+            const relationKey = [
+                normalizeComparableText(relationship.source),
+                relationship.type,
+                normalizeComparableText(relationship.target)
+            ].join('::');
+            if (mergedKeys.has(relationKey)) continue;
+            mergedKeys.add(relationKey);
+            mergedRelationships.push(relationship);
+        }
+
         let entityCount = 0;
         let relationshipCount = 0;
 
@@ -278,7 +305,7 @@ async function processConversationDepthStrict(clientId, remoteId, userName, cont
             if (nodeId) entityCount++;
         }
 
-        for (const relationship of groundedGraph.relationships) {
+        for (const relationship of mergedRelationships) {
             const saved = await upsertKnowledgeEdge(
                 clientId,
                 relationship.source,
