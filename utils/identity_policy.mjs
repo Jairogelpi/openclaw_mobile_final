@@ -54,7 +54,10 @@ const ROLE_MENTION_PATTERNS = [
 
 const ROLE_RELATION_PATTERNS = [
     /^(padrastro|madrastra|padre|madre|hijo|hija|hermano|hermana|novio|novia|pareja|familia)\b/i,
-    /^(el|la)\s+(papa|papá|mama|mamá)\b/i
+    /^(el|la)\s+(papa|papá|mama|mamá)\b/i,
+    /^(otro|otra|alguien|uno|una)\b/i,
+    /^(otro|otra)\s+con\s+el\s+que\b/i,
+    /^(otro|otra)\s+de\b/i
 ];
 
 const GROUPISH_NAME_PATTERNS = [

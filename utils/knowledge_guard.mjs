@@ -380,6 +380,22 @@ function relationshipHasStrongEvidence({
         new Set([sourceKey, targetKey]).size === 2 &&
         [sourceKey, targetKey].includes(ownerKey) &&
         [sourceKey, targetKey].includes(contactKey);
+    const requiresDirectionalSpeakerAnchor = ['[PAREJA_DE]', '[AMISTAD]', '[FAMILIA_DE]', '[CONOCE_A]'].includes(relationType);
+
+    if (speakerKey && requiresDirectionalSpeakerAnchor && privatePair) {
+        if (speakerMatchesSource) {
+            if (relationType === '[AMISTAD]') {
+                const friendshipText = `${evidence || ''} ${context || ''}`;
+                return STRONG_FRIENDSHIP_PATTERNS.some(pattern => pattern.test(friendshipText))
+                    && (mentionsTarget || hasExplicitCue(relationType, evidence, context));
+            }
+            return mentionsTarget || hasExplicitCue(relationType, evidence, context);
+        }
+
+        if (speakerMatchesTarget && !mentionsSource) {
+            return false;
+        }
+    }
 
     if (relationType === '[HABLA_DE]') {
         if (hasNegativeTalkCue(evidence, context)) {

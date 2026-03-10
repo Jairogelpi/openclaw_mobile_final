@@ -218,6 +218,47 @@ test('keeps friendship edges when the wording is explicitly about friendship', (
     assert.equal(result.relationships[0].type, '[AMISTAD]');
 });
 
+test('rejects inverted pareja direction when the speaker is explicitly the target side', () => {
+    const result = validateGraph({
+        contactName: 'Mireya',
+        chunkText: 'Mireya: Te amo mi vida gracias por verme tan por dentro y todo.',
+        entities: [
+            { name: 'Jairo', type: 'PERSONA', evidence: 'Mireya: Te amo mi vida gracias por verme tan por dentro y todo.' },
+            { name: 'Mireya', type: 'PERSONA', evidence: 'Mireya: Te amo mi vida gracias por verme tan por dentro y todo.' }
+        ],
+        relationships: [
+            {
+                source: 'Jairo',
+                target: 'Mireya',
+                type: '[PAREJA_DE]',
+                context: 'cue:te amo | Mireya: Te amo mi vida gracias por verme tan por dentro y todo',
+                evidence: 'Mireya: Te amo mi vida gracias por verme tan por dentro y todo.'
+            }
+        ]
+    });
+
+    assert.equal(result.relationships.length, 0);
+});
+
+test('quarantines contextual person labels like otro con el que trabajo', () => {
+    const result = evaluateEntityAdmissibility({
+        name: 'otro con el que trabajo',
+        type: 'PERSONA',
+        desc: 'Colaborador de Jairo',
+        evidence: 'Jairo hablaba de otro con el que trabajo.',
+        knownNames: new Set(),
+        remoteId: null,
+        isGroup: false,
+        chunkText: 'Jairo hablaba de otro con el que trabajo.',
+        groundedBySpeaker: false,
+        groundedByEvidence: false,
+        groundedByMention: true
+    });
+
+    assert.equal(result.allowed, false);
+    assert.equal(result.reason, 'role_mention_person');
+});
+
 test('retypes group-like person labels to GRUPO and blocks role mentions as PERSONA', () => {
     assert.equal(deriveEffectiveEntityType('Máster INESDI', 'PERSONA'), 'GRUPO');
     assert.equal(deriveEffectiveEntityType('mi colega', 'PERSONA'), null);
