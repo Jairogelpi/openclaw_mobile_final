@@ -95,10 +95,15 @@ Responde ÚNICAMENTE en JSON con esta estructura:
                 }
 
                 // Relacionar Nodos
-                const relations = validCommunityNodeIds.map(nodeId => ({
+                const relations = filterValidCommunityNodeIds(validCommunityNodeIds, validNodeIds).map(nodeId => ({
                     node_id: nodeId,
                     community_id: insertedComm.id
                 }));
+
+                if (relations.length < 2) {
+                    console.warn(`ðŸŒ [Community] ${comm.name} descartada tras validaciÃ³n final de node_ids.`);
+                    continue;
+                }
 
                 const { error: relError } = await supabase
                     .from('node_communities')

@@ -3,6 +3,7 @@ import { distillAndVectorize } from '../memory_worker.mjs';
 import { hydrateContactIdentities, repairOwnerIdentity } from '../services/identity.service.mjs';
 import { detectAndSaveCommunities } from '../services/community.service.mjs';
 import { cleanupGraphOutliers } from './cleanup_graph_outliers.mjs';
+import { collectGraphHealthSnapshot, formatGraphHealthStatus } from '../services/graph_health.service.mjs';
 
 const clientId = process.argv[2];
 const resumeMode = process.argv.includes('--resume');
@@ -167,11 +168,12 @@ async function rebuild() {
     console.log(`[Rebuild] Cleanup automatico completado. Nodos borrados: ${cleanupReport.deleted_nodes}. Edges borrados: ${cleanupReport.deleted_edges}.`);
     await detectAndSaveCommunities(clientId);
 
+    const health = await collectGraphHealthSnapshot(clientId);
     await supabase
         .from('user_souls')
         .update({
             is_processing: false,
-            worker_status: `Clean relations rebuilt (cleanup: ${cleanupReport.deleted_nodes} nodes, ${cleanupReport.deleted_edges} edges)`
+            worker_status: `${formatGraphHealthStatus(health)} | rebuild cleanup: ${cleanupReport.deleted_nodes} nodes, ${cleanupReport.deleted_edges} edges`
         })
         .eq('client_id', clientId);
 

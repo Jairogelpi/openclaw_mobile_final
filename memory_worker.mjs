@@ -20,6 +20,7 @@ import { hydrateContactIdentities, repairOwnerIdentity } from './services/identi
 import { resolveIdentity } from "./skills/whatsapp_contacts.mjs";
 import { discoverWhatsAppGroup } from './skills/whatsapp_groups.mjs';
 import { processAttachment } from "./utils/media.mjs";
+import { collectGraphHealthSnapshot, formatGraphHealthStatus } from './services/graph_health.service.mjs';
 import {
     deriveOwnerNameFromSlug,
     dominantExternalSpeaker,
@@ -522,6 +523,7 @@ export async function distillAndVectorize(clientId, options = {}) {
     if (!soulData) return;
     const clientSlug = soulData.slug;
     const ownerName = await resolveOwnerName(clientId, soulData);
+    let finalWorkerStatus = '◦ Cerebro en reposo';
 
     // Acquire lock (Temporarily disabled for Antigravity debugging)
     /*
@@ -691,6 +693,7 @@ export async function distillAndVectorize(clientId, options = {}) {
             console.log(`[Worker] ✅ Batch finalizado (Acumulado: ${totalProcessedThisRun})`);
         }
         await invalidateSemanticCache(clientId);
+        const pendingAfterRun = await remainingUnprocessedRawMessages(clientId);
         if (totalProcessedThisRun > 0) {
             if (!skipIdentityHydration) {
                 try {
@@ -709,10 +712,22 @@ export async function distillAndVectorize(clientId, options = {}) {
                 }
             }
         }
+        try {
+            const health = await collectGraphHealthSnapshot(clientId);
+            finalWorkerStatus = formatGraphHealthStatus(health);
+            if (pendingAfterRun > 0 && !finalWorkerStatus.includes('pendientes')) {
+                finalWorkerStatus = `◦ Cerebro en reposo (${pendingAfterRun} pendientes)`;
+            }
+        } catch (healthErr) {
+            finalWorkerStatus = pendingAfterRun > 0
+                ? `◦ Cerebro en reposo (${pendingAfterRun} pendientes)`
+                : '◦ Cerebro en reposo';
+            console.warn(`[Graph Health] Post-process skipped: ${healthErr.message}`);
+        }
     } catch (e) {
         console.error('[Memory Worker] Error:', e.message);
     } finally {
-        await supabase.from('user_souls').update({ is_processing: false, worker_status: '○ Cerebro en reposo' }).eq('client_id', clientId);
+        await supabase.from('user_souls').update({ is_processing: false, worker_status: finalWorkerStatus }).eq('client_id', clientId);
     }
 }
 
@@ -777,6 +792,17 @@ async function consolidateMemories() {
 async function cleanupRawMessages() {
     const cutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000).toISOString();
     await supabase.from('raw_messages').delete().eq('processed', true).lt('created_at', cutoff);
+}
+
+async function remainingUnprocessedRawMessages(clientId) {
+    const { count, error } = await supabase
+        .from('raw_messages')
+        .select('*', { head: true, count: 'exact' })
+        .eq('client_id', clientId)
+        .eq('processed', false);
+
+    if (error) throw error;
+    return Number(count || 0);
 }
 
 // === MAIN ===

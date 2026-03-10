@@ -52,7 +52,9 @@ async function readRebuildProcess() {
         const lines = stdout
             .split(/\r?\n/)
             .map(line => line.trim())
-            .filter(Boolean);
+            .filter(Boolean)
+            .filter(line => !line.includes('pgrep -af'))
+            .filter(line => !line.includes('monitor_rebuild_progress.mjs'));
         return {
             running: lines.length > 0,
             processes: lines
