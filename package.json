@@ -22,8 +22,9 @@
         "test:graph-guards": "node --test tests/graph_guards.test.mjs",
         "test:identity-guards": "node --test tests/identity_guards.test.mjs",
         "test:community-guards": "node --test tests/community_guards.test.mjs",
+        "test:rebuild-embedding": "node --test tests/rebuild_embedding_policy.test.mjs",
         "test:reranker": "node --test tests/reranker_quality.test.mjs",
-        "test:guards": "node --test tests/graph_guards.test.mjs tests/identity_guards.test.mjs tests/community_guards.test.mjs tests/reranker_quality.test.mjs"
+        "test:guards": "node --test tests/graph_guards.test.mjs tests/identity_guards.test.mjs tests/community_guards.test.mjs tests/rebuild_embedding_policy.test.mjs tests/reranker_quality.test.mjs"
     },
     "dependencies": {
         "@huggingface/transformers": "^3.8.1",

@@ -19,12 +19,18 @@ let warmupPromise = null;
 const EMBEDDING_CACHE_MAX = Number(process.env.OPENCLAW_EMBEDDING_CACHE_MAX || 2000);
 const embeddingCache = new Map();
 const embeddingInFlight = new Map();
+const embeddingRuntimeStats = {
+    embedding_cache_hits: 0,
+    embedding_cache_misses: 0,
+    deferred_embedding_count: 0
+};
 
 function getCachedEmbedding(cacheKey) {
     if (!embeddingCache.has(cacheKey)) return null;
     const cached = embeddingCache.get(cacheKey);
     embeddingCache.delete(cacheKey);
     embeddingCache.set(cacheKey, cached);
+    embeddingRuntimeStats.embedding_cache_hits += 1;
     return Array.isArray(cached) ? [...cached] : null;
 }
 
@@ -134,6 +140,7 @@ export async function generateEmbedding(text, isQuery = false) {
     const textToEmbed = prefix + text;
     const cached = getCachedEmbedding(textToEmbed);
     if (cached) return cached;
+    embeddingRuntimeStats.embedding_cache_misses += 1;
     if (embeddingInFlight.has(textToEmbed)) {
         return embeddingInFlight.get(textToEmbed);
     }
@@ -162,6 +169,31 @@ export async function generateEmbedding(text, isQuery = false) {
 
     embeddingInFlight.set(textToEmbed, requestPromise);
     return requestPromise;
+}
+
+export function trackDeferredEmbedding(delta = 1) {
+    const numericDelta = Number(delta || 0);
+    if (!Number.isFinite(numericDelta) || numericDelta === 0) return;
+    embeddingRuntimeStats.deferred_embedding_count = Math.max(
+        0,
+        embeddingRuntimeStats.deferred_embedding_count + numericDelta
+    );
+}
+
+export function getEmbeddingRuntimeStats() {
+    return {
+        embedding_cache_hits: embeddingRuntimeStats.embedding_cache_hits,
+        embedding_cache_misses: embeddingRuntimeStats.embedding_cache_misses,
+        deferred_embedding_count: embeddingRuntimeStats.deferred_embedding_count,
+        cache_size: embeddingCache.size,
+        in_flight: embeddingInFlight.size
+    };
+}
+
+export function resetEmbeddingRuntimeStats() {
+    embeddingRuntimeStats.embedding_cache_hits = 0;
+    embeddingRuntimeStats.embedding_cache_misses = 0;
+    embeddingRuntimeStats.deferred_embedding_count = 0;
 }
 
 /**

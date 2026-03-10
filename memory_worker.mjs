@@ -12,7 +12,7 @@ const execPromise = util.promisify(exec);
 import { encrypt, decrypt } from './security.mjs';
 import crypto from 'node:crypto';
 import os from 'node:os';
-import { generateEmbedding, cosineSimilarity, invalidateSemanticCache } from './services/local_ai.mjs';
+import { generateEmbedding, cosineSimilarity, invalidateSemanticCache, trackDeferredEmbedding } from './services/local_ai.mjs';
 import redisClient from './config/redis.mjs';
 import { upsertKnowledgeNode, upsertKnowledgeEdge } from './services/graph.service.mjs';
 import { detectAndSaveCommunities } from './services/community.service.mjs';
@@ -39,6 +39,11 @@ import {
     validateGroundedGraph
 } from './utils/knowledge_guard.mjs';
 import { analyzeGraphExtractionNeed } from './utils/graph_prefilter.mjs';
+import {
+    buildChunkMemoryMetadata,
+    buildConversationMemoryMetadata,
+    shouldEmbedChunkImmediatelyForRebuild
+} from './utils/rebuild_embedding_policy.mjs';
 import cron from 'node-cron';
 
 const ENABLE_DREAM_CYCLE = String(process.env.OPENCLAW_ENABLE_DREAM_CYCLE || '').toLowerCase() === 'true';
@@ -112,10 +117,6 @@ const sanitizeInput = (text, maxLength = 2000) => {
     return text.replace(/[<>{}\\^\`]/g, '').substring(0, maxLength).trim();
 };
 
-function shouldEmbedChunkImmediately(mode, graphPrefilter = {}) {
-    if (mode !== 'rebuild') return true;
-    return ['explicit_graph_cue', 'third_party_reference', 'deterministic_relationship_only'].includes(graphPrefilter.reason);
-}
 
 /**
  * 2026 Grounded Extraction: Semántica Cuádruple + Temporal + Thematic (GraphRAG Level 4)
@@ -702,26 +703,27 @@ export async function distillAndVectorize(clientId, options = {}) {
                                 date: chunk[0]?.created_at,
                                 speakers: chunkSpeakers
                             });
-                            const shouldDeferEmbedding = !shouldEmbedChunkImmediately(mode, graphPrefilter);
+                            const shouldDeferEmbedding = !shouldEmbedChunkImmediatelyForRebuild(mode, graphPrefilter);
                             const holographicEmbedding = shouldDeferEmbedding
                                 ? null
                                 : await generateEmbedding(embeddingText);
+                            if (shouldDeferEmbedding) {
+                                trackDeferredEmbedding(1);
+                            }
                             await supabase.from('user_memories').insert({
                                 client_id: clientId,
                                 content: enrichedText,
                                 sender: dominantExternalSpeaker(chunk, chunkUserName, chunkContactName),
                                 embedding: holographicEmbedding,
-                                metadata: {
+                                metadata: buildChunkMemoryMetadata({
                                     remoteId: chunkRemoteId,
                                     contactName: chunkContactName,
-                                    holographic: true,
-                                    embedding_source: 'compact_hologram_v2',
-                                    embedding_deferred: shouldDeferEmbedding,
-                                    graph_prefilter_reason: graphPrefilter.reason,
+                                    graphPrefilterReason: graphPrefilter.reason,
                                     chunkIndex: i / CHUNK_SIZE,
                                     date: chunk[0]?.created_at,
-                                    speakers: [...new Set(chunkLines.map(line => line.split(':')[0]).filter(Boolean))]
-                                }
+                                    speakers: chunkSpeakers,
+                                    embeddingDeferred: shouldDeferEmbedding
+                                })
                             });
                         } catch (embErr) { }
                     }));
@@ -751,16 +753,12 @@ export async function distillAndVectorize(clientId, options = {}) {
                             content: `[Conversacion Consolidada][Contacto: ${contactName}][ID: ${remoteId}][Fecha: ${conv.raw[0]?.created_at || '?'}]\n${consolidatedText}`,
                             sender: dominantExternalSpeaker(conv.raw, userName, contactName),
                             embedding: consolidatedEmbedding,
-                            metadata: {
+                            metadata: buildConversationMemoryMetadata({
                                 remoteId,
                                 contactName,
-                                holographic: true,
-                                conversation_consolidated: true,
-                                embedding_source: 'compact_conversation_v1',
-                                embedding_deferred: false,
                                 date: conv.raw[0]?.created_at,
                                 speakers: conversationSpeakers
-                            }
+                            })
                         });
                     }
                 } catch (depthErr) {
