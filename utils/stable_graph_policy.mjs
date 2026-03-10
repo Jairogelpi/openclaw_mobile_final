@@ -67,7 +67,18 @@ const GENERIC_RELATION_CONTEXT_PATTERNS = [
     /\binterlocutor\b/i,
     /\busuario del chat\b/i,
     /\bmencionado en la conversacion\b/i,
-    /\bmencionado en la conversación\b/i
+    /\bmencionado en la conversación\b/i,
+    /\bintercambio de mensajes\b/i,
+    /\bhablando\b/i
+];
+
+const STRONG_FRIENDSHIP_CONTEXT_PATTERNS = [
+    /\bes mi amig[oa]\b/i,
+    /\beres mi amig[oa]\b/i,
+    /\bsois amig[oa]s\b/i,
+    /\bsomos amig[oa]s\b/i,
+    /\bmi mejor amig[oa]\b/i,
+    /\bgran amig[oa]\b/i
 ];
 
 function normalizedText(value) {
@@ -135,6 +146,12 @@ function hasGenericRelationContext(text = '') {
     const raw = String(text || '');
     if (!raw) return false;
     return GENERIC_RELATION_CONTEXT_PATTERNS.some(pattern => pattern.test(raw));
+}
+
+function hasStrongFriendshipContext(text = '') {
+    const raw = String(text || '');
+    if (!raw) return false;
+    return STRONG_FRIENDSHIP_CONTEXT_PATTERNS.some(pattern => pattern.test(raw));
 }
 
 export function computeNodeStability({
@@ -238,6 +255,10 @@ export function computeEdgeStability({
         score -= 3;
     }
 
+    if (normalizedRelation === '[AMISTAD]' && !hasStrongFriendshipContext(context)) {
+        score -= 4;
+    }
+
     score = Math.max(score, Number(existingScore || 0));
 
     let tier = 'candidate';
@@ -271,6 +292,10 @@ export function computeEdgeStability({
         && hasGenericRelationContext(context)
         && support < 2
     ) {
+        tier = 'candidate';
+    }
+
+    if (normalizedRelation === '[AMISTAD]' && !hasStrongFriendshipContext(context)) {
         tier = 'candidate';
     }
 

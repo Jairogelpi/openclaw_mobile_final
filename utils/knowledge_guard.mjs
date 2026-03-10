@@ -194,6 +194,15 @@ const EXPLICIT_RELATION_CUES = new Map([
     ['[EVENTO_CON]', ['con', 'junto a', 'acompanado de', 'acompañado de']]
 ]);
 
+const STRONG_FRIENDSHIP_PATTERNS = [
+    /\bes mi amig[oa]\b/i,
+    /\beres mi amig[oa]\b/i,
+    /\bsois amig[oa]s\b/i,
+    /\bsomos amig[oa]s\b/i,
+    /\bmi mejor amig[oa]\b/i,
+    /\bgran amig[oa]\b/i
+];
+
 const DETERMINISTIC_PRIVATE_RELATIONS = [
     {
         type: '[PAREJA_DE]',
@@ -207,6 +216,23 @@ const ROMANTIC_VOCATIVE_PATTERNS = [
     /(^|[,:;!?\-]\s*)mi amor([!,. ]|$)/i,
     /(^|[,:;!?\-]\s*)amor mio([!,. ]|$)/i,
     /\bte amo\b/i
+];
+
+const ROMANTIC_SECOND_PERSON_PATTERNS = [
+    /\bte\b/i,
+    /\btu\b/i,
+    /\bti\b/i,
+    /\bcontigo\b/i,
+    /\beres\b/i,
+    /\bme estas\b/i,
+    /\bme est[aá]s\b/i
+];
+
+const ROMANTIC_NEGATIVE_PATTERNS = [
+    /\bde mi vida\b/i,
+    /\bpeor etapa de mi vida\b/i,
+    /\balegria a m[ií] vida\b/i,
+    /\balegría a m[ií] vida\b/i
 ];
 
 function trimEntityEdges(value) {
@@ -348,6 +374,24 @@ function relationshipHasStrongEvidence({
         return hasExplicitCue(relationType, evidence, context)
             && (mentionsSource || speakerMatchesSource || speakerMatchesTarget)
             && mentionsTarget;
+    }
+
+    if (relationType === '[AMISTAD]') {
+        const friendshipText = `${evidence || ''} ${context || ''}`;
+        const hasStrongFriendshipCue = STRONG_FRIENDSHIP_PATTERNS.some(pattern => pattern.test(friendshipText));
+        if (!hasStrongFriendshipCue) {
+            return false;
+        }
+
+        if (mentionsSource && mentionsTarget) {
+            return true;
+        }
+
+        if (privatePair && (speakerMatchesSource || speakerMatchesTarget)) {
+            return true;
+        }
+
+        return speakerMatchesSource && mentionsTarget;
     }
 
     if (mentionsSource && mentionsTarget) {
@@ -722,6 +766,10 @@ export function extractDeterministicRelationships({
 
     const results = [];
     const seen = new Set();
+    const romanticScores = new Map([
+        [owner, { score: 0, lines: [] }],
+        [contact, { score: 0, lines: [] }]
+    ]);
 
     for (const line of lines) {
         const normalizedLine = normalizeComparableText(line);
@@ -745,6 +793,9 @@ export function extractDeterministicRelationships({
             if (relation.type === '[PAREJA_DE]' && !ROMANTIC_VOCATIVE_PATTERNS.some(pattern => pattern.test(line))) {
                 continue;
             }
+            if (relation.type === '[PAREJA_DE]' && ROMANTIC_NEGATIVE_PATTERNS.some(pattern => pattern.test(line))) {
+                continue;
+            }
 
             const key = `${normalizeComparableText(source)}::${relation.type}::${normalizeComparableText(target)}`;
             if (seen.has(key)) continue;
@@ -757,7 +808,52 @@ export function extractDeterministicRelationships({
                 context: clampText(`cue:${matchedCue} | ${line}`, 300),
                 evidence: clampText(line, 300)
             });
+
+            if (relation.type === '[PAREJA_DE]') {
+                const current = romanticScores.get(source);
+                if (current) {
+                    current.score += 3;
+                    current.lines.push(line);
+                }
+            }
         }
+
+        if (ROMANTIC_VOCATIVE_PATTERNS.some(pattern => pattern.test(line)) && !ROMANTIC_NEGATIVE_PATTERNS.some(pattern => pattern.test(line))) {
+            const current = romanticScores.get(source);
+            if (current && ROMANTIC_SECOND_PERSON_PATTERNS.some(pattern => pattern.test(line))) {
+                current.score += 1;
+                current.lines.push(line);
+            }
+        }
+    }
+
+    const ownerRomantic = romanticScores.get(owner) || { score: 0, lines: [] };
+    const contactRomantic = romanticScores.get(contact) || { score: 0, lines: [] };
+    const ownerToContactKey = `${normalizeComparableText(owner)}::[PAREJA_DE]::${normalizeComparableText(contact)}`;
+    const contactToOwnerKey = `${normalizeComparableText(contact)}::[PAREJA_DE]::${normalizeComparableText(owner)}`;
+
+    if (!seen.has(ownerToContactKey) && ownerRomantic.score >= 3) {
+        seen.add(ownerToContactKey);
+        results.push({
+            source: owner,
+            target: contact,
+            type: '[PAREJA_DE]',
+            weight: 9,
+            context: clampText(`aggregate_romantic_score:${ownerRomantic.score}`, 300),
+            evidence: clampText(ownerRomantic.lines[0] || '', 300)
+        });
+    }
+
+    if (!seen.has(contactToOwnerKey) && contactRomantic.score >= 3) {
+        seen.add(contactToOwnerKey);
+        results.push({
+            source: contact,
+            target: owner,
+            type: '[PAREJA_DE]',
+            weight: 9,
+            context: clampText(`aggregate_romantic_score:${contactRomantic.score}`, 300),
+            evidence: clampText(contactRomantic.lines[0] || '', 300)
+        });
     }
 
     return results;

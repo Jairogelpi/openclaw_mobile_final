@@ -161,6 +161,63 @@ test('downgrades friendship edges with generic reference context', () => {
     assert.equal(result.promote, false);
 });
 
+test('downgrades friendship edges with message-exchange context', () => {
+    const result = computeEdgeStability({
+        relationType: '[AMISTAD]',
+        context: 'intercambio de mensajes',
+        supportCount: 3,
+        weight: 7,
+        sourceTags: ['grounded_extraction'],
+        flags: ['grounded', 'direct']
+    });
+
+    assert.equal(result.tier, 'candidate');
+    assert.equal(result.promote, false);
+});
+
+test('rejects friendship edges without explicit friendship wording', () => {
+    const result = validateGraph({
+        chunkText: 'Jairo: Estuve hablando con Naiara un rato.',
+        entities: [
+            { name: 'Jairo', type: 'PERSONA', evidence: 'Jairo: Estuve hablando con Naiara un rato.' },
+            { name: 'Naiara', type: 'PERSONA', evidence: 'Jairo: Estuve hablando con Naiara un rato.' }
+        ],
+        relationships: [
+            {
+                source: 'Jairo',
+                target: 'Naiara',
+                type: '[AMISTAD]',
+                context: 'intercambio de mensajes',
+                evidence: 'Jairo: Estuve hablando con Naiara un rato.'
+            }
+        ]
+    });
+
+    assert.equal(result.relationships.length, 0);
+});
+
+test('keeps friendship edges when the wording is explicitly about friendship', () => {
+    const result = validateGraph({
+        chunkText: 'Jairo: Naiara es mi amiga desde hace anos.',
+        entities: [
+            { name: 'Jairo', type: 'PERSONA', evidence: 'Jairo: Naiara es mi amiga desde hace anos.' },
+            { name: 'Naiara', type: 'PERSONA', evidence: 'Jairo: Naiara es mi amiga desde hace anos.' }
+        ],
+        relationships: [
+            {
+                source: 'Jairo',
+                target: 'Naiara',
+                type: '[AMISTAD]',
+                context: 'Naiara es mi amiga desde hace anos',
+                evidence: 'Jairo: Naiara es mi amiga desde hace anos.'
+            }
+        ]
+    });
+
+    assert.equal(result.relationships.length, 1);
+    assert.equal(result.relationships[0].type, '[AMISTAD]');
+});
+
 test('retypes group-like person labels to GRUPO and blocks role mentions as PERSONA', () => {
     assert.equal(deriveEffectiveEntityType('Máster INESDI', 'PERSONA'), 'GRUPO');
     assert.equal(deriveEffectiveEntityType('mi colega', 'PERSONA'), null);

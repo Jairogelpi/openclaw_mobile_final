@@ -60,3 +60,17 @@ test('does not infer pareja in self-like chats where contact label is the owner 
 
     assert.equal(relationships.length, 0);
 });
+
+test('infers directed pareja relation from contact when romantic cue is explicit and addressed', () => {
+    const relationships = extractDeterministicRelationships({
+        chunkText: 'Mireya: Y te pienso cuidar siempre, mi vida.',
+        ownerName: 'Jairo',
+        contactName: 'Mireya',
+        isGroup: false
+    });
+
+    assert.equal(relationships.length, 1);
+    assert.equal(relationships[0].source, 'Mireya');
+    assert.equal(relationships[0].target, 'Jairo');
+    assert.equal(relationships[0].type, '[PAREJA_DE]');
+});
