@@ -37,6 +37,7 @@ import {
     extractSpeakersFromLines,
     validateGroundedGraph
 } from './utils/knowledge_guard.mjs';
+import { analyzeGraphExtractionNeed } from './utils/graph_prefilter.mjs';
 import cron from 'node-cron';
 
 const ENABLE_DREAM_CYCLE = String(process.env.OPENCLAW_ENABLE_DREAM_CYCLE || '').toLowerCase() === 'true';
@@ -239,37 +240,42 @@ async function processConversationDepthStrict(clientId, remoteId, userName, cont
         const chunkText = (lines || []).join('\n');
         if (!chunkText) return;
 
-        const prompt = buildGroundedExtractionPrompt(userName, contactName, remoteId, options);
-        const response = await groq.chat.completions.create({
-            model: 'llama-3.1-8b-instant',
-            messages: [
-                { role: 'system', content: prompt },
-                { role: 'user', content: chunkText }
-            ],
-            response_format: { type: 'json_object' },
-            temperature: 0.0
-        });
-
-        const extractedGraph = parseLLMJson(response.choices[0].message.content);
-        if (!extractedGraph) return;
-
-        const groundedGraph = validateGroundedGraph({
-            entities: extractedGraph.entities,
-            relationships: extractedGraph.relationships,
-            chunkText,
-            ownerName: userName,
-            contactName,
-            remoteId,
-            isGroup: options.isGroup,
-            speakers: options.speakers
-        });
-
-        const deterministicRelationships = extractDeterministicRelationships({
+        const extractionNeed = analyzeGraphExtractionNeed({
             chunkText,
             ownerName: userName,
             contactName,
             isGroup: options.isGroup
         });
+        const deterministicRelationships = extractionNeed.deterministicRelationships || [];
+
+        let groundedGraph = { entities: [], relationships: [] };
+        if (extractionNeed.shouldRunLLM) {
+            const prompt = buildGroundedExtractionPrompt(userName, contactName, remoteId, options);
+            const response = await groq.chat.completions.create({
+                model: 'llama-3.1-8b-instant',
+                messages: [
+                    { role: 'system', content: prompt },
+                    { role: 'user', content: chunkText }
+                ],
+                response_format: { type: 'json_object' },
+                temperature: 0.0
+            });
+
+            const extractedGraph = parseLLMJson(response.choices[0].message.content);
+            if (!extractedGraph) return;
+
+            groundedGraph = validateGroundedGraph({
+                entities: extractedGraph.entities,
+                relationships: extractedGraph.relationships,
+                chunkText,
+                ownerName: userName,
+                contactName,
+                remoteId,
+                isGroup: options.isGroup,
+                speakers: options.speakers
+            });
+        }
+
         const mergedRelationships = [...groundedGraph.relationships];
         const mergedKeys = new Set(
             mergedRelationships.map(relationship => [
@@ -288,6 +294,11 @@ async function processConversationDepthStrict(clientId, remoteId, userName, cont
             if (mergedKeys.has(relationKey)) continue;
             mergedKeys.add(relationKey);
             mergedRelationships.push(relationship);
+        }
+
+        if (!groundedGraph.entities.length && !mergedRelationships.length) {
+            console.log(`[Grounded Graph] Chunk saltado (${extractionNeed.reason}).`);
+            return;
         }
 
         let entityCount = 0;
