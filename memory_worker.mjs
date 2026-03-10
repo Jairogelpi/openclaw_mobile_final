@@ -32,6 +32,7 @@ import {
     renderConversationLine,
     resolveStoredSpeakerName
 } from './utils/message_guard.mjs';
+import { buildCompactMemoryEmbeddingText } from './utils/memory_embedding_text.mjs';
 import {
     extractDeterministicRelationships,
     extractSpeakersFromLines,
@@ -110,28 +111,6 @@ const sanitizeInput = (text, maxLength = 2000) => {
     if (typeof text !== 'string') return '';
     return text.replace(/[<>{}\\^\`]/g, '').substring(0, maxLength).trim();
 };
-
-function buildCompactMemoryEmbeddingText(chunkText, {
-    contactName,
-    remoteId,
-    date,
-    speakers = []
-} = {}) {
-    const compactSpeakers = [...new Set((speakers || []).filter(Boolean))].slice(0, 6).join(', ');
-    const compactBody = String(chunkText || '')
-        .replace(/\s+/g, ' ')
-        .trim()
-        .slice(0, 1200);
-
-    return [
-        '[WA_MEMORY]',
-        contactName ? `contact=${contactName}` : null,
-        remoteId ? `remote=${remoteId}` : null,
-        date ? `date=${date}` : null,
-        compactSpeakers ? `speakers=${compactSpeakers}` : null,
-        compactBody
-    ].filter(Boolean).join('\n');
-}
 
 /**
  * 2026 Grounded Extraction: Semántica Cuádruple + Temporal + Thematic (GraphRAG Level 4)

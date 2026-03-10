@@ -2,6 +2,7 @@ import supabase from '../config/supabase.mjs';
 import { distillAndVectorize } from '../memory_worker.mjs';
 import { hydrateContactIdentities, repairOwnerIdentity } from '../services/identity.service.mjs';
 import { detectAndSaveCommunities } from '../services/community.service.mjs';
+import { backfillDeferredMemoryEmbeddings } from '../services/memory_embedding_backfill.service.mjs';
 import { cleanupGraphOutliers } from './cleanup_graph_outliers.mjs';
 import { collectGraphHealthSnapshot, formatGraphHealthStatus } from '../services/graph_health.service.mjs';
 
@@ -163,6 +164,8 @@ async function rebuild() {
     }
 
     await hydrateContactIdentities(clientId, { force: true });
+    const embeddingBackfill = await backfillDeferredMemoryEmbeddings(clientId, { batchSize: 120, maxRows: 2000 });
+    console.log(`[Rebuild] Backfill de embeddings completado. Filas revisadas: ${embeddingBackfill.processed}. Filas actualizadas: ${embeddingBackfill.updated}.`);
     await repairOwnerIdentity(clientId);
     const cleanupReport = await cleanupGraphOutliers(clientId, { apply: true });
     console.log(`[Rebuild] Cleanup automatico completado. Nodos borrados: ${cleanupReport.deleted_nodes}. Edges borrados: ${cleanupReport.deleted_edges}.`);
@@ -173,7 +176,7 @@ async function rebuild() {
         .from('user_souls')
         .update({
             is_processing: false,
-            worker_status: `${formatGraphHealthStatus(health)} | rebuild cleanup: ${cleanupReport.deleted_nodes} nodes, ${cleanupReport.deleted_edges} edges`
+            worker_status: `${formatGraphHealthStatus(health)} | rebuild cleanup: ${cleanupReport.deleted_nodes} nodes, ${cleanupReport.deleted_edges} edges | embedding backfill: ${embeddingBackfill.updated}`
         })
         .eq('client_id', clientId);
 
