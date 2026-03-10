@@ -246,6 +246,15 @@ const FRIENDSHIP_DIRECT_PATTERNS = [
     /\bmi mejor amig[oa]\b/i
 ];
 
+const AFFECTIONATE_PAIR_SIGNALS = [
+    { key: 'te_como', pattern: /\bte como\b/i, score: 2 },
+    { key: 'besitos', pattern: /\bbesitos?\b/i, score: 2 },
+    { key: 'kiss', pattern: /\b(beso|besote|besazo)\b/i, score: 1 },
+    { key: 'heart_emoji', pattern: /[❤❤️💖💘💝💞💕🥰😍]/u, score: 1 },
+    { key: 'te_cuido', pattern: /\bte pienso cuidar\b/i, score: 2 },
+    { key: 'me_encantas', pattern: /\bme encantas\b/i, score: 2 }
+];
+
 function trimEntityEdges(value) {
     return String(value || '')
         .replace(/^["'`´“”‘’@#\s]+/, '')
@@ -778,8 +787,8 @@ export function extractDeterministicRelationships({
     const results = [];
     const seen = new Set();
     const romanticScores = new Map([
-        [owner, { score: 0, lines: [] }],
-        [contact, { score: 0, lines: [] }]
+        [owner, { score: 0, lines: [], signals: new Set(), hasDirectedCue: false }],
+        [contact, { score: 0, lines: [], signals: new Set(), hasDirectedCue: false }]
     ]);
 
     for (const line of lines) {
@@ -828,6 +837,8 @@ export function extractDeterministicRelationships({
                 if (current) {
                     current.score += 3;
                     current.lines.push(line);
+                    current.signals.add('explicit_romantic');
+                    current.hasDirectedCue = true;
                 }
             }
         }
@@ -837,16 +848,33 @@ export function extractDeterministicRelationships({
             if (current && ROMANTIC_SECOND_PERSON_PATTERNS.some(pattern => pattern.test(line))) {
                 current.score += 1;
                 current.lines.push(line);
+                current.signals.add('vocative');
+                current.hasDirectedCue = true;
+            }
+        }
+
+        if (!ROMANTIC_NEGATIVE_PATTERNS.some(pattern => pattern.test(line))) {
+            const current = romanticScores.get(source);
+            if (current) {
+                if (ROMANTIC_SECOND_PERSON_PATTERNS.some(pattern => pattern.test(line))) {
+                    current.hasDirectedCue = true;
+                }
+                for (const signal of AFFECTIONATE_PAIR_SIGNALS) {
+                    if (!signal.pattern.test(line)) continue;
+                    current.score += signal.score;
+                    current.lines.push(line);
+                    current.signals.add(signal.key);
+                }
             }
         }
     }
 
-    const ownerRomantic = romanticScores.get(owner) || { score: 0, lines: [] };
-    const contactRomantic = romanticScores.get(contact) || { score: 0, lines: [] };
+    const ownerRomantic = romanticScores.get(owner) || { score: 0, lines: [], signals: new Set(), hasDirectedCue: false };
+    const contactRomantic = romanticScores.get(contact) || { score: 0, lines: [], signals: new Set(), hasDirectedCue: false };
     const ownerToContactKey = `${normalizeComparableText(owner)}::[PAREJA_DE]::${normalizeComparableText(contact)}`;
     const contactToOwnerKey = `${normalizeComparableText(contact)}::[PAREJA_DE]::${normalizeComparableText(owner)}`;
 
-    if (!seen.has(ownerToContactKey) && ownerRomantic.score >= 3) {
+    if (!seen.has(ownerToContactKey) && ownerRomantic.hasDirectedCue && ownerRomantic.score >= 4 && ownerRomantic.signals.size >= 2) {
         seen.add(ownerToContactKey);
         results.push({
             source: owner,
@@ -858,7 +886,7 @@ export function extractDeterministicRelationships({
         });
     }
 
-    if (!seen.has(contactToOwnerKey) && contactRomantic.score >= 3) {
+    if (!seen.has(contactToOwnerKey) && contactRomantic.hasDirectedCue && contactRomantic.score >= 4 && contactRomantic.signals.size >= 2) {
         seen.add(contactToOwnerKey);
         results.push({
             source: contact,

@@ -99,3 +99,17 @@ test('does not infer amistad from generic my-friend mentions', () => {
 
     assert.equal(relationships.length, 0);
 });
+
+test('infers pareja from repeated affectionate signals in private chat', () => {
+    const relationships = extractDeterministicRelationships({
+        chunkText: 'Naiara: Y yo 🥰.\nNaiara: esta mañana dándome besitos.\nNaiara: Te como.',
+        ownerName: 'Jairo',
+        contactName: 'Naiara',
+        isGroup: false
+    });
+
+    assert.equal(relationships.length, 1);
+    assert.equal(relationships[0].source, 'Naiara');
+    assert.equal(relationships[0].target, 'Jairo');
+    assert.equal(relationships[0].type, '[PAREJA_DE]');
+});
