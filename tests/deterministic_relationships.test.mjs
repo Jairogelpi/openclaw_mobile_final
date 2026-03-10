@@ -74,3 +74,28 @@ test('infers directed pareja relation from contact when romantic cue is explicit
     assert.equal(relationships[0].target, 'Jairo');
     assert.equal(relationships[0].type, '[PAREJA_DE]');
 });
+
+test('infers amistad only from direct explicit friendship wording', () => {
+    const relationships = extractDeterministicRelationships({
+        chunkText: 'Naiara: Eres mi amigo y te aprecio mucho.',
+        ownerName: 'Jairo',
+        contactName: 'Naiara',
+        isGroup: false
+    });
+
+    assert.equal(relationships.length, 1);
+    assert.equal(relationships[0].source, 'Naiara');
+    assert.equal(relationships[0].target, 'Jairo');
+    assert.equal(relationships[0].type, '[AMISTAD]');
+});
+
+test('does not infer amistad from generic my-friend mentions', () => {
+    const relationships = extractDeterministicRelationships({
+        chunkText: 'Jairo: Mi amigo Victor me ha escrito.',
+        ownerName: 'Jairo',
+        contactName: 'Naiara',
+        isGroup: false
+    });
+
+    assert.equal(relationships.length, 0);
+});

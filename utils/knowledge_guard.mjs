@@ -208,6 +208,11 @@ const DETERMINISTIC_PRIVATE_RELATIONS = [
         type: '[PAREJA_DE]',
         weight: 9,
         cues: ['te amo', 'mi amor', 'mi vida', 'amor mio']
+    },
+    {
+        type: '[AMISTAD]',
+        weight: 7,
+        cues: ['eres mi amigo', 'eres mi amiga', 'somos amigos', 'somos amigas', 'mi mejor amigo', 'mi mejor amiga']
     }
 ];
 
@@ -233,6 +238,12 @@ const ROMANTIC_NEGATIVE_PATTERNS = [
     /\bpeor etapa de mi vida\b/i,
     /\balegria a m[ií] vida\b/i,
     /\balegría a m[ií] vida\b/i
+];
+
+const FRIENDSHIP_DIRECT_PATTERNS = [
+    /\beres mi amig[oa]\b/i,
+    /\bsomos amig[oa]s\b/i,
+    /\bmi mejor amig[oa]\b/i
 ];
 
 function trimEntityEdges(value) {
@@ -794,6 +805,9 @@ export function extractDeterministicRelationships({
                 continue;
             }
             if (relation.type === '[PAREJA_DE]' && ROMANTIC_NEGATIVE_PATTERNS.some(pattern => pattern.test(line))) {
+                continue;
+            }
+            if (relation.type === '[AMISTAD]' && !FRIENDSHIP_DIRECT_PATTERNS.some(pattern => pattern.test(line))) {
                 continue;
             }
 
