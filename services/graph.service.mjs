@@ -787,7 +787,7 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
 
     const { data: exactNode } = await supabase
         .from('knowledge_nodes')
-        .select('id, description, support_count, stable_score, stability_tier, entity_type, source_tags')
+        .select('id, description, support_count, stable_score, stability_tier, entity_type, source_tags, embedding')
         .eq('client_id', clientId)
         .eq('entity_name', finalEntityName)
         .maybeSingle();
@@ -819,13 +819,16 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
             source_tags: nextSourceTags,
             last_seen: nowIso()
         };
+        let shouldRefreshEmbedding = !Array.isArray(exactNode.embedding) || !exactNode.embedding.length;
         if (finalDescription && finalDescription.length > String(exactNode.description || '').length) {
             patch.description = finalDescription;
+            shouldRefreshEmbedding = true;
         }
         if (finalEntityType && finalEntityType !== String(exactNode.entity_type || '').trim()) {
             patch.entity_type = finalEntityType;
+            shouldRefreshEmbedding = true;
         }
-        if (stability.promote) {
+        if (stability.promote && shouldRefreshEmbedding) {
             patch.embedding = await generateEmbedding(`${finalEntityName} ${patch.description || finalDescription || exactNode.description || ''}`);
         }
         await supabase

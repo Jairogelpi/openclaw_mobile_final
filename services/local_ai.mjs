@@ -16,6 +16,28 @@ let messageIdCounter = 0;
 const pendingRequests = new Map();
 let lastWarmupAt = 0;
 let warmupPromise = null;
+const EMBEDDING_CACHE_MAX = Number(process.env.OPENCLAW_EMBEDDING_CACHE_MAX || 2000);
+const embeddingCache = new Map();
+const embeddingInFlight = new Map();
+
+function getCachedEmbedding(cacheKey) {
+    if (!embeddingCache.has(cacheKey)) return null;
+    const cached = embeddingCache.get(cacheKey);
+    embeddingCache.delete(cacheKey);
+    embeddingCache.set(cacheKey, cached);
+    return Array.isArray(cached) ? [...cached] : null;
+}
+
+function saveCachedEmbedding(cacheKey, vector) {
+    if (!cacheKey || !Array.isArray(vector)) return;
+    if (embeddingCache.has(cacheKey)) embeddingCache.delete(cacheKey);
+    embeddingCache.set(cacheKey, [...vector]);
+    while (embeddingCache.size > EMBEDDING_CACHE_MAX) {
+        const oldestKey = embeddingCache.keys().next().value;
+        if (!oldestKey) break;
+        embeddingCache.delete(oldestKey);
+    }
+}
 
 function failPendingRequests(error) {
     for (const [id, resolver] of pendingRequests.entries()) {
@@ -110,8 +132,13 @@ export async function generateEmbedding(text, isQuery = false) {
 
     const prefix = isQuery ? 'search_query: ' : 'search_document: ';
     const textToEmbed = prefix + text;
+    const cached = getCachedEmbedding(textToEmbed);
+    if (cached) return cached;
+    if (embeddingInFlight.has(textToEmbed)) {
+        return embeddingInFlight.get(textToEmbed);
+    }
 
-    return new Promise((resolve, reject) => {
+    const requestPromise = new Promise((resolve, reject) => {
         const id = ++messageIdCounter;
         pendingRequests.set(id, { resolve, reject });
 
@@ -126,7 +153,15 @@ export async function generateEmbedding(text, isQuery = false) {
 
         // console.log(`[AI Service] Enviando request de embedding ${id}...`);
         embedderWorker.postMessage({ action: 'embed', id, text: textToEmbed });
+    }).then(vector => {
+        saveCachedEmbedding(textToEmbed, vector);
+        return Array.isArray(vector) ? [...vector] : vector;
+    }).finally(() => {
+        embeddingInFlight.delete(textToEmbed);
     });
+
+    embeddingInFlight.set(textToEmbed, requestPromise);
+    return requestPromise;
 }
 
 /**

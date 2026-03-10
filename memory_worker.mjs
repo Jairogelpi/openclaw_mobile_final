@@ -111,6 +111,28 @@ const sanitizeInput = (text, maxLength = 2000) => {
     return text.replace(/[<>{}\\^\`]/g, '').substring(0, maxLength).trim();
 };
 
+function buildCompactMemoryEmbeddingText(chunkText, {
+    contactName,
+    remoteId,
+    date,
+    speakers = []
+} = {}) {
+    const compactSpeakers = [...new Set((speakers || []).filter(Boolean))].slice(0, 6).join(', ');
+    const compactBody = String(chunkText || '')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .slice(0, 1200);
+
+    return [
+        '[WA_MEMORY]',
+        contactName ? `contact=${contactName}` : null,
+        remoteId ? `remote=${remoteId}` : null,
+        date ? `date=${date}` : null,
+        compactSpeakers ? `speakers=${compactSpeakers}` : null,
+        compactBody
+    ].filter(Boolean).join('\n');
+}
+
 /**
  * 2026 Grounded Extraction: Semántica Cuádruple + Temporal + Thematic (GraphRAG Level 4)
  */
@@ -240,7 +262,7 @@ async function processConversationDepthStrict(clientId, remoteId, userName, cont
         const chunkText = (lines || []).join('\n');
         if (!chunkText) return;
 
-        const extractionNeed = analyzeGraphExtractionNeed({
+        const extractionNeed = options.prefilter || analyzeGraphExtractionNeed({
             chunkText,
             ownerName: userName,
             contactName,
@@ -658,6 +680,12 @@ export async function distillAndVectorize(clientId, options = {}) {
                         const chunkLines = buildConversationLines(chunk, chunkUserName, chunkContactName);
                         const chunkSpeakers = extractSpeakersFromLines(chunkLines);
                         const chunkText = chunkLines.join('\n');
+                        const graphPrefilter = analyzeGraphExtractionNeed({
+                            chunkText,
+                            ownerName: chunkUserName,
+                            contactName: chunkContactName,
+                            isGroup: isGroupConversation
+                        });
 
                         if (!chunkText) {
                             console.log(`[Worker] ⏩ [Conv: ${chunkRemoteId}] Chunk ${i / CHUNK_SIZE} saltado (solo contenía media sin transcribir).`);
@@ -669,7 +697,8 @@ export async function distillAndVectorize(clientId, options = {}) {
                             console.log(`[Worker] 🕸️ [Conv: ${chunkRemoteId}] Extrayendo grafo para chunk ${i / CHUNK_SIZE}...`);
                             await processConversationDepthStrict(clientId, chunkRemoteId, chunkUserName, chunkContactName, chunkLines, {
                                 isGroup: isGroupConversation,
-                                speakers: chunkSpeakers
+                                speakers: chunkSpeakers,
+                                prefilter: graphPrefilter
                             });
 
                             // 2. Cognitive Depth (Soul Update & Insights) - MOVED OUTSIDE CHUNK LOOP OR CONSOLIDATED
@@ -683,7 +712,18 @@ export async function distillAndVectorize(clientId, options = {}) {
                         try {
                             const chunkHeader = `[Fragmento Conversacional(Holograma)][Contacto: ${chunkContactName}][ID: ${chunkRemoteId}][Fecha: ${chunk[0]?.created_at || '?'}]\n`;
                             const enrichedText = chunkHeader + chunkText;
-                            const holographicEmbedding = await generateEmbedding(enrichedText);
+                            const embeddingText = buildCompactMemoryEmbeddingText(chunkText, {
+                                contactName: chunkContactName,
+                                remoteId: chunkRemoteId,
+                                date: chunk[0]?.created_at,
+                                speakers: chunkSpeakers
+                            });
+                            const shouldDeferEmbedding =
+                                mode === 'rebuild'
+                                && ['participant_only_banter', 'low_semantic_signal'].includes(graphPrefilter.reason);
+                            const holographicEmbedding = shouldDeferEmbedding
+                                ? null
+                                : await generateEmbedding(embeddingText);
                             await supabase.from('user_memories').insert({
                                 client_id: clientId,
                                 content: enrichedText,
@@ -693,6 +733,9 @@ export async function distillAndVectorize(clientId, options = {}) {
                                     remoteId: chunkRemoteId,
                                     contactName: chunkContactName,
                                     holographic: true,
+                                    embedding_source: 'compact_hologram_v2',
+                                    embedding_deferred: shouldDeferEmbedding,
+                                    graph_prefilter_reason: graphPrefilter.reason,
                                     chunkIndex: i / CHUNK_SIZE,
                                     date: chunk[0]?.created_at,
                                     speakers: [...new Set(chunkLines.map(line => line.split(':')[0]).filter(Boolean))]
