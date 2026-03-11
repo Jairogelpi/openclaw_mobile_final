@@ -79,6 +79,11 @@ function getWorkerTuning(mode = 'normal') {
     };
 }
 
+function getMemorySweepCron() {
+    const raw = String(process.env.OPENCLAW_MEMORY_SWEEP_CRON || '').trim();
+    return raw || '*/5 * * * *';
+}
+
 // === HYPER-ROBUST HELPERS ===
 function cleanJSON(text) {
     if (!text) return null;
@@ -568,6 +573,8 @@ export async function distillAndVectorize(clientId, options = {}) {
     if (!soulData) return;
     const clientSlug = soulData.slug;
     const ownerName = await resolveOwnerName(clientId, soulData);
+    const skipLock = options.skipLock === true;
+    let acquiredProcessingFlag = false;
     let finalWorkerStatus = '◦ Cerebro en reposo';
 
     // Acquire lock (Temporarily disabled for Antigravity debugging)
@@ -579,6 +586,24 @@ export async function distillAndVectorize(clientId, options = {}) {
     }
     await supabase.from('user_souls').update({ is_processing: true, worker_status: '🧠 Procesando...' }).eq('client_id', clientId);
     */
+
+    if (!skipLock) {
+        const { data: soul2 } = await supabase
+            .from('user_souls')
+            .select('is_processing')
+            .eq('client_id', clientId)
+            .single();
+        if (soul2?.is_processing) {
+            console.log(`[Worker] 🔒 Cliente ${clientId} bloqueado. Saltando.`);
+            await refreshClientWorkerStatus(clientId);
+            return;
+        }
+        await supabase
+            .from('user_souls')
+            .update({ is_processing: true, worker_status: '🧠 Procesando...' })
+            .eq('client_id', clientId);
+        acquiredProcessingFlag = true;
+    }
 
     try {
         const mode = options.mode === 'rebuild' ? 'rebuild' : 'normal';
@@ -816,7 +841,9 @@ export async function distillAndVectorize(clientId, options = {}) {
     } catch (e) {
         console.error('[Memory Worker] Error:', e.message);
     } finally {
-        await supabase.from('user_souls').update({ is_processing: false, worker_status: finalWorkerStatus }).eq('client_id', clientId);
+        if (skipLock || acquiredProcessingFlag) {
+            await supabase.from('user_souls').update({ is_processing: false, worker_status: finalWorkerStatus }).eq('client_id', clientId);
+        }
     }
 }
 
@@ -894,6 +921,54 @@ async function remainingUnprocessedRawMessages(clientId) {
     return Number(count || 0);
 }
 
+async function refreshClientWorkerStatus(clientId, {
+    isProcessing = false,
+    fallbackStatus = '◦ Cerebro en reposo'
+} = {}) {
+    try {
+        const health = await collectGraphHealthSnapshot(clientId);
+        const workerStatus = formatGraphHealthStatus(health) || fallbackStatus;
+        await supabase
+            .from('user_souls')
+            .update({ is_processing: isProcessing, worker_status: workerStatus })
+            .eq('client_id', clientId);
+        return workerStatus;
+    } catch (error) {
+        const pending = await remainingUnprocessedRawMessages(clientId).catch(() => 0);
+        const workerStatus = pending > 0
+            ? `◦ Cerebro en reposo (${pending} pendientes)`
+            : fallbackStatus;
+        await supabase
+            .from('user_souls')
+            .update({ is_processing: isProcessing, worker_status: workerStatus })
+            .eq('client_id', clientId);
+        return workerStatus;
+    }
+}
+
+async function listClientsWithPendingRawMessages(limit = 200) {
+    const { data, error } = await supabase
+        .from('raw_messages')
+        .select('client_id')
+        .eq('processed', false)
+        .limit(limit);
+
+    if (error) throw error;
+    return [...new Set((data || []).map(row => row.client_id).filter(Boolean))];
+}
+
+async function sweepPendingClients({ refreshStatusOnly = false } = {}) {
+    const activeClients = await listClientsWithPendingRawMessages();
+    for (const cid of activeClients) {
+        if (refreshStatusOnly) {
+            await refreshClientWorkerStatus(cid);
+            continue;
+        }
+        await distillAndVectorize(cid);
+    }
+    return activeClients.length;
+}
+
 // === MAIN ===
 async function main() {
     console.log('🚀 OpenClaw Memory Worker 2026 Online');
@@ -908,10 +983,12 @@ async function main() {
             }
         });
 
-        cron.schedule('*/30 * * * *', async () => {
-            const { data: clients } = await supabase.from('raw_messages').select('client_id').eq('processed', false);
-            const active = [...new Set(clients?.map(c => c.client_id))];
-            for (const cid of active) await distillAndVectorize(cid);
+        const sweepCron = getMemorySweepCron();
+        cron.schedule(sweepCron, async () => {
+            await sweepPendingClients();
+        });
+        cron.schedule('*/2 * * * *', async () => {
+            await sweepPendingClients({ refreshStatusOnly: true });
         });
         if (ENABLE_DREAM_CYCLE) {
             cron.schedule('0 3 * * *', async () => {
@@ -923,6 +1000,7 @@ async function main() {
         }
         cron.schedule('0 */3 * * *', consolidateMemories);
         cron.schedule('0 4 * * *', cleanupRawMessages);
+        await sweepPendingClients();
     } catch (err) { }
 }
 
