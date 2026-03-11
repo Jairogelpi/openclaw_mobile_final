@@ -4,7 +4,7 @@ import {
     evaluateRelationshipAdmissibility
 } from '../utils/graph_admissibility_policy.mjs';
 
-const clientId = process.argv[2];
+const clientId = String(process.argv[2] || '').trim();
 
 if (!clientId) {
     console.error('Usage: node scripts/graph_metrics_report.mjs <client_id>');
@@ -24,6 +24,12 @@ function sortCounts(map) {
 
 function round(value) {
     return Number(Number(value || 0).toFixed(4));
+}
+
+function describeError(error) {
+    if (!error) return 'Unknown error';
+    if (typeof error === 'string') return error;
+    return error.message || error.details || JSON.stringify(error);
 }
 
 async function countRows(table) {
@@ -155,8 +161,8 @@ async function main() {
         }));
 
     const nodeCommunityCount = communityIds.length
-        ? await supabase.from('node_communities').select('*', { head: true, count: 'exact' }).in('community_id', communityIds)
-        : { count: 0, error: null };
+        ? await supabase.from('node_communities').select('community_id').in('community_id', communityIds)
+        : { data: [], error: null };
 
     if (nodeCommunityCount.error) throw nodeCommunityCount.error;
 
@@ -172,7 +178,7 @@ async function main() {
             knowledge_edges: totalEdges,
             contact_identities: identities,
             knowledge_communities: communities,
-            node_communities: Number(nodeCommunityCount.count || 0)
+            node_communities: (nodeCommunityCount.data || []).length
         },
         distributions: {
             node_types: sortCounts(nodeTypeCounts),
@@ -209,6 +215,6 @@ async function main() {
 }
 
 main().catch(error => {
-    console.error('[Graph Metrics] Error:', error.message);
+    console.error('[Graph Metrics] Error:', describeError(error));
     process.exit(1);
 });

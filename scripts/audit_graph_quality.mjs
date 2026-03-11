@@ -6,7 +6,7 @@ import {
     evaluateRelationshipAdmissibility
 } from '../utils/graph_admissibility_policy.mjs';
 
-const clientId = process.argv[2];
+const clientId = String(process.argv[2] || '').trim();
 
 if (!clientId) {
     console.error('Usage: node scripts/audit_graph_quality.mjs <client_id>');
@@ -73,6 +73,12 @@ const SUSPICIOUS_CONTEXT_PATTERNS = [
 
 function normalize(value) {
     return normalizeComparableText(normalizeEntityLikeText(String(value || '')));
+}
+
+function describeError(error) {
+    if (!error) return 'Unknown error';
+    if (typeof error === 'string') return error;
+    return error.message || error.details || JSON.stringify(error);
 }
 
 function isBlockedNodeName(value) {
@@ -187,13 +193,13 @@ async function fetchNodeCommunityCount() {
     const ids = (communities || []).map(row => row.id).filter(Boolean);
     if (!ids.length) return 0;
 
-    const { count, error: countError } = await supabase
+    const { data, error: countError } = await supabase
         .from('node_communities')
-        .select('*', { head: true, count: 'exact' })
+        .select('community_id')
         .in('community_id', ids);
 
     if (countError) throw countError;
-    return Number(count || 0);
+    return Number((data || []).length);
 }
 
 async function main() {
@@ -312,6 +318,6 @@ async function main() {
 }
 
 main().catch(error => {
-    console.error('[Graph Audit] Error:', error.message);
+    console.error('[Graph Audit] Error:', describeError(error));
     process.exit(1);
 });
