@@ -84,6 +84,12 @@ function getMemorySweepCron() {
     return raw || '*/5 * * * *';
 }
 
+function getMemoryFastSweepMs() {
+    const parsed = Number.parseInt(String(process.env.OPENCLAW_MEMORY_FAST_SWEEP_MS || ''), 10);
+    if (Number.isFinite(parsed) && parsed >= 10000) return parsed;
+    return 30000;
+}
+
 // === HYPER-ROBUST HELPERS ===
 function cleanJSON(text) {
     if (!text) return null;
@@ -969,6 +975,18 @@ async function sweepPendingClients({ refreshStatusOnly = false } = {}) {
     return activeClients.length;
 }
 
+let pendingSweepInFlight = false;
+
+async function runPendingSweep(options = {}) {
+    if (pendingSweepInFlight) return 0;
+    pendingSweepInFlight = true;
+    try {
+        return await sweepPendingClients(options);
+    } finally {
+        pendingSweepInFlight = false;
+    }
+}
+
 // === MAIN ===
 async function main() {
     console.log('🚀 OpenClaw Memory Worker 2026 Online');
@@ -985,10 +1003,15 @@ async function main() {
 
         const sweepCron = getMemorySweepCron();
         cron.schedule(sweepCron, async () => {
-            await sweepPendingClients();
+            await runPendingSweep();
         });
+        setInterval(() => {
+            runPendingSweep().catch(error => {
+                console.warn(`[Memory Sweep] Fast sweep error: ${error.message}`);
+            });
+        }, getMemoryFastSweepMs());
         cron.schedule('*/2 * * * *', async () => {
-            await sweepPendingClients({ refreshStatusOnly: true });
+            await runPendingSweep({ refreshStatusOnly: true });
         });
         if (ENABLE_DREAM_CYCLE) {
             cron.schedule('0 3 * * *', async () => {
@@ -1000,7 +1023,7 @@ async function main() {
         }
         cron.schedule('0 */3 * * *', consolidateMemories);
         cron.schedule('0 4 * * *', cleanupRawMessages);
-        await sweepPendingClients();
+        await runPendingSweep();
     } catch (err) { }
 }
 

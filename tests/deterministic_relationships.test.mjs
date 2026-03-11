@@ -30,7 +30,7 @@ test('does not invent deterministic private-pair relations inside groups', () =>
 
 test('does not infer pareja from generic affection words without direct romantic cue', () => {
     const relationships = extractDeterministicRelationships({
-        chunkText: 'Jairo: Necesitaba sentir que alguien me quiera dar cariño.',
+        chunkText: 'Jairo: Necesitaba sentir que alguien me quiera dar carino.',
         ownerName: 'Jairo',
         contactName: 'Naiara',
         isGroup: false
@@ -100,16 +100,24 @@ test('does not infer amistad from generic my-friend mentions', () => {
     assert.equal(relationships.length, 0);
 });
 
-test('infers pareja from repeated affectionate signals in private chat', () => {
+test('does not infer pareja from repeated affectionate signals without direct addressed cue', () => {
     const relationships = extractDeterministicRelationships({
-        chunkText: 'Naiara: Y yo 🥰.\nNaiara: esta mañana dándome besitos.\nNaiara: Te como.',
+        chunkText: 'Naiara: Y yo.\nNaiara: esta manana dandome besitos.\nNaiara: Te como.',
         ownerName: 'Jairo',
         contactName: 'Naiara',
         isGroup: false
     });
 
-    assert.equal(relationships.length, 1);
-    assert.equal(relationships[0].source, 'Naiara');
-    assert.equal(relationships[0].target, 'Jairo');
-    assert.equal(relationships[0].type, '[PAREJA_DE]');
+    assert.equal(relationships.length, 0);
+});
+
+test('does not infer pareja from reported speech about saying te amo', () => {
+    const relationships = extractDeterministicRelationships({
+        chunkText: 'Mireya: Y aparte nos deciamos te amo.',
+        ownerName: 'Jairo',
+        contactName: 'Mireya',
+        isGroup: false
+    });
+
+    assert.equal(relationships.length, 0);
 });

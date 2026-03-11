@@ -81,6 +81,23 @@ const STRONG_FRIENDSHIP_CONTEXT_PATTERNS = [
     /\bgran amig[oa]\b/i
 ];
 
+const DIRECT_ROMANTIC_CONTEXT_PATTERNS = [
+    /\bte amo\b/i,
+    /\bmi vida\b/i,
+    /\bmi amor\b/i,
+    /\bamor mio\b/i,
+    /\bamor mío\b/i,
+    /\bte pienso cuidar\b/i,
+    /\bbesitos?\b/i
+];
+
+const REPORTED_ROMANTIC_CONTEXT_PATTERNS = [
+    /\baggregate_romantic_score:/i,
+    /\bnos dec[ií]amos te amo\b/i,
+    /\bnos dijimos te amo\b/i,
+    /\bse dijeron te amo\b/i
+];
+
 function normalizedText(value) {
     return normalizeComparableText(String(value || ''));
 }
@@ -152,6 +169,18 @@ function hasStrongFriendshipContext(text = '') {
     const raw = String(text || '');
     if (!raw) return false;
     return STRONG_FRIENDSHIP_CONTEXT_PATTERNS.some(pattern => pattern.test(raw));
+}
+
+function hasDirectRomanticContext(text = '') {
+    const raw = String(text || '');
+    if (!raw) return false;
+    return DIRECT_ROMANTIC_CONTEXT_PATTERNS.some(pattern => pattern.test(raw));
+}
+
+function hasReportedRomanticContext(text = '') {
+    const raw = String(text || '');
+    if (!raw) return false;
+    return REPORTED_ROMANTIC_CONTEXT_PATTERNS.some(pattern => pattern.test(raw));
 }
 
 export function computeNodeStability({
@@ -259,6 +288,11 @@ export function computeEdgeStability({
         score -= 4;
     }
 
+    if (normalizedRelation === '[PAREJA_DE]') {
+        if (!hasDirectRomanticContext(context)) score -= 5;
+        if (hasReportedRomanticContext(context)) score -= 6;
+    }
+
     score = Math.max(score, Number(existingScore || 0));
 
     let tier = 'candidate';
@@ -296,6 +330,10 @@ export function computeEdgeStability({
     }
 
     if (normalizedRelation === '[AMISTAD]' && !hasStrongFriendshipContext(context)) {
+        tier = 'candidate';
+    }
+
+    if (normalizedRelation === '[PAREJA_DE]' && (!hasDirectRomanticContext(context) || hasReportedRomanticContext(context))) {
         tier = 'candidate';
     }
 

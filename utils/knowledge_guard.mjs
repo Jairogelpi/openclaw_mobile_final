@@ -240,6 +240,16 @@ const ROMANTIC_NEGATIVE_PATTERNS = [
     /\balegría a m[ií] vida\b/i
 ];
 
+const ROMANTIC_REPORTED_CONTEXT_PATTERNS = [
+    /\bnos dec[ií]amos te amo\b/i,
+    /\bnos dijimos te amo\b/i,
+    /\bdec[ií]amos te amo\b/i,
+    /\b(dijo|dec[ií]a|decia)\s+te amo\b/i,
+    /\bme dijo\s+te amo\b/i,
+    /\ble dije\s+te amo\b/i,
+    /\bse dijeron\s+te amo\b/i
+];
+
 const FRIENDSHIP_DIRECT_PATTERNS = [
     /\beres mi amig[oa]\b/i,
     /\bsomos amig[oa]s\b/i,
@@ -353,6 +363,23 @@ function hasNegativeTalkCue(evidenceText, contextText = '') {
     ].some(cue => haystack.includes(normalizeComparableText(cue)));
 }
 
+function isReportedRomanticContext(text = '') {
+    const raw = String(text || '');
+    if (!raw) return false;
+    return ROMANTIC_REPORTED_CONTEXT_PATTERNS.some(pattern => pattern.test(raw));
+}
+
+function hasDirectedRomanticAddress(text = '') {
+    const raw = String(text || '');
+    if (!raw) return false;
+    if (ROMANTIC_NEGATIVE_PATTERNS.some(pattern => pattern.test(raw))) return false;
+    if (isReportedRomanticContext(raw)) return false;
+
+    if (!ROMANTIC_VOCATIVE_PATTERNS.some(pattern => pattern.test(raw))) return false;
+
+    return ROMANTIC_SECOND_PERSON_PATTERNS.some(pattern => pattern.test(raw));
+}
+
 function relationshipHasStrongEvidence({
     relationType,
     sourceName,
@@ -383,6 +410,16 @@ function relationshipHasStrongEvidence({
     const requiresDirectionalSpeakerAnchor = ['[PAREJA_DE]', '[AMISTAD]', '[FAMILIA_DE]', '[CONOCE_A]'].includes(relationType);
 
     if (speakerKey && requiresDirectionalSpeakerAnchor && privatePair) {
+        if (relationType === '[PAREJA_DE]') {
+            if (speakerMatchesSource) {
+                return hasDirectedRomanticAddress(evidence);
+            }
+
+            if (speakerMatchesTarget) {
+                return false;
+            }
+        }
+
         if (speakerMatchesSource) {
             if (relationType === '[AMISTAD]') {
                 const friendshipText = `${evidence || ''} ${context || ''}`;
@@ -832,6 +869,9 @@ export function extractDeterministicRelationships({
             if (relation.type === '[PAREJA_DE]' && ROMANTIC_NEGATIVE_PATTERNS.some(pattern => pattern.test(line))) {
                 continue;
             }
+            if (relation.type === '[PAREJA_DE]' && !hasDirectedRomanticAddress(line)) {
+                continue;
+            }
             if (relation.type === '[AMISTAD]' && !FRIENDSHIP_DIRECT_PATTERNS.some(pattern => pattern.test(line))) {
                 continue;
             }
@@ -859,9 +899,9 @@ export function extractDeterministicRelationships({
             }
         }
 
-        if (ROMANTIC_VOCATIVE_PATTERNS.some(pattern => pattern.test(line)) && !ROMANTIC_NEGATIVE_PATTERNS.some(pattern => pattern.test(line))) {
+        if (hasDirectedRomanticAddress(line)) {
             const current = romanticScores.get(source);
-            if (current && ROMANTIC_SECOND_PERSON_PATTERNS.some(pattern => pattern.test(line))) {
+            if (current) {
                 current.score += 1;
                 current.lines.push(line);
                 current.signals.add('vocative');
@@ -869,7 +909,7 @@ export function extractDeterministicRelationships({
             }
         }
 
-        if (!ROMANTIC_NEGATIVE_PATTERNS.some(pattern => pattern.test(line))) {
+        if (!ROMANTIC_NEGATIVE_PATTERNS.some(pattern => pattern.test(line)) && !isReportedRomanticContext(line)) {
             const current = romanticScores.get(source);
             if (current) {
                 if (ROMANTIC_SECOND_PERSON_PATTERNS.some(pattern => pattern.test(line))) {
@@ -890,7 +930,13 @@ export function extractDeterministicRelationships({
     const ownerToContactKey = `${normalizeComparableText(owner)}::[PAREJA_DE]::${normalizeComparableText(contact)}`;
     const contactToOwnerKey = `${normalizeComparableText(contact)}::[PAREJA_DE]::${normalizeComparableText(owner)}`;
 
-    if (!seen.has(ownerToContactKey) && ownerRomantic.hasDirectedCue && ownerRomantic.score >= 4 && ownerRomantic.signals.size >= 2) {
+    if (
+        !seen.has(ownerToContactKey)
+        && ownerRomantic.hasDirectedCue
+        && ownerRomantic.score >= 4
+        && ownerRomantic.signals.size >= 2
+        && ownerRomantic.lines.some(line => hasDirectedRomanticAddress(line))
+    ) {
         seen.add(ownerToContactKey);
         results.push({
             source: owner,
@@ -902,7 +948,13 @@ export function extractDeterministicRelationships({
         });
     }
 
-    if (!seen.has(contactToOwnerKey) && contactRomantic.hasDirectedCue && contactRomantic.score >= 4 && contactRomantic.signals.size >= 2) {
+    if (
+        !seen.has(contactToOwnerKey)
+        && contactRomantic.hasDirectedCue
+        && contactRomantic.score >= 4
+        && contactRomantic.signals.size >= 2
+        && contactRomantic.lines.some(line => hasDirectedRomanticAddress(line))
+    ) {
         seen.add(contactToOwnerKey);
         results.push({
             source: contact,

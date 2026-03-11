@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { evaluateEntityAdmissibility } from '../utils/graph_admissibility_policy.mjs';
+import { evaluateEntityAdmissibility, evaluateRelationshipAdmissibility } from '../utils/graph_admissibility_policy.mjs';
 import { deriveEffectiveEntityType, extractDeterministicRelationships, normalizeEntityName, validateGroundedGraph } from '../utils/knowledge_guard.mjs';
 import { computeEdgeStability } from '../utils/stable_graph_policy.mjs';
 
@@ -238,6 +238,35 @@ test('rejects inverted pareja direction when the speaker is explicitly the targe
     });
 
     assert.equal(result.relationships.length, 0);
+});
+
+test('keeps direct pareja evidence when the speaker matches the source side', () => {
+    const verdict = evaluateRelationshipAdmissibility({
+        relationType: '[PAREJA_DE]',
+        sourceEntity: { name: 'Mireya', type: 'PERSONA' },
+        targetEntity: { name: 'Jairo', type: 'PERSONA' },
+        evidence: 'Mireya: Te amo mi vida gracias por verme tan por dentro y todo.',
+        context: 'cue:te amo | Mireya: Te amo mi vida gracias por verme tan por dentro y todo.',
+        knownNames: new Set(),
+        remoteId: '34660386701@s.whatsapp.net',
+        isGroup: false
+    });
+
+    assert.equal(verdict.allowed, true);
+});
+
+test('rejects pareja edges built from aggregate romantic score without direct cue', () => {
+    const result = computeEdgeStability({
+        relationType: '[PAREJA_DE]',
+        context: 'aggregate_romantic_score:4',
+        supportCount: 4,
+        weight: 9,
+        sourceTags: ['grounded_extraction'],
+        flags: ['grounded', 'direct']
+    });
+
+    assert.equal(result.tier, 'candidate');
+    assert.equal(result.promote, false);
 });
 
 test('quarantines contextual person labels like otro con el que trabajo', () => {

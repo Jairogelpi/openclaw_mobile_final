@@ -10,7 +10,7 @@ import { normalizeComparableText, normalizeEntityLikeText, pickBestHumanName, lo
 import { classifyIdentityLikeName, looksHumanIdentityLabel } from '../utils/identity_policy.mjs';
 import { computeEdgeStability } from '../utils/stable_graph_policy.mjs';
 
-const clientId = process.argv[2];
+const clientId = String(process.argv[2] || '').trim();
 const applyMode = process.argv.includes('--apply');
 const WEAK_ORPHAN_TYPES = new Set(['OBJETO', 'ENTITY', 'EVENTO', 'TEMA']);
 const OWNER_ALIAS_NAMES = new Set(['yo', 'me', 'mi clon', 'mi clon yo', 'usuario principal', 'user sent', 'user_sent']);

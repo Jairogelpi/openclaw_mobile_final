@@ -41,6 +41,23 @@ const WEAK_RELATIONSHIP_CONTEXTS = new Set([
     'comentario'
 ]);
 
+const DIRECT_ROMANTIC_RELATION_PATTERNS = [
+    /\bte amo\b/i,
+    /\bmi vida\b/i,
+    /\bmi amor\b/i,
+    /\bamor mio\b/i,
+    /\bamor mío\b/i,
+    /\bte pienso cuidar\b/i,
+    /\bbesitos?\b/i
+];
+
+const REPORTED_ROMANTIC_RELATION_PATTERNS = [
+    /\baggregate_romantic_score:/i,
+    /\bnos dec[ií]amos te amo\b/i,
+    /\bnos dijimos te amo\b/i,
+    /\bse dijeron te amo\b/i
+];
+
 const GENERIC_ENTITY_TYPES = new Set([
     'LUGAR',
     'ORGANIZACION',
@@ -107,6 +124,25 @@ function countNormalizedOccurrences(haystack, needle) {
         cursor = next + normalizedNeedle.length;
     }
     return count;
+}
+
+function extractEvidenceSpeakerName(evidence = '') {
+    const raw = String(evidence || '').split('|').pop()?.trim() || String(evidence || '');
+    const separatorIndex = raw.indexOf(':');
+    if (separatorIndex <= 0) return '';
+    return normalizeComparableText(raw.slice(0, separatorIndex).trim());
+}
+
+function hasDirectRomanticRelationCue(text = '') {
+    const raw = String(text || '');
+    if (!raw) return false;
+    return DIRECT_ROMANTIC_RELATION_PATTERNS.some(pattern => pattern.test(raw));
+}
+
+function hasReportedRomanticRelationCue(text = '') {
+    const raw = String(text || '');
+    if (!raw) return false;
+    return REPORTED_ROMANTIC_RELATION_PATTERNS.some(pattern => pattern.test(raw));
 }
 
 export function evaluateEntityAdmissibility({
@@ -224,6 +260,25 @@ export function evaluateRelationshipAdmissibility({
     const normalizedRelationType = String(relationType || '').trim();
     if (!normalizedRelationType) {
         return { allowed: false, reason: 'missing_relation_type' };
+    }
+
+    if (normalizedRelationType === '[PAREJA_DE]') {
+        const contextText = `${evidence || ''} ${context || ''}`;
+        if (hasReportedRomanticRelationCue(contextText)) {
+            return { allowed: false, reason: 'reported_romantic_context' };
+        }
+
+        if (!hasDirectRomanticRelationCue(contextText)) {
+            return { allowed: false, reason: 'missing_direct_romantic_cue' };
+        }
+
+        const speakerName = extractEvidenceSpeakerName(evidence);
+        const sourceName = normalizeComparableText(sourceEntity?.name);
+        if (speakerName && sourceName && speakerName !== sourceName) {
+            return { allowed: false, reason: 'missing_source_anchor' };
+        }
+
+        return { allowed: true, reason: 'grounded_direct_romance' };
     }
 
     if (normalizedRelationType !== '[HABLA_DE]') {
