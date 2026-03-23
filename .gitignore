@@ -7,4 +7,8 @@ build/
 coverage/
 *.log
 .DS_Store
-EOFuploads/
+uploads/
+.cache/
+*.sqlite
+*.sqlite3
+*.db

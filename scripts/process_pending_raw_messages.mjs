@@ -1,5 +1,11 @@
 import supabase from '../config/supabase.mjs';
 import { distillAndVectorize } from '../memory_worker.mjs';
+import { hydrateContactIdentities, repairOwnerIdentity } from '../services/identity.service.mjs';
+import { detectAndSaveCommunities } from '../services/community.service.mjs';
+import { backfillDeferredMemoryEmbeddings } from '../services/memory_embedding_backfill.service.mjs';
+import { getEmbeddingRuntimeStats, resetEmbeddingRuntimeStats } from '../services/local_ai.mjs';
+import { cleanupGraphOutliers } from './cleanup_graph_outliers.mjs';
+import { collectGraphHealthSnapshot, formatGraphHealthStatus } from '../services/graph_health.service.mjs';
 
 const clientId = process.argv[2];
 
@@ -20,6 +26,7 @@ async function pendingCount() {
 }
 
 async function main() {
+    resetEmbeddingRuntimeStats();
     let pending = await pendingCount();
     console.log(`[Process Pending] start pending=${pending}`);
 
@@ -28,6 +35,30 @@ async function main() {
         pending = await pendingCount();
         console.log(`[Process Pending] pending=${pending}`);
     }
+
+    await supabase
+        .from('user_souls')
+        .update({
+            is_processing: true,
+            worker_status: 'Rebuild phase B: embedding backfill, identities and cleanup...'
+        })
+        .eq('client_id', clientId);
+
+    await hydrateContactIdentities(clientId, { force: true });
+    const embeddingBackfill = await backfillDeferredMemoryEmbeddings(clientId, { batchSize: 120, maxRows: 1200, prioritizeConsolidated: true });
+    await repairOwnerIdentity(clientId);
+    const cleanupReport = await cleanupGraphOutliers(clientId, { apply: true });
+    await detectAndSaveCommunities(clientId);
+    const health = await collectGraphHealthSnapshot(clientId);
+    const embeddingStats = getEmbeddingRuntimeStats();
+
+    await supabase
+        .from('user_souls')
+        .update({
+            is_processing: false,
+            worker_status: `${formatGraphHealthStatus(health)} | cleanup: ${cleanupReport.deleted_nodes} nodes, ${cleanupReport.deleted_edges} edges | embedding backfill: ${embeddingBackfill.updated} | cache hits:${embeddingStats.embedding_cache_hits} misses:${embeddingStats.embedding_cache_misses} deferred:${embeddingStats.deferred_embedding_count}`
+        })
+        .eq('client_id', clientId);
 
     console.log(`[Process Pending] completed for ${clientId}`);
 }

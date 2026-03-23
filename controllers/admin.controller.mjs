@@ -3,55 +3,114 @@ import { exec } from 'child_process';
 import util from 'util';
 import path from 'path';
 import supabase from '../config/supabase.mjs';
-import { encrypt, decrypt } from '../security.mjs';
+import { encrypt, decrypt } from '../core/security.mjs';
 import redisClient from '../config/redis.mjs';
-import { processMessage } from '../core_engine.mjs';
+import { processMessage } from '../core/core_engine.mjs';
 import { getAggregatedMetrics } from '../services/rag_metrics.mjs';
 import { getAllConfig, setConfig } from '../services/config.service.mjs';
-import { adminNeuralQueue, adminNeuralQueueEvents } from '../config/queues.mjs';
 
 const execPromise = util.promisify(exec);
 const BRAIN_ADMIN_PORT = Number(process.env.OPENCLAW_BRAIN_ADMIN_PORT || 3001);
+const BRAIN_HEALTH_TIMEOUT_MS = Number(process.env.OPENCLAW_BRAIN_HEALTH_TIMEOUT_MS || 1500);
+const BRAIN_ADMIN_TIMEOUT_MS = Number(process.env.OPENCLAW_BRAIN_ADMIN_TIMEOUT_MS || 20000);
+const LOCAL_ADMIN_FALLBACK_TIMEOUT_MS = Number(process.env.OPENCLAW_LOCAL_ADMIN_FALLBACK_TIMEOUT_MS || 25000);
 
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
-}
-
-async function waitForAdminNeuralResult(requestId, timeoutMs = 35000) {
-    if (!requestId || !redisClient) return null;
-
-    const startedAt = Date.now();
-    while ((Date.now() - startedAt) < timeoutMs) {
-        const payload = await redisClient.get(`admin_neural_result:${requestId}`);
-        if (payload) {
-            await redisClient.del(`admin_neural_result:${requestId}`).catch(() => null);
-            return JSON.parse(payload);
-        }
-        await sleep(150);
-    }
-
-    return null;
-}
-
-async function callBrainAdminEndpoint(token, payload, timeoutMs = 35000) {
+async function fetchJsonWithTimeout(url, init = {}, timeoutMs = 10000) {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), timeoutMs);
     try {
-        const response = await fetch(`http://127.0.0.1:${BRAIN_ADMIN_PORT}/admin/api/neural_chat?token=${encodeURIComponent(token)}`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
+        const response = await fetch(url, {
+            ...init,
             signal: controller.signal
         });
-
         const data = await response.json().catch(() => ({}));
-        if (!response.ok) {
-            throw new Error(data?.error || `Brain admin endpoint error (${response.status})`);
-        }
-        return data;
+        return { response, data };
     } finally {
         clearTimeout(timeout);
     }
+}
+
+async function isBrainAdminHealthy(timeoutMs = BRAIN_HEALTH_TIMEOUT_MS) {
+    try {
+        const { response, data } = await fetchJsonWithTimeout(
+            `http://127.0.0.1:${BRAIN_ADMIN_PORT}/healthz`,
+            {},
+            timeoutMs
+        );
+        return response.ok && data?.ok === true;
+    } catch (error) {
+        return false;
+    }
+}
+
+async function callBrainAdminEndpoint(token, payload, timeoutMs = BRAIN_ADMIN_TIMEOUT_MS) {
+    const { response, data } = await fetchJsonWithTimeout(
+        `http://127.0.0.1:${BRAIN_ADMIN_PORT}/admin/api/neural_chat?token=${encodeURIComponent(token)}`,
+        {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+        },
+        timeoutMs
+    );
+
+    if (!response.ok) {
+        throw new Error(data?.error || `Brain admin endpoint error (${response.status})`);
+    }
+
+    return data;
+}
+
+async function loadLatestAdminTrace(clientId) {
+    try {
+        const { data } = await supabase
+            .from('rag_metrics')
+            .select('*')
+            .eq('client_id', clientId)
+            .order('created_at', { ascending: false })
+            .limit(1);
+        return data?.[0] || null;
+    } catch (error) {
+        return null;
+    }
+}
+
+async function runLocalAdminProbe(payload) {
+    const reply = await Promise.race([
+        processMessage(payload),
+        new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout en fallback local del gateway.')), LOCAL_ADMIN_FALLBACK_TIMEOUT_MS))
+    ]);
+
+    return {
+        reply,
+        trace: await loadLatestAdminTrace(payload.clientId),
+        path: 'gateway_local_fallback'
+    };
+}
+
+async function dispatchAdminNeuralChat(token, payload) {
+    const brainHealthy = await isBrainAdminHealthy();
+    if (brainHealthy) {
+        try {
+            const directResult = await callBrainAdminEndpoint(token, {
+                clientId: payload.clientId,
+                text: payload.text,
+                remoteId: payload.senderId,
+                asSelfChat: Boolean(payload.metadata?.isSelfChat),
+                threadId: payload.threadId || null
+            });
+            return {
+                ...directResult,
+                path: directResult?.path || 'brain_http'
+            };
+        } catch (error) {
+            console.warn(`[Neural Terminal] Brain HTTP fallback a gateway local: ${error.message}`);
+        }
+    } else {
+        console.warn('[Neural Terminal] Brain healthz no disponible. Fallback a gateway local.');
+    }
+
+    return runLocalAdminProbe(payload);
 }
 
 export async function adminHealthDashboard(req, res, activeSessions) {
@@ -165,7 +224,7 @@ export async function adminRestartClient(req, res, activeSessions, startWhatsApp
         await supabase.rpc('increment_restart', { p_client_id: soul.client_id });
 
         // Relanzamos
-        startWhatsAppClient(soul.client_id, slug, clientDir).catch(e => {
+        startWhatsAppClient(soul.client_id, slug).catch(e => {
             console.error(`Error de fondo en reinicio de ${slug}:`, e);
         });
 
@@ -562,10 +621,8 @@ export async function adminNeuralChat(req, res) {
     if (!clientId || !text) return res.status(400).json({ error: 'Faltan parámetros' });
 
     try {
-        // Fetch slug for the client
         const { data: soul } = await supabase.from('user_souls').select('slug').eq('client_id', clientId).single();
         const clientSlug = soul?.slug || 'unknown';
-        const requestId = `admin_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
         const payload = {
             clientId,
             clientSlug,
@@ -573,65 +630,18 @@ export async function adminNeuralChat(req, res) {
             senderId: remoteId || 'terminal-admin',
             pushName: 'Admin Debugger',
             channel: 'terminal',
-            adminRequestId: requestId,
             metadata: {
                 adminProbe: true
             }
         };
 
         console.log(`🧠 [Neural Terminal] Testing for ${clientId} (${clientSlug}): "${text.slice(0, 30)}..."`);
-        try {
-            const directResult = await callBrainAdminEndpoint(req.query.token, {
-                clientId,
-                text,
-                remoteId: remoteId || 'terminal-admin'
-            });
-            return res.json(directResult);
-        } catch (error) {
-            console.warn(`[Neural Terminal] Brain direct probe fallback: ${error.message}`);
-        }
-
-        if (adminNeuralQueue && redisClient) {
-            const job = await adminNeuralQueue.add('admin_probe', payload, {
-                jobId: requestId,
-                removeOnComplete: true,
-                attempts: 1
-            });
-
-            try {
-                const result = await job.waitUntilFinished(adminNeuralQueueEvents, 35000);
-                if (result && typeof result === 'object' && 'reply' in result) {
-                    return res.json({
-                        reply: result.reply,
-                        trace: result.trace || null
-                    });
-                }
-            } catch (error) {
-                const fallback = await waitForAdminNeuralResult(requestId, 1500);
-                if (fallback?.ok) {
-                    return res.json({ reply: fallback.reply, trace: fallback.trace || null });
-                }
-                if (error?.message?.includes('timed out')) {
-                    return res.status(504).json({ error: 'Timeout esperando respuesta del brain worker.' });
-                }
-                return res.status(500).json({ error: error.message || 'Fallo procesando admin probe.' });
-            }
-        }
-
-        const reply = await processMessage(payload);
-
-        let trace = null;
-        try {
-            const { data } = await supabase
-                .from('rag_metrics')
-                .select('*')
-                .eq('client_id', clientId)
-                .order('created_at', { ascending: false })
-                .limit(1);
-            if (data?.[0]) trace = data[0];
-        } catch (e) { /* non-critical */ }
-
-        return res.json({ reply, trace });
+        const result = await dispatchAdminNeuralChat(req.query.token, payload);
+        return res.json({
+            reply: result.reply,
+            trace: result.trace || null,
+            path: result.path || null
+        });
     } catch (err) {
         res.status(500).json({ error: err.message });
     }
@@ -779,3 +789,67 @@ export async function adminSaveClientFile(req, res) {
     }
 }
 
+/**
+ * API: Inicia pairing de WhatsApp via Código (Baileys)
+ */
+export async function adminWhatsAppPair(req, res, activeSessions, qrCodes, startWhatsAppClient) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { slug } = req.params;
+    const { phoneNumber } = req.body;
+
+    if (!phoneNumber) return res.status(400).json({ error: 'Falta número de teléfono' });
+
+    try {
+        console.log(`📱 [Admin] Solicitando Código de Vinculación para ${slug} (${phoneNumber})...`);
+        const { data: soul } = await supabase.from('user_souls').select('client_id').eq('slug', slug).single();
+        if (!soul?.client_id) throw new Error("Cliente no encontrado en DB");
+
+        // Lanzar/Reiniciar cliente con flag de pairing
+        startWhatsAppClient(soul.client_id, slug, { pairingNumber: phoneNumber }).catch(e => {
+            console.error(`Error de fondo en pairing de ${slug}:`, e);
+        });
+
+        res.json({ success: true, message: `Petición de código enviada para ${phoneNumber}.` });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * API: Status simplificado de WhatsApp para un cliente
+ */
+export function adminWhatsAppStatus(req, res, activeSessions, qrCodes) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { slug } = req.params;
+
+    try {
+        const session = Array.from(activeSessions.values()).find(s => s.slug === slug);
+        const clientId = session?.clientId;
+        
+        res.json({
+            connected: !!(session?.sock?.user),
+            hasQr: qrCodes.has(clientId),
+            qr: qrCodes.get(clientId) || null
+        });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}
+
+/**
+ * API: Reintenta conexión sin borrar sesión
+ */
+export async function adminWhatsAppReconnect(req, res, activeSessions, startWhatsAppClient) {
+    if (req.query.token !== process.env.ADMIN_TOKEN) return res.status(401).json({ error: 'No autorizado' });
+    const { slug } = req.params;
+
+    try {
+        const { data: soul } = await supabase.from('user_souls').select('client_id').eq('slug', slug).single();
+        if (!soul?.client_id) throw new Error("Cliente no encontrado en DB");
+
+        startWhatsAppClient(soul.client_id, slug).catch(e => { });
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: err.message });
+    }
+}

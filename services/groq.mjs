@@ -32,6 +32,13 @@ const groq = {
                 return retryWithBackoff(() => rawGroq.chat.completions.create(args));
             }
         }
+    },
+    audio: {
+        transcriptions: {
+            create: async (args) => {
+                return retryWithBackoff(() => rawGroq.audio.transcriptions.create(args));
+            }
+        }
     }
 };
 

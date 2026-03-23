@@ -127,6 +127,8 @@ export function startRagTrace(clientId, query) {
         citation_coverage: 0,
         answer_verdict: null,
         supported_claims: [],
+        query_style: null,
+        retrieval_profile: {},
 
         reflection_attempts: 0,
         reflection_score: 0,
@@ -218,6 +220,14 @@ export function startRagTrace(clientId, query) {
                 : [];
         },
 
+        setQueryStyle(style) {
+            this.query_style = style || null;
+        },
+
+        setRetrievalProfile(profile) {
+            this.retrieval_profile = profile || {};
+        },
+
         async finish(response) {
             this.timing.total = Date.now() - this._startTime;
 
@@ -240,6 +250,8 @@ export function startRagTrace(clientId, query) {
                 conflict_detected: Boolean(this.conflict_detected),
                 total_latency_ms: Number(this.timing.total || 0),
                 llm_calls_count: Number(this.llm_calls_count || 0),
+                query_style: this.query_style,
+                retrieval_profile: this.retrieval_profile,
                 metadata: {
                     mode: this.mode,
                     query_plan: this.query_plan,

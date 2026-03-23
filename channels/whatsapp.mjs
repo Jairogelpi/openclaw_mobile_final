@@ -1,8 +1,9 @@
 import { makeWASocket, DisconnectReason, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import { useSupabaseAuthState } from '../utils/whatsapp_db_auth.mjs';
 import pino from 'pino';
+import fs from 'fs/promises';
 import { Worker } from 'bullmq';
-import { incomingQueue, outgoingQueue, mediaQueue } from '../config/queues.mjs';
+import { incomingQueue, outgoingQueue } from '../config/queues.mjs';
 import redisClient from '../config/redis.mjs';
 import groq from '../services/groq.mjs';
 import { resolveIdentity } from '../skills/whatsapp_contacts.mjs';
@@ -10,6 +11,43 @@ import { discoverWhatsAppGroup } from '../skills/whatsapp_groups.mjs';
 import supabase from '../config/supabase.mjs';
 import crypto from 'node:crypto';
 import { fallbackNameFromRemoteId, looksLikeBotText, pickBestHumanName } from '../utils/message_guard.mjs';
+import {
+    buildRawMessageRecord,
+    buildWhatsAppDownloadableMessage,
+    extractMediaFilename,
+    extractMediaMimeType,
+    extractWhatsAppMediaPayload,
+    isPlaceholderOnlyText,
+    looksLikeWhatsAppChannel,
+    normalizeUuid
+} from '../services/raw_message_ingest.service.mjs';
+import { enrichMediaFile } from '../services/media_enrichment.service.mjs';
+
+function toIsoOrNull(value) {
+    if (value === null || value === undefined || value === '') return null;
+    if (typeof value === 'string') {
+        const parsed = new Date(value);
+        return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+    }
+    if (typeof value === 'number') {
+        const millis = value > 1e12 ? value : value * 1000;
+        const parsed = new Date(millis);
+        return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+    }
+    if (typeof value === 'object') {
+        const candidate = Number(value.low ?? value.high ?? value.value ?? value.toString?.());
+        if (Number.isFinite(candidate)) {
+            const millis = candidate > 1e12 ? candidate : candidate * 1000;
+            const parsed = new Date(millis);
+            return Number.isNaN(parsed.getTime()) ? null : parsed.toISOString();
+        }
+    }
+    return null;
+}
+
+function resolveWhatsAppMessageTimestamp(messageTimestamp, fallbackIso = null) {
+    return toIsoOrNull(messageTimestamp) || fallbackIso || new Date().toISOString();
+}
 
 /**
  * Resetea el temporizador de inactividad para un cliente.
@@ -84,7 +122,13 @@ async function syncAssistantMessageId(clientId, remoteId, logicalText, sentMessa
 
     await supabase
         .from('raw_messages')
-        .update({ metadata: nextMetadata, processed: true })
+        .update({
+            metadata: nextMetadata,
+            processed: true,
+            source_message_id: sentMessageId,
+            channel: 'whatsapp',
+            delivery_status: 'sent'
+        })
         .eq('id', row.id);
 }
 
@@ -120,6 +164,298 @@ const reconnectAttempts = new Map(); // Track reconnect attempts for exponential
 
 // Cache para evitar pedir la foto de perfil en cada mensaje (válida por 1 hora)
 const profilePicCache = new Map();
+const INLINE_MEDIA_ENRICHMENT_CONCURRENCY = 2;
+const HISTORICAL_MEDIA_BACKFILL_LIMIT = 200;
+const HISTORICAL_MEDIA_BACKFILL_MIN_INTERVAL_MS = 5 * 60 * 1000;
+const inlineMediaEnrichmentQueue = [];
+const inlineMediaEnrichmentQueuedIds = new Set();
+const historicalMediaBackfillActive = new Set();
+const historicalMediaBackfillLastAttempt = new Map();
+let inlineMediaEnrichmentActive = 0;
+
+function normalizeSemanticSeed(value = '') {
+    const normalized = String(value || '').replace(/\s+/g, ' ').trim();
+    if (!normalized || isPlaceholderOnlyText(normalized)) return '';
+    return normalized;
+}
+
+function mergeMediaSemanticText(existingText = '', derivedText = '', mediaType = '') {
+    const base = normalizeSemanticSeed(existingText);
+    const derived = normalizeSemanticSeed(derivedText);
+    if (!base && !derived) return '';
+    if (!base) return derived;
+    if (!derived) return base;
+    if (base.toLowerCase() === derived.toLowerCase()) return base;
+
+    const label = mediaType === 'audio'
+        ? 'Transcripcion'
+        : mediaType === 'image'
+            ? 'Descripcion visual'
+            : mediaType === 'document'
+                ? 'Contenido del documento'
+                : 'Descripcion';
+
+    return `${base}\n${label}: ${derived}`.trim();
+}
+
+function fileExtensionForMedia(mediaType = '', mimeType = '') {
+    const normalizedMime = String(mimeType || '').toLowerCase();
+    if (normalizedMime.includes('ogg')) return '.ogg';
+    if (normalizedMime.includes('mpeg')) return '.mp3';
+    if (normalizedMime.includes('wav')) return '.wav';
+    if (normalizedMime.includes('png')) return '.png';
+    if (normalizedMime.includes('jpeg') || normalizedMime.includes('jpg')) return '.jpg';
+    if (normalizedMime.includes('webp')) return '.webp';
+    if (normalizedMime.includes('pdf')) return '.pdf';
+    if (normalizedMime.includes('word')) return '.docx';
+    if (normalizedMime.includes('sheet')) return '.xlsx';
+
+    if (mediaType === 'audio') return '.ogg';
+    if (mediaType === 'image') return '.jpg';
+    if (mediaType === 'video') return '.mp4';
+    if (mediaType === 'document') return '.bin';
+    return '.bin';
+}
+
+function shouldInlineEnrichMedia(mediaType = '') {
+    return ['audio', 'image', 'document'].includes(String(mediaType || '').trim().toLowerCase());
+}
+
+async function updateRawMessageEnrichment(rawMessageId, patch = {}, metadataPatch = {}) {
+    const { data: row, error } = await supabase
+        .from('raw_messages')
+        .select('metadata, processed, semantic_text')
+        .eq('id', rawMessageId)
+        .maybeSingle();
+
+    if (error) throw error;
+
+    const metadata = {
+        ...(row?.metadata || {}),
+        ...(metadataPatch || {})
+    };
+
+    const previousSemantic = normalizeSemanticSeed(row?.semantic_text || row?.metadata?.semantic_text || '');
+    const nextSemantic = normalizeSemanticSeed(
+        patch?.semantic_text
+        ?? metadataPatch?.semantic_text
+        ?? row?.semantic_text
+        ?? row?.metadata?.semantic_text
+        ?? ''
+    );
+    const shouldRequeueProcessing = Boolean(nextSemantic)
+        && row?.processed === true
+        && !metadata?.exclude_from_memory
+        && previousSemantic.toLowerCase() !== nextSemantic.toLowerCase();
+
+    const updatePayload = {
+        ...patch,
+        metadata
+    };
+    if (shouldRequeueProcessing) {
+        updatePayload.processed = false;
+    }
+
+    const { error: updateError } = await supabase
+        .from('raw_messages')
+        .update(updatePayload)
+        .eq('id', rawMessageId);
+
+    if (updateError) throw updateError;
+    return { requeued: shouldRequeueProcessing };
+}
+
+async function runInlineMediaEnrichment({ clientId, rawMessage, downloadableMessage, sock }) {
+    if (!rawMessage?.id || !rawMessage?.media_type || !downloadableMessage?.message) return;
+
+    const rawMessageId = rawMessage.id;
+    const baseSemantic = rawMessage.semantic_text || rawMessage.media_caption || '';
+    const shouldEnrichInline = shouldInlineEnrichMedia(rawMessage.media_type);
+
+    if (!shouldEnrichInline) {
+        const fallbackSemantic = normalizeSemanticSeed(baseSemantic);
+        await updateRawMessageEnrichment(rawMessageId, {
+            semantic_text: fallbackSemantic || null,
+            content_ready: Boolean(fallbackSemantic),
+            media_status: 'captured',
+            enrichment_status: 'unsupported'
+        }, {
+            semantic_text: fallbackSemantic || null,
+            media_status: 'captured',
+            enrichment_status: 'unsupported',
+            last_enriched_at: new Date().toISOString()
+        });
+
+        if (fallbackSemantic && !rawMessage.metadata?.exclude_from_memory) {
+            await triggerMemoryTimer(clientId);
+        }
+        return;
+    }
+
+    await updateRawMessageEnrichment(rawMessageId, {
+        media_status: 'processing',
+        enrichment_status: 'processing'
+    }, {
+        media_status: 'processing',
+        enrichment_status: 'processing'
+    });
+
+    let tempFilePath;
+    try {
+        const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
+        const buffer = await downloadMediaMessage(downloadableMessage, 'buffer', {}, {
+            logger: sock.logger,
+            reuploadRequest: sock.updateMediaMessage
+        });
+
+        const ext = fileExtensionForMedia(rawMessage.media_type, rawMessage.media_mime_type);
+        const tempFileName = `${clientId}_${rawMessage.source_message_id || rawMessage.id}_${crypto.randomBytes(4).toString('hex')}${ext}`;
+        tempFilePath = `./uploads/${tempFileName}`;
+
+        await fs.mkdir('./uploads', { recursive: true });
+        await fs.writeFile(tempFilePath, buffer);
+
+        const enrichment = await enrichMediaFile({
+            filePath: tempFilePath,
+            mediaType: rawMessage.media_type,
+            mimeType: rawMessage.media_mime_type,
+            originalName: rawMessage.metadata?.mediaFilename || rawMessage.metadata?.filename || tempFileName
+        });
+
+        const mergedSemanticText = mergeMediaSemanticText(baseSemantic, enrichment.semanticText, rawMessage.media_type);
+
+        await updateRawMessageEnrichment(rawMessageId, {
+            semantic_text: mergedSemanticText || null,
+            content_ready: Boolean(mergedSemanticText),
+            media_status: mergedSemanticText ? 'enriched' : 'failed',
+            enrichment_status: mergedSemanticText ? 'ready' : 'failed'
+        }, {
+            semantic_text: mergedSemanticText || null,
+            media_status: mergedSemanticText ? 'enriched' : 'failed',
+            enrichment_status: mergedSemanticText ? 'ready' : 'failed',
+            enrichment_kind: enrichment.enrichmentKind || null,
+            last_enriched_at: new Date().toISOString()
+        });
+
+        if (mergedSemanticText && !rawMessage.metadata?.exclude_from_memory) {
+            await triggerMemoryTimer(clientId);
+        }
+    } catch (error) {
+        const fallbackSemantic = normalizeSemanticSeed(baseSemantic);
+        await updateRawMessageEnrichment(rawMessageId, {
+            semantic_text: fallbackSemantic || null,
+            content_ready: Boolean(fallbackSemantic),
+            media_status: 'failed',
+            enrichment_status: 'failed'
+        }, {
+            semantic_text: fallbackSemantic || null,
+            media_status: 'failed',
+            enrichment_status: 'failed',
+            enrichment_error: error.message,
+            last_enriched_at: new Date().toISOString()
+        }).catch(() => { });
+        console.warn(`[WhatsApp Media] Error enriqueciendo ${rawMessageId}: ${error.message}`);
+        if (fallbackSemantic && !rawMessage.metadata?.exclude_from_memory) {
+            await triggerMemoryTimer(clientId);
+        }
+    } finally {
+        if (tempFilePath) {
+            await fs.unlink(tempFilePath).catch(() => { });
+        }
+    }
+}
+
+function drainInlineMediaEnrichmentQueue() {
+    while (inlineMediaEnrichmentActive < INLINE_MEDIA_ENRICHMENT_CONCURRENCY && inlineMediaEnrichmentQueue.length > 0) {
+        const job = inlineMediaEnrichmentQueue.shift();
+        inlineMediaEnrichmentActive += 1;
+
+        Promise.resolve()
+            .then(() => runInlineMediaEnrichment(job))
+            .catch(error => {
+                console.warn(`[WhatsApp Media] Cola inline falló: ${error.message}`);
+            })
+            .finally(() => {
+                if (job?.rawMessage?.id) {
+                    inlineMediaEnrichmentQueuedIds.delete(job.rawMessage.id);
+                }
+                inlineMediaEnrichmentActive = Math.max(0, inlineMediaEnrichmentActive - 1);
+                drainInlineMediaEnrichmentQueue();
+            });
+    }
+}
+
+function scheduleInlineMediaEnrichment(job) {
+    const rawMessageId = job?.rawMessage?.id;
+    if (rawMessageId && inlineMediaEnrichmentQueuedIds.has(rawMessageId)) return;
+    if (rawMessageId) {
+        inlineMediaEnrichmentQueuedIds.add(rawMessageId);
+    }
+    inlineMediaEnrichmentQueue.push(job);
+    drainInlineMediaEnrichmentQueue();
+}
+
+async function backfillHistoricalMediaForClient(clientId, clientSlug, sock) {
+    const backfillKey = String(clientId);
+    if (historicalMediaBackfillActive.has(backfillKey)) return;
+    historicalMediaBackfillActive.add(backfillKey);
+
+    try {
+        const { data: rows, error } = await supabase
+            .from('raw_messages')
+            .select('id, client_id, remote_id, sender_role, source_message_id, participant_jid, semantic_text, media_caption, media_type, media_mime_type, content_ready, processed, enrichment_status, channel, metadata')
+            .eq('client_id', clientId)
+            .eq('has_media', true)
+            .or('content_ready.eq.false,enrichment_status.eq.pending,enrichment_status.eq.failed')
+            .order('created_at', { ascending: true })
+            .limit(HISTORICAL_MEDIA_BACKFILL_LIMIT);
+
+        if (error) throw error;
+
+        const candidates = (rows || []).filter(row => {
+            if (!row?.id || !row?.source_message_id || !row?.metadata?.mediaPayload) return false;
+            return looksLikeWhatsAppChannel(row.channel, row.remote_id, row.participant_jid || row.metadata?.participantJid);
+        });
+
+        if (!candidates.length) {
+            console.log(`[${clientSlug}] ðŸŽ¯ No hay media histÃ³rica pendiente para rehidratar.`);
+            return;
+        }
+
+        console.log(`[${clientSlug}] ðŸ§ª Rehidratando ${candidates.length} raws multimedia histÃ³ricos pendientes...`);
+
+        for (const row of candidates) {
+            scheduleInlineMediaEnrichment({
+                clientId,
+                sock,
+                rawMessage: row,
+                downloadableMessage: buildWhatsAppDownloadableMessage({
+                    remoteJid: row.remote_id,
+                    messageId: row.source_message_id,
+                    fromMe: row.sender_role === 'Yo' || row.sender_role === 'assistant',
+                    participantJid: row.participant_jid || row.metadata?.participantJid || null,
+                    mediaPayload: row.metadata?.mediaPayload || null
+                })
+            });
+        }
+    } catch (error) {
+        console.warn(`[${clientSlug}] âš ï¸ Backfill de media histÃ³rica fallÃ³: ${error.message}`);
+    } finally {
+        historicalMediaBackfillActive.delete(backfillKey);
+    }
+}
+
+function maybeScheduleHistoricalMediaBackfill(clientId, clientSlug, sock, delayMs = 12000) {
+    const backfillKey = String(clientId);
+    const lastAttempt = historicalMediaBackfillLastAttempt.get(backfillKey) || 0;
+    if (Date.now() - lastAttempt < HISTORICAL_MEDIA_BACKFILL_MIN_INTERVAL_MS) return;
+    historicalMediaBackfillLastAttempt.set(backfillKey, Date.now());
+    setTimeout(() => {
+        backfillHistoricalMediaForClient(clientId, clientSlug, sock).catch(error => {
+            console.warn(`[${clientSlug}] âš ï¸ No se pudo lanzar el backfill multimedia: ${error.message}`);
+        });
+    }, delayMs);
+}
 
 // --- HIBERNACIÓN DE SESIONES (WAKE/SLEEP) ---
 const MAX_IDLE_TIME_MS = 48 * 60 * 60 * 1000; // 48 horas de inactividad
@@ -215,7 +551,14 @@ async function checkRateLimit(clientId, senderId) {
  * Inicia una sesión WebSocket pura para WhatsApp (Consumo: ~10MB RAM)
  */
 export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = null) {
-    const sessionKey = String(clientId);
+    const normalizedClientId = normalizeUuid(clientId, null);
+    if (!normalizedClientId) {
+        console.error(`[WhatsApp-Baileys] Invalid clientId for ${clientSlug}:`, clientId);
+        return { status: 'error', message: 'client_id inválido para iniciar WhatsApp.' };
+    }
+
+    clientId = normalizedClientId;
+    const sessionKey = normalizedClientId;
     if (startingSessions.has(sessionKey)) {
         console.log(`[WhatsApp-Baileys] ⏳ Bloqueado por candado: ${clientSlug} (${sessionKey}) ya se está iniciando.`);
         return { status: 'starting' };
@@ -269,7 +612,6 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
     sock = makeWASocket({
         auth: state,
         version: waVersion,
-        printQRInTerminal: !phoneNumber,
         browser: ['Mac OS', 'Chrome', '121.0.6167.85'],
         syncFullHistory: true, // Re-activado para capturar mensajes no leídos (Inbox)
         markOnlineOnConnect: true,
@@ -397,6 +739,12 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 } catch (welcomeErr) {
                     console.warn(`[🤖 Self-Chat AI] ⚠️ Error enviando bienvenida:`, welcomeErr.message);
                 }
+                setTimeout(() => {
+                    backfillHistoricalMediaForClient(clientId, clientSlug, sock).catch(error => {
+                        console.warn(`[${clientSlug}] âš ï¸ No se pudo lanzar el backfill multimedia: ${error.message}`);
+                    });
+                }, 12000);
+                maybeScheduleHistoricalMediaBackfill(clientId, clientSlug, sock, 12000);
             }, 6000); // 6s to ensure session is fully ready
         }
     });
@@ -476,12 +824,12 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
 
             const { data: existingRows } = await supabase
                 .from('raw_messages')
-                .select('metadata')
+                .select('id, metadata, source_message_id')
                 .eq('client_id', clientId);
-            const knownMsgIds = new Set(
+            const knownRowsByMsgId = new Map(
                 (existingRows || [])
-                    .map(row => row.metadata?.msgId)
-                    .filter(Boolean)
+                    .map(row => [row.source_message_id || row.metadata?.msgId, row])
+                    .filter(([msgId]) => Boolean(msgId))
             );
 
             // Sincronizar metadatos de grupos iniciales
@@ -517,7 +865,9 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
             let totalHistorySaved = 0;
             let unreadsTagged = 0;
             let messagesToInsert = [];
+            const historyMediaJobsById = new Map();
             const historyIdentityCache = new Map();
+            let totalHistoryUpgraded = 0;
 
             for (const chat of chats) {
                 const chatMessages = (messages || []).filter(m => m.key.remoteJid === chat.id);
@@ -531,17 +881,13 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 const unreadMsgIds = new Set(unreadMsgs.map(m => m.key.id));
 
                 for (const msg of chatMessages) {
-                    // Filtrar mensajes basura del protocolo de Meta (cifrado, sender keys)
                     if (msg.message?.protocolMessage || msg.message?.senderKeyDistributionMessage) continue;
-                    if (knownMsgIds.has(msg.key.id)) continue;
 
                     const text = extractMessageContent(msg.message);
-                    if (!text && !msg.message?.imageMessage && !msg.message?.audioMessage && !msg.message?.videoMessage) continue;
+                    if (!text && !msg.message?.imageMessage && !msg.message?.audioMessage && !msg.message?.videoMessage && !msg.message?.documentMessage && !msg.message?.stickerMessage) continue;
 
                     const isSentByMe = msg.key.fromMe;
                     const isUnread = unreadMsgIds.has(msg.key.id);
-
-                    // 💎 Extracción de Metadatos Ricos para 10K History
                     const quotedMessageId = msg.message?.extendedTextMessage?.contextInfo?.stanzaId || null;
                     const pushName = msg.pushName || null;
                     const participantJid = chat.id.endsWith('@g.us') ? msg.key.participant : chat.id;
@@ -549,42 +895,73 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                         ? 'Yo'
                         : await resolveCachedIdentityName(historyIdentityCache, clientId, participantJid, pushName);
                     const conversationName = chat.name || chat.id;
-
-                    let mediaPayload = null;
-                    if (msg.message?.imageMessage) mediaPayload = { imageMessage: msg.message.imageMessage };
-                    else if (msg.message?.audioMessage) mediaPayload = { audioMessage: msg.message.audioMessage };
-                    else if (msg.message?.videoMessage) mediaPayload = { videoMessage: msg.message.videoMessage };
-                    else if (msg.message?.documentMessage) mediaPayload = { documentMessage: msg.message.documentMessage };
-                    else if (msg.message?.stickerMessage) mediaPayload = { stickerMessage: msg.message.stickerMessage };
-                    const historyContent = text || (msg.message?.imageMessage ? `[Imagen: ${msg.key.id}]` : (msg.message?.videoMessage ? `[Video: ${msg.key.id}]` : `[Audio: ${msg.key.id}]`));
+                    const mediaPayload = extractWhatsAppMediaPayload(msg.message);
+                    const messageTimestampIso = resolveWhatsAppMessageTimestamp(msg.messageTimestamp);
+                    const historyContent = text || '';
                     const excludeFromHistoryMemory = isSentByMe && looksLikeBotText(historyContent);
+                    const existingRow = knownRowsByMsgId.get(msg.key.id) || null;
+                    const shouldUpgradeExistingRow = Boolean(existingRow)
+                        && Boolean(mediaPayload)
+                        && !existingRow?.metadata?.mediaPayload;
+                    if (existingRow && !shouldUpgradeExistingRow) continue;
 
-                    messagesToInsert.push({
-                        client_id: clientId,
-                        remote_id: chat.id,
-                        sender_role: isSentByMe
+                    const rawRecord = buildRawMessageRecord({
+                        id: shouldUpgradeExistingRow ? existingRow.id : undefined,
+                        clientId,
+                        senderRole: isSentByMe
                             ? 'user_sent'
                             : (canonicalSenderName || fallbackNameFromRemoteId(participantJid) || 'Contacto'),
                         content: historyContent,
+                        remoteId: chat.id,
+                        createdAt: messageTimestampIso,
                         processed: excludeFromHistoryMemory,
+                        channel: 'whatsapp',
+                        sourceMessageId: msg.key.id,
+                        participantJid,
+                        canonicalSenderName: canonicalSenderName || fallbackNameFromRemoteId(participantJid) || null,
+                        conversationName,
+                        isGroup: chat.id.endsWith('@g.us'),
+                        isHistory: true,
+                        quotedMessageId,
+                        pushName,
+                        deliveryStatus: isSentByMe ? 'read' : 'sent',
+                        mediaPayload,
+                        mediaMimeType: extractMediaMimeType(mediaPayload),
+                        mediaFilename: extractMediaFilename(mediaPayload, msg.key.id),
+                        excludeFromMemory: excludeFromHistoryMemory,
                         metadata: {
-                            msgId: msg.key.id,
-                            timestamp: msg.messageTimestamp ? new Date(msg.messageTimestamp * 1000).toISOString() : new Date().toISOString(),
-                            isHistory: true,
-                            is_new_unread: isUnread, // 🔑 ESTO LE DICE AL WORKER SI DEBE CREAR TARJETA DE INBOX O NO
-                            channel: 'whatsapp',
-                            participantJid,
-                            status: isSentByMe ? 'read' : 'sent',
-                            quotedMessageId: quotedMessageId,
-                            pushName: pushName,
-                            canonicalSenderName: canonicalSenderName || fallbackNameFromRemoteId(participantJid) || null,
-                            conversationName,
-                            mediaPayload: mediaPayload,
-                            exclude_from_memory: excludeFromHistoryMemory
+                            ...(existingRow?.metadata || {}),
+                            is_new_unread: isUnread
                         }
                     });
-                    knownMsgIds.add(msg.key.id);
 
+                    if (!rawRecord.client_id) {
+                        console.warn(`[${clientSlug}] Omitiendo raw histórico ${msg.key.id}: client_id inválido.`);
+                        continue;
+                    }
+
+                    messagesToInsert.push(rawRecord);
+                    if (rawRecord.has_media) {
+                        historyMediaJobsById.set(rawRecord.id, {
+                            clientId,
+                            rawMessage: rawRecord,
+                            downloadableMessage: buildWhatsAppDownloadableMessage({
+                                remoteJid: chat.id,
+                                messageId: msg.key.id,
+                                fromMe: isSentByMe,
+                                participantJid,
+                                mediaPayload
+                            }),
+                            sock
+                        });
+                    }
+
+                    knownRowsByMsgId.set(msg.key.id, {
+                        id: rawRecord.id,
+                        source_message_id: rawRecord.source_message_id,
+                        metadata: rawRecord.metadata
+                    });
+                    if (shouldUpgradeExistingRow) totalHistoryUpgraded++;
                     if (isUnread) unreadsTagged++;
                 }
             }
@@ -598,10 +975,14 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 for (let i = 0; i < messagesToInsert.length; i += BATCH_SIZE) {
                     const batch = messagesToInsert.slice(i, i + BATCH_SIZE);
                     try {
-                        const res = await supabase.from('raw_messages').insert(batch);
+                        const res = await supabase.from('raw_messages').upsert(batch, { onConflict: 'id' });
                         console.log(`[${clientSlug}] Lote ${i / BATCH_SIZE} Status: ${res.status} | Data: ${!!res.data} | Err: ${res.error?.message || 'none'}`);
                         if (!res.error) {
                             totalHistorySaved += batch.length;
+                            for (const row of batch) {
+                                const mediaJob = historyMediaJobsById.get(row.id);
+                                if (mediaJob) scheduleInlineMediaEnrichment(mediaJob);
+                            }
                         } else {
                             console.error(`[${clientSlug}] ❌ Fallo fatal (Lote ${i / BATCH_SIZE}):`, res.error.message);
                         }
@@ -624,6 +1005,7 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
     sock.ev.on('messages.upsert', async (m) => {
         console.log(`[${clientSlug}] 🔍 messages.upsert triggered. Type: ${m.type}, Count: ${m.messages?.length}`);
 
+        maybeScheduleHistoricalMediaBackfill(clientId, clientSlug, sock, 4000);
         for (const msg of m.messages) {
             try {
                 const textRaw = extractMessageContent(msg.message);
@@ -644,7 +1026,7 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                     } catch (cacheErr) { }
                 }
 
-                if (!msg.message || (!textRaw && !msg.message.imageMessage && !msg.message.audioMessage && !msg.message.videoMessage)) {
+                if (!msg.message || (!textRaw && !msg.message.imageMessage && !msg.message.audioMessage && !msg.message.videoMessage && !msg.message.documentMessage && !msg.message.stickerMessage)) {
                     // Solo loguear si es el único mensaje o si es relevante
                     if (m.messages.length === 1) console.log(`[${clientSlug}] ℹ️ Mensaje sin contenido útil ignorado (msgId=${msg.key.id}).`);
                     continue;
@@ -718,63 +1100,14 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 lastActivity.set(sessionKey, Date.now());
 
                 let text = extractMessageContent(msgContent);
-                let mediaDescription = '';
+                const mediaPayload = extractWhatsAppMediaPayload(msgContent);
+                let finalText = text || '';
 
-                // Procesar Media (DELEGADO AL MEDIA WORKER)
-                if (hasImage || hasAudio || hasDocument) {
-                    try {
-                        const { downloadMediaMessage } = await import('@whiskeysockets/baileys');
-                        const crypto = await import('crypto');
-                        const fs = await import('fs/promises');
-
-                        const buffer = await downloadMediaMessage(msg, 'buffer', {});
-                        const type = hasImage ? 'image' : hasAudio ? 'audio' : 'document';
-
-                        const ext = hasImage ? '.jpg' : hasAudio ? '.ogg' : '.ext';
-                        const tempFileName = `${clientId}_${crypto.randomBytes(4).toString('hex')}${ext}`;
-                        const tempFilePath = `./uploads/${tempFileName}`;
-
-                        await fs.mkdir('./uploads', { recursive: true });
-                        await fs.writeFile(tempFilePath, buffer);
-
-                        console.log(`[Queue] 📸 Encolando media (${type}) a mediaProcessingQueue para ${clientSlug}...`);
-                        await mediaQueue.add('process_media', {
-                            clientId,
-                            clientSlug,
-                            senderId,
-                            participantJid,
-                            isSentByMe,
-                            pushName,
-                            isGroup,
-                            text: text || '',
-                            type,
-                            tempFilePath,
-                            mimetype: msgContent.imageMessage?.mimetype || msgContent.audioMessage?.mimetype || msgContent.documentMessage?.mimetype,
-                            filename: msgContent.documentMessage?.fileName || tempFileName
-                        }, { removeOnComplete: true });
-
-                        // El flujo de mensaje se detiene aquí para esta interacción.
-                        // El media_worker retomará la conversión a texto pura e impulsará a incomingQueue.
-                        return;
-
-                    } catch (e) {
-                        console.warn(`[${clientSlug}] ⚠️ Media Download Error:`, e.message);
-                        mediaDescription = '[Error descargando adjunto]';
-                    }
+                if (!finalText && !mediaPayload) {
+                    if (isSentByMe) finalText = '[Mensaje del usuario]';
                 }
 
-                let finalText = [mediaDescription, text].filter(Boolean).join(' ');
-
-                // Fallback
-                if (!finalText) {
-                    if (hasImage) finalText = '[Imagen]';
-                    else if (hasAudio) finalText = '[Audio]';
-                    else if (hasVideo) finalText = '[Video]';
-                    else if (hasSticker) finalText = '[Sticker]';
-                    else if (isSentByMe) finalText = '[Mensaje del usuario]';
-                }
-
-                if (!finalText) {
+                if (!finalText && !mediaPayload) {
                     console.log(`[${clientSlug}] ℹ️ Mensaje vacío ignorado. Tipos presentes: ${Object.keys(msgContent).join(', ')}`);
                     // Debug extra: si es protocolMessage, ver qué trae
                     if (msgContent.protocolMessage) {
@@ -783,11 +1116,7 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                     return;
                 }
 
-                console.log(`[${clientSlug} - ${isSentByMe ? 'Sent' : 'Recv'}]: ${finalText.slice(0, 50)}...`);
-                const assistantEcho = isSentByMe
-                    ? await consumeTrackedOutboundMessage(clientId, senderId, finalText)
-                    : null;
-                const excludeFromMemory = Boolean(assistantEcho?.exclude_from_memory) || (isSentByMe && looksLikeBotText(finalText));
+                console.log(`[${clientSlug} - ${isSentByMe ? 'Sent' : 'Recv'}]: ${(finalText || '[Media]').slice(0, 50)}...`);
                 const groupMeta = isGroup ? await discoverWhatsAppGroup(clientId, senderId).catch(() => null) : null;
                 const conversationName = isGroup
                     ? (pickBestHumanName(groupMeta?.subject, fallbackNameFromRemoteId(senderId)) || senderId)
@@ -807,36 +1136,74 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                     }
                 }
 
-                // INSERTAR EN DB
-                const supabase = (await import('../config/supabase.mjs')).default;
-                const { error: dbErr, data: insertedRows } = await supabase.from('raw_messages').insert([{
-                    client_id: clientId,
-                    sender_role: isSentByMe ? 'user_sent' : pushName,
+                const messageTimestampIso = resolveWhatsAppMessageTimestamp(msg.messageTimestamp);
+                const baseRecord = buildRawMessageRecord({
+                    clientId,
+                    senderRole: isSentByMe ? 'user_sent' : pushName,
                     content: finalText,
-                    remote_id: senderId, // This acts as conversation/group ID
+                    remoteId: senderId,
+                    createdAt: messageTimestampIso,
+                    processed: false,
+                    channel: 'whatsapp',
+                    sourceMessageId: msg.key.id,
+                    participantJid,
+                    canonicalSenderName: isSentByMe ? 'Yo' : pushName,
+                    conversationName,
+                    isGroup,
+                    isHistory: false,
+                    quotedMessageId: msg.message?.extendedTextMessage?.contextInfo?.stanzaId || null,
+                    pushName,
+                    avatarUrl,
+                    deliveryStatus: isSentByMe ? 'sent' : 'read',
+                    mediaPayload,
+                    mediaMimeType: extractMediaMimeType(mediaPayload),
+                    mediaFilename: extractMediaFilename(mediaPayload, msg.key.id),
+                    metadata: {}
+                });
+                const previewText = baseRecord.semantic_text || baseRecord.content;
+                const assistantEcho = isSentByMe
+                    ? await consumeTrackedOutboundMessage(clientId, senderId, previewText)
+                    : null;
+                const excludeFromMemory = Boolean(assistantEcho?.exclude_from_memory) || (isSentByMe && looksLikeBotText(previewText));
+                const rawRecord = buildRawMessageRecord({
+                    ...baseRecord,
                     processed: excludeFromMemory,
+                    excludeFromMemory,
+                    assistantEcho: Boolean(assistantEcho),
+                    generatedBy: assistantEcho?.generated_by || null,
                     metadata: {
-                        pushName,
-                        channel: 'whatsapp',
-                        isGroup,
-                        hasMedia: !!mediaDescription,
-                        historical: false,
-                        avatarUrl,
-                        participantJid,
-                        msgId: msg.key.id,
-                        status: isSentByMe ? 'sent' : 'read',
-                        canonicalSenderName: isSentByMe ? 'Yo' : pushName,
-                        conversationName,
-                        exclude_from_memory: excludeFromMemory,
-                        assistant_echo: Boolean(assistantEcho),
-                        generated_by: assistantEcho?.generated_by || null
+                        ...(baseRecord.metadata || {})
                     }
-                }]).select('id, created_at');
+                });
+
+                if (!rawRecord.client_id) {
+                    console.warn(`[${clientSlug}] Omitiendo raw en tiempo real ${msg.key.id}: client_id inválido.`);
+                    continue;
+                }
+
+                const { error: dbErr, data: insertedRows } = await supabase
+                    .from('raw_messages')
+                    .insert([rawRecord])
+                    .select('id, created_at');
 
                 if (dbErr) {
                     console.error(`[${clientSlug}] ❌ DB Insert Error:`, dbErr.message);
                 } else {
                     console.log(`[${clientSlug}] ✅ Message stored in raw_messages`);
+                    if (rawRecord.has_media) {
+                        scheduleInlineMediaEnrichment({
+                            clientId,
+                            rawMessage: rawRecord,
+                            downloadableMessage: buildWhatsAppDownloadableMessage({
+                                remoteJid: senderId,
+                                messageId: msg.key.id,
+                                fromMe: isSentByMe,
+                                participantJid,
+                                mediaPayload
+                            }),
+                            sock
+                        });
+                    }
 
                     // 🔴 BROADCAST: Real-time WebSocket event for the native clone
                     if (global.__wss) {
@@ -847,12 +1214,12 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                                 conversation_id: senderId,
                                 participant_jid: participantJid,
                                 id: msg.key.id, // Usamos el ID de Baileys para tracking en el front
-                                text: finalText,
+                                text: rawRecord.semantic_text || rawRecord.content,
                                 from_me: isSentByMe,
-                                timestamp: insertedMsg?.created_at || new Date().toISOString(),
+                                timestamp: messageTimestampIso || insertedMsg?.created_at || new Date().toISOString(),
                                 sender_name: isSentByMe ? 'Yo' : pushName,
                                 media_url: null,
-                                media_type: null,
+                                media_type: rawRecord.media_type,
                                 status: isSentByMe ? 'sent' : 'read'
                             }
                         });
@@ -865,7 +1232,7 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                 }
 
                 // Notificar al worker de memoria (Amnesia Consolidator) en cada interacción
-                if (!excludeFromMemory) {
+                if (!excludeFromMemory && !rawRecord.has_media) {
                     await triggerMemoryTimer(clientId);
                 }
 
@@ -896,11 +1263,12 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                         continue;
                     }
                     // 🛡️ Evitar bucle: No procesar mensajes que el propio bot generó
-                    if (finalText.startsWith('🤖') || finalText.startsWith('[OpenClaw')) {
+                    const selfChatText = finalText || previewText || rawRecord.semantic_text || rawRecord.content || '';
+                    if (selfChatText.startsWith('🤖') || selfChatText.startsWith('[OpenClaw')) {
                         console.log(`[🤖 Self-Chat AI] ℹ️ Ignorando mensaje propio del bot.`);
                     } else {
                         // 🧠 El usuario está hablando consigo mismo → Activar el Asistente IA
-                        console.log(`[🤖 Self-Chat AI] 📬 Pregunta del usuario detectada: "${finalText.slice(0, 60)}..."`);
+                        console.log(`[🤖 Self-Chat AI] 📬 Pregunta del usuario detectada: "${selfChatText.slice(0, 60)}..."`);
 
                         // 🔥 FEEDBACK VISUAL: Mostrar "escribiendo..." inmediatamente
                         try {
@@ -915,7 +1283,7 @@ export async function startWhatsAppClient(clientId, clientSlug, phoneNumber = nu
                             clientSlug,
                             channel: 'whatsapp',
                             senderId, // Responderá al propio JID del usuario
-                            text: finalText,
+                            text: selfChatText,
                             isSentByMe: true,
                             metadata: { pushName: 'Yo (Asistente)', isGroup: false, isSelfChat: true }
                         }, {
@@ -1079,7 +1447,6 @@ export async function getWhatsAppStatus(clientId) {
 /**
  * Cierra la sesión y opcionalmente borra los archivos si se desvincula por completo
  */
-import fs from 'fs/promises';
 /**
  * Envía un mensaje simulando comportamiento humano (Typing... + Delay aleatorio)
  * para reducir el riesgo de baneos de WhatsApp.
@@ -1197,12 +1564,23 @@ export async function fetchHistoricalMedia(clientId, remoteJid, messageId) {
         console.log(`[Lazy Media] 🔍 Buscando BD metadata histórica para ${messageId}...`);
 
         // 1. Obtener los metadatos y las llaves de desencriptado directamente de PostgreSQL
-        const { data: records, error } = await supabase
+        let { data: records, error } = await supabase
             .from('raw_messages')
             .select('metadata')
             .eq('client_id', clientId)
-            .contains('metadata', { msgId: messageId })
+            .eq('source_message_id', messageId)
             .limit(1);
+
+        if ((!records || records.length === 0) && !error) {
+            const fallback = await supabase
+                .from('raw_messages')
+                .select('metadata')
+                .eq('client_id', clientId)
+                .contains('metadata', { msgId: messageId })
+                .limit(1);
+            records = fallback.data;
+            error = fallback.error;
+        }
 
         if (error || !records || records.length === 0) {
             throw new Error(`Mensaje ${messageId} no encontrado en la base de datos local.`);

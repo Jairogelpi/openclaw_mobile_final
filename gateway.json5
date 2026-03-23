@@ -1,4 +1,4 @@
-﻿{
+{
   "logging": {
     "level": "info"
   },
@@ -28,7 +28,7 @@
     "port": 3001,
     "auth": {
       "mode": "token",
-      "token": "64a329039125d3765dcb73d60ba93580a15f3272ab6139b6"
+      "token": "${OPENCLAW_GATEWAY_TOKEN}"
     }
   },
   "plugins": {

@@ -3,12 +3,70 @@ import { generateEmbedding } from './local_ai.mjs';
 import redisClient from '../config/redis.mjs';
 import { resolveIdentityCandidates } from './identity.service.mjs';
 import {
+    deriveEffectiveEntityType,
     expandDetectedNamesConservatively,
     normalizeEntityName,
     sanitizeEntityType,
     sanitizeRelationType
 } from '../utils/knowledge_guard.mjs';
+import { isPhoneLikeGraphName } from '../utils/graph_admissibility_policy.mjs';
 import { normalizeComparableText } from '../utils/message_guard.mjs';
+import {
+    computeEdgeStability,
+    computeNodeStability,
+    isStableTier
+} from '../utils/stable_graph_policy.mjs';
+
+const EXCLUSIVE_RELATION_TYPES = new Set([
+    '[PAREJA_DE]',
+    '[VIVE_EN]',
+    '[TRABAJA_EN]',
+    '[ESTUDIA_EN]'
+]);
+
+const SYMMETRIC_RELATION_TYPES = new Set([
+    '[AMISTAD]',
+    '[PAREJA_DE]',
+    '[CONOCE_A]',
+    '[FAMILIA_DE]',
+    '[RELACIONADO_CON]',
+    '[EVENTO_CON]'
+]);
+
+const GENERIC_ALIAS_STOPWORDS = new Set([
+    'el',
+    'ella',
+    'ellos',
+    'ellas',
+    'lo',
+    'la',
+    'alguien',
+    'persona',
+    'contacto',
+    'amigo',
+    'amiga'
+]);
+
+function canonicalizeEdgeDirection(sourceName, targetName, relationType) {
+    const sourceNode = String(sourceName || '').trim();
+    const targetNode = String(targetName || '').trim();
+    const canonicalRelationType = String(relationType || '').trim();
+
+    if (!SYMMETRIC_RELATION_TYPES.has(canonicalRelationType)) {
+        return { sourceNode, targetNode };
+    }
+
+    const sourceKey = normalizeComparableText(sourceNode);
+    const targetKey = normalizeComparableText(targetNode);
+    if (!sourceKey || !targetKey || sourceKey <= targetKey) {
+        return { sourceNode, targetNode };
+    }
+
+    return {
+        sourceNode: targetNode,
+        targetNode: sourceNode
+    };
+}
 
 function buildCitationLabel(prefix, id) {
     return `${prefix}${String(id || '').slice(0, 8)}`;
@@ -109,11 +167,242 @@ function cryptoRandomId() {
     return `tmp_${Math.random().toString(36).slice(2, 10)}`;
 }
 
+function mergeSourceTags(...sets) {
+    const merged = new Set();
+    for (const sourceSet of sets) {
+        const values = Array.isArray(sourceSet) ? sourceSet : [sourceSet];
+        for (const value of values) {
+            const tag = String(value || '').trim();
+            if (!tag) continue;
+            merged.add(tag);
+        }
+    }
+    return [...merged];
+}
+
+function nowIso() {
+    return new Date().toISOString();
+}
+
+async function upsertEntityMentionAggregate(clientId, entityName, entityType, description, options = {}) {
+    try {
+        const { data: exactMention, error: selectError } = await supabase
+            .from('entity_mentions')
+            .select('id, support_count, stable_score, stability_tier, description, source_tags, metadata')
+            .eq('client_id', clientId)
+            .eq('entity_name', entityName)
+            .maybeSingle();
+
+        if (selectError) throw selectError;
+
+        const nextSupportCount = Number(exactMention?.support_count || 0) + 1;
+        const nextSourceTags = mergeSourceTags(exactMention?.source_tags || [], options.source || '');
+        const finalDescription = String(description || '').trim() || String(exactMention?.description || '').trim();
+        const metadata = {
+            ...(exactMention?.metadata || {}),
+            ...(options.metadata || {}),
+            mention_kind: 'entity',
+            latest_source: options.source || exactMention?.metadata?.latest_source || null
+        };
+        if (options.remoteId) metadata.remote_id = options.remoteId;
+
+        const stability = computeNodeStability({
+            entityName,
+            entityType,
+            description: finalDescription,
+            supportCount: nextSupportCount,
+            source: options.source || '',
+            sourceTags: nextSourceTags,
+            existingScore: exactMention?.stable_score || 0,
+            existingTier: exactMention?.stability_tier || 'candidate'
+        });
+
+        const payload = {
+            client_id: clientId,
+            entity_name: entityName,
+            entity_type: entityType,
+            description: finalDescription || null,
+            remote_id: options.remoteId || exactMention?.metadata?.remote_id || null,
+            support_count: nextSupportCount,
+            stable_score: stability.score,
+            stability_tier: stability.tier,
+            source_tags: nextSourceTags,
+            metadata,
+            last_seen: nowIso(),
+            updated_at: nowIso()
+        };
+
+        if (!exactMention?.id) {
+            payload.first_seen = nowIso();
+        }
+
+        const { data: savedMention, error: upsertError } = await supabase
+            .from('entity_mentions')
+            .upsert(payload, { onConflict: 'client_id, entity_name' })
+            .select('id, support_count, stable_score, stability_tier, source_tags, description')
+            .single();
+
+        if (upsertError) throw upsertError;
+
+        return {
+            mentionId: savedMention.id,
+            supportCount: Number(savedMention.support_count || nextSupportCount),
+            sourceTags: savedMention.source_tags || nextSourceTags,
+            description: String(savedMention.description || finalDescription || '').trim(),
+            stability: {
+                score: Number(savedMention.stable_score || stability.score),
+                tier: String(savedMention.stability_tier || stability.tier),
+                promote: isStableTier(savedMention.stability_tier || stability.tier)
+            }
+        };
+    } catch (error) {
+        console.warn('[Graph Service] entity mention staging unavailable:', error.message);
+        return null;
+    }
+}
+
+async function upsertRelationMentionAggregate(clientId, sourceNode, targetNode, relationType, weight, context, flags = [], options = {}) {
+    try {
+        const { data: exactMention, error: selectError } = await supabase
+            .from('relation_mentions')
+            .select('id, support_count, stable_score, stability_tier, context, cognitive_flags, source_tags, metadata')
+            .eq('client_id', clientId)
+            .eq('source_node', sourceNode)
+            .eq('relation_type', relationType)
+            .eq('target_node', targetNode)
+            .maybeSingle();
+
+        if (selectError) throw selectError;
+
+        const nextSupportCount = Number(exactMention?.support_count || 0) + 1;
+        const nextSourceTags = mergeSourceTags(exactMention?.source_tags || [], options.source || '');
+        const mergedFlags = [
+            ...new Set([
+                ...(Array.isArray(exactMention?.cognitive_flags) ? exactMention.cognitive_flags : []),
+                ...(Array.isArray(flags) ? flags : [flags]).filter(Boolean)
+            ])
+        ];
+        const finalContext = String(context || '').trim().slice(0, 500) || String(exactMention?.context || '').trim() || null;
+        const metadata = {
+            ...(exactMention?.metadata || {}),
+            ...(options.metadata || {}),
+            mention_kind: 'relation',
+            latest_source: options.source || exactMention?.metadata?.latest_source || null
+        };
+        const stability = computeEdgeStability({
+            relationType,
+            context: finalContext,
+            weight,
+            supportCount: nextSupportCount,
+            source: options.source || '',
+            sourceTags: nextSourceTags,
+            flags: mergedFlags,
+            existingScore: exactMention?.stable_score || 0,
+            existingTier: exactMention?.stability_tier || 'candidate'
+        });
+
+        const payload = {
+            client_id: clientId,
+            source_node: sourceNode,
+            relation_type: relationType,
+            target_node: targetNode,
+            context: finalContext,
+            support_count: nextSupportCount,
+            stable_score: stability.score,
+            stability_tier: stability.tier,
+            cognitive_flags: mergedFlags,
+            source_tags: nextSourceTags,
+            metadata,
+            last_seen: nowIso(),
+            updated_at: nowIso()
+        };
+
+        if (!exactMention?.id) {
+            payload.first_seen = nowIso();
+        }
+
+        const { data: savedMention, error: upsertError } = await supabase
+            .from('relation_mentions')
+            .upsert(payload, { onConflict: 'client_id, source_node, relation_type, target_node' })
+            .select('id, support_count, stable_score, stability_tier, source_tags, context, cognitive_flags, metadata')
+            .single();
+
+        if (upsertError) throw upsertError;
+
+        return {
+            mentionId: savedMention.id,
+            supportCount: Number(savedMention.support_count || nextSupportCount),
+            sourceTags: savedMention.source_tags || nextSourceTags,
+            context: String(savedMention.context || finalContext || '').trim() || null,
+            cognitiveFlags: savedMention.cognitive_flags || mergedFlags,
+            stability: {
+                score: Number(savedMention.stable_score || stability.score),
+                tier: String(savedMention.stability_tier || stability.tier),
+                promote: isStableTier(savedMention.stability_tier || stability.tier)
+            }
+        };
+    } catch (error) {
+        console.warn('[Graph Service] relation mention staging unavailable:', error.message);
+        return null;
+    }
+}
+
+async function markEntityMentionPromoted(mentionId, nodeId) {
+    if (!mentionId || !nodeId) return;
+    await supabase
+        .from('entity_mentions')
+        .update({
+            promoted_to_graph: true,
+            promoted_node_id: nodeId,
+            updated_at: nowIso()
+        })
+        .eq('id', mentionId);
+}
+
+async function markRelationMentionPromoted(mentionId) {
+    if (!mentionId) return;
+    await supabase
+        .from('relation_mentions')
+        .update({
+            promoted_to_graph: true,
+            updated_at: nowIso()
+        })
+        .eq('id', mentionId);
+}
+
+function hasConflictFlag(flags = []) {
+    return (Array.isArray(flags) ? flags : [flags])
+        .map(flag => normalizeComparableText(flag))
+        .includes('conflicted');
+}
+
+async function hasConflictingExclusiveEdge(clientId, sourceNode, relationType, targetNode) {
+    if (!EXCLUSIVE_RELATION_TYPES.has(String(relationType || '').trim())) return false;
+
+    const { data, error } = await supabase
+        .from('knowledge_edges')
+        .select('target_node')
+        .eq('client_id', clientId)
+        .eq('source_node', sourceNode)
+        .eq('relation_type', relationType)
+        .neq('target_node', targetNode)
+        .in('stability_tier', ['provisional', 'stable'])
+        .limit(1);
+
+    if (error) {
+        console.warn('[Graph Service] exclusive edge conflict check skipped:', error.message);
+        return false;
+    }
+
+    return Boolean((data || []).length);
+}
+
 function addAliasToMap(aliasMap, value) {
     const alias = String(value || '').trim();
     if (!alias || alias.length < 2) return;
     const normalized = normalizeComparableText(alias);
     if (!normalized) return;
+    if (GENERIC_ALIAS_STOPWORDS.has(normalized)) return;
     if (!aliasMap.has(normalized)) {
         aliasMap.set(normalized, alias);
     }
@@ -167,6 +456,17 @@ function extractSpeakerLabel(line = '') {
     if (!normalized) return null;
     if (normalized.split(' ').length > 4) return null;
     return label;
+}
+
+function hasExplicitMediaAnchor(row = {}) {
+    const metadata = row.metadata || {};
+    return Boolean(
+        metadata.mediaType ||
+        metadata.attachmentType ||
+        metadata.attachmentMime ||
+        metadata.caption ||
+        /\[(media|image|audio|video|document|documento|pdf)\]/i.test(String(row.content || ''))
+    );
 }
 
 function extractMediaSnippetFromContent(content = '', matchedTerms = [], speaker = null) {
@@ -254,9 +554,220 @@ function isMeaningfulAlias(alias) {
     const normalized = normalizeComparableText(value);
     if (!normalized || normalized.length < 2) return false;
     if (['assistant', 'user', 'user sent', 'system_test', 'terminal-admin', 'contacto', 'usuario'].includes(normalized)) return false;
+    if (GENERIC_ALIAS_STOPWORDS.has(normalized)) return false;
     if (/^\d{6,}$/.test(normalized)) return false;
     if (normalized.includes('@')) return false;
     return true;
+}
+
+function isWeakExactEntityMentionDescription(entityName = '', description = '') {
+    const normalizedEntity = normalizeComparableText(entityName);
+    const normalized = normalizeComparableText(description);
+    if (!normalized) return true;
+    if (normalized === normalizedEntity) return true;
+    if (normalized.length < 14) return true;
+    if (normalized.includes('participante del chat')) return true;
+    if (normalized.includes('contacto mencionado')) return true;
+    if (normalized.includes('persona mencionada') && normalized.length < 32) return true;
+    if (/^(quien es|quien era|como se relaciona|que hace en mi vida|de que hablo con|que recuerdas de)\b/.test(normalized)) return true;
+    if (normalizedEntity && normalized.includes(`quien es ${normalizedEntity}`)) return true;
+    return false;
+}
+
+function shouldIncludeExactEntityMention(mention = {}, directIdentityNames = new Set()) {
+    const entityName = String(mention.entity_name || '').trim();
+    const description = String(mention.description || '').trim();
+    const normalizedName = normalizeComparableText(entityName);
+    const hasDirectIdentityMatch = normalizedName && directIdentityNames.has(normalizedName);
+
+    if (!hasDirectIdentityMatch) {
+        return !isWeakExactEntityMentionDescription(entityName, description);
+    }
+
+    if (isWeakExactEntityMentionDescription(entityName, description)) {
+        return false;
+    }
+
+    return Number(mention.support_count || 0) >= 2 || Number(mention.stable_score || 0) >= 0.7;
+}
+
+const RELATION_MEMORY_CUES = new Map([
+    ['FAMILIA_DE', ['madre', 'padre', 'hermano', 'hermana', 'hijo', 'hija', 'familia', 'primo', 'prima']],
+    ['PAREJA_DE', ['pareja', 'novia', 'novio', 'amor', 'mi vida', 'te amo', 'cariño', 'carino']],
+    ['AMISTAD', ['amigo', 'amiga', 'colega', 'bro']],
+    ['TRABAJA_EN', ['trabaja', 'curro', 'empleo', 'empresa', 'oficina', 'jefe', 'jefa']],
+    ['VIVE_EN', ['vive', 'casa', 'piso', 'mudado', 'mudarse']],
+    ['ESTUDIA_EN', ['estudia', 'universidad', 'instituto', 'master', 'máster', 'curso']],
+    ['CONOCE_A', ['conoce', 'quede con', 'quedé con', 'he hablado con', 'hablé con']]
+]);
+
+function normalizeRelationFilterKey(value) {
+    const normalized = normalizeComparableText(String(value || '').replace(/[\[\]]/g, ''));
+    if (!normalized) return null;
+    if (normalized === 'any_relation') return 'ANY_RELATION';
+    return normalized.toUpperCase();
+}
+
+function buildRelationCueMap(relationFilter = null) {
+    const requested = normalizeRelationFilterKey(relationFilter);
+    if (requested && requested !== 'ANY_RELATION' && RELATION_MEMORY_CUES.has(requested)) {
+        return new Map([[requested, RELATION_MEMORY_CUES.get(requested)]]);
+    }
+    return RELATION_MEMORY_CUES;
+}
+
+function textContainsAlias(text = '', aliases = []) {
+    const haystack = normalizeComparableText(text);
+    if (!haystack) return false;
+    return aliases.some(alias => {
+        const needle = normalizeComparableText(alias);
+        return Boolean(needle) && haystack.includes(needle);
+    });
+}
+
+function inferRelationTypeFromText(text = '', relationFilter = null) {
+    const haystack = normalizeComparableText(text);
+    if (!haystack) return null;
+
+    for (const [relationType, cues] of buildRelationCueMap(relationFilter).entries()) {
+        if (cues.some(cue => haystack.includes(normalizeComparableText(cue)))) {
+            return `[${relationType}]`;
+        }
+    }
+
+    return null;
+}
+
+function extractRelationshipSnippet(content = '', aliases = []) {
+    const lines = String(content || '')
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean);
+    if (!lines.length) return '';
+
+    const scored = lines
+        .map((line, index) => {
+            const normalized = normalizeComparableText(line);
+            let score = inferRelationTypeFromText(line, 'ANY_RELATION') ? 4 : 0;
+            for (const alias of aliases) {
+                const needle = normalizeComparableText(alias);
+                if (needle && normalized.includes(needle)) score += 2;
+            }
+            if (line.includes(':')) score += 1;
+            return { line, index, score };
+        })
+        .sort((a, b) => b.score - a.score || a.index - b.index);
+
+    const best = scored[0];
+    const neighbor = scored.find(item => Math.abs(item.index - best.index) === 1 && item.score >= Math.max(1, best.score - 2));
+    return [best.line, neighbor?.line].filter(Boolean).join(' ').trim().slice(0, 240);
+}
+
+function buildRelationshipAliasMap(lookup, canonicalEntities = []) {
+    const aliasMap = new Map();
+
+    for (const entity of canonicalEntities) {
+        const normalizedEntity = normalizeComparableText(entity);
+        const aliases = new Set([entity]);
+
+        for (const row of (lookup.identityMatches || [])) {
+            const rowAliases = [row.canonical_name, ...(row.aliases || [])]
+                .map(value => String(value || '').trim())
+                .filter(isMeaningfulAlias);
+            const matchesEntity =
+                normalizeComparableText(row.canonical_name) === normalizedEntity ||
+                rowAliases.some(alias => normalizeComparableText(alias) === normalizedEntity);
+            if (!matchesEntity) continue;
+            for (const alias of rowAliases) aliases.add(alias);
+        }
+
+        aliasMap.set(entity, [...aliases]);
+    }
+
+    return aliasMap;
+}
+
+async function exactRelationshipMemorySearch(clientId, lookup, canonicalEntities = [], relationFilter = null, matchCount = 8) {
+    if (canonicalEntities.length < 2) return [];
+
+    const aliasMap = buildRelationshipAliasMap(lookup, canonicalEntities);
+    const remoteIdSet = new Set(lookup.remoteIdList);
+    const pairs = [];
+    for (let i = 0; i < canonicalEntities.length; i += 1) {
+        for (let j = i + 1; j < canonicalEntities.length; j += 1) {
+            pairs.push([canonicalEntities[i], canonicalEntities[j]]);
+        }
+    }
+
+    const { data: rows, error } = await supabase
+        .from('user_memories')
+        .select('id, content, sender, metadata, created_at')
+        .eq('client_id', clientId)
+        .order('created_at', { ascending: false })
+        .limit(Math.max(300, matchCount * 60));
+
+    if (error) throw error;
+
+    const results = [];
+    const seen = new Set();
+
+    for (const row of (rows || [])) {
+        const content = String(row.content || '');
+        const sender = String(row.sender || '').trim();
+        const remoteId = row.metadata?.remoteId || row.metadata?.remote_id || null;
+        const senderNormalized = normalizeComparableText(sender);
+
+        for (const [left, right] of pairs) {
+            const leftAliases = aliasMap.get(left) || [left];
+            const rightAliases = aliasMap.get(right) || [right];
+            const leftMentionedInText = textContainsAlias(content, leftAliases);
+            const rightMentionedInText = textContainsAlias(content, rightAliases);
+            const leftBySpeaker = leftAliases.some(alias => normalizeComparableText(alias) === senderNormalized);
+            const rightBySpeaker = rightAliases.some(alias => normalizeComparableText(alias) === senderNormalized);
+            const remoteAnchored = remoteId && remoteIdSet.has(remoteId);
+            const leftPresent = leftMentionedInText || leftBySpeaker;
+            const rightPresent = rightMentionedInText || rightBySpeaker;
+
+            const hasPairEvidence = Boolean(
+                (leftMentionedInText && rightMentionedInText) ||
+                (remoteAnchored && leftBySpeaker && rightMentionedInText) ||
+                (remoteAnchored && rightBySpeaker && leftMentionedInText)
+            );
+
+            if (!hasPairEvidence) continue;
+
+            const relationType = inferRelationTypeFromText(content, relationFilter);
+            if (!relationType) continue;
+
+            const sourceNode = leftPresent ? left : right;
+            const targetNode = sourceNode === left ? right : left;
+            const sourceId = `relationship_memory:${row.id}:${sourceNode}:${relationType}:${targetNode}`;
+            if (seen.has(sourceId)) continue;
+            seen.add(sourceId);
+
+            results.push(toFactEvidenceCandidate({
+                fact_type: 'relationship_memory',
+                source_id: sourceId,
+                entity_name: sourceNode,
+                speaker: sender || sourceNode,
+                remote_id: remoteId,
+                timestamp: getEventTimestamp(row),
+                relation_type: relationType,
+                source_node: sourceNode,
+                target_node: targetNode,
+                evidence_text: extractRelationshipSnippet(content, [...leftAliases, ...rightAliases]),
+                metadata: {
+                    memory_id: row.id,
+                    support_count: 1,
+                    stability_tier: 'provisional',
+                    relation_filter: relationFilter || null
+                },
+                recall_score: 0.93
+            }, { source: 'RELATIONSHIP_MEMORY_EXACT' }));
+        }
+    }
+
+    return results.slice(0, matchCount);
 }
 
 async function buildEntityLookupContext(clientId, entityNames = []) {
@@ -338,7 +849,7 @@ export async function traverseGraphV2(clientId, queryText, queryVector, matchCou
 /**
  * Stores or updates a knowledge node using deterministic normalization.
  */
-export async function upsertKnowledgeNode(clientId, entityName, entityType, description) {
+export async function upsertKnowledgeNode(clientId, entityName, entityType, description, options = {}) {
     const { data: soulRow } = await supabase
         .from('user_souls')
         .select('soul_json')
@@ -349,22 +860,67 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
     const finalEntityName = normalizeEntityName(entityName, ownerCanonicalName);
     if (!finalEntityName) return null;
 
-    const finalEntityType = sanitizeEntityType(entityType);
+    const finalEntityType = deriveEffectiveEntityType(finalEntityName, entityType);
+    if (!finalEntityType) return null;
+    if (finalEntityType === 'PERSONA' && isPhoneLikeGraphName(finalEntityName)) {
+        return null;
+    }
     const finalDescription = String(description || '').trim().slice(0, 1000);
+    const stagedMention = await upsertEntityMentionAggregate(clientId, finalEntityName, finalEntityType, finalDescription, options);
+
+    if (stagedMention && !stagedMention.stability.promote) {
+        return null;
+    }
 
     const { data: exactNode } = await supabase
         .from('knowledge_nodes')
-        .select('id, description')
+        .select('id, description, support_count, stable_score, stability_tier, entity_type, source_tags')
         .eq('client_id', clientId)
         .eq('entity_name', finalEntityName)
         .maybeSingle();
 
+    const nextSupportCount = stagedMention
+        ? Math.max(Number(exactNode?.support_count || 0), Number(stagedMention.supportCount || 0))
+        : Number(exactNode?.support_count || 0) + 1;
+    const nextSourceTags = stagedMention?.sourceTags || mergeSourceTags(exactNode?.source_tags || [], options.source || '');
+    const stability = stagedMention?.stability || computeNodeStability({
+        entityName: finalEntityName,
+        entityType: finalEntityType,
+        description: finalDescription,
+        supportCount: nextSupportCount,
+        source: options.source || '',
+        sourceTags: nextSourceTags,
+        existingScore: exactNode?.stable_score || 0,
+        existingTier: exactNode?.stability_tier || 'candidate'
+    });
+
+    if (!stability.promote) {
+        return null;
+    }
+
     if (exactNode?.id) {
+        const patch = {
+            support_count: nextSupportCount,
+            stable_score: stability.score,
+            stability_tier: stability.tier,
+            source_tags: nextSourceTags,
+            last_seen: nowIso()
+        };
         if (finalDescription && finalDescription.length > String(exactNode.description || '').length) {
-            await supabase
-                .from('knowledge_nodes')
-                .update({ description: finalDescription })
-                .eq('id', exactNode.id);
+            patch.description = finalDescription;
+        }
+        if (finalEntityType && finalEntityType !== String(exactNode.entity_type || '').trim()) {
+            patch.entity_type = finalEntityType;
+        }
+        if (stability.promote) {
+            patch.embedding = await generateEmbedding(`${finalEntityName} ${patch.description || finalDescription || exactNode.description || ''}`);
+        }
+        await supabase
+            .from('knowledge_nodes')
+            .update(patch)
+            .eq('id', exactNode.id);
+        if (stagedMention?.mentionId) {
+            await markEntityMentionPromoted(stagedMention.mentionId, exactNode.id);
         }
         return exactNode.id;
     }
@@ -392,19 +948,30 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
         }
     }
 
-    const embedding = await generateEmbedding(`${finalEntityName} ${finalDescription}`);
+    const embedding = stability.promote
+        ? await generateEmbedding(`${finalEntityName} ${finalDescription}`)
+        : null;
 
     const { data: inserted, error } = await supabase.from('knowledge_nodes').upsert({
         client_id: clientId,
         entity_name: finalEntityName,
         entity_type: finalEntityType,
-        description: finalDescription,
-        embedding
+        description: stagedMention?.description || finalDescription,
+        embedding,
+        support_count: nextSupportCount,
+        stable_score: stability.score,
+        stability_tier: stability.tier,
+        source_tags: nextSourceTags,
+        last_seen: nowIso()
     }, { onConflict: 'client_id, entity_name' }).select('id').single();
 
     if (error) {
         console.error('[Graph Service] Error upserting node:', error.message);
         throw error;
+    }
+
+    if (stagedMention?.mentionId) {
+        await markEntityMentionPromoted(stagedMention.mentionId, inserted.id);
     }
 
     return inserted.id;
@@ -413,11 +980,16 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
 /**
  * Creates or updates an edge between two normalized entity names.
  */
-export async function upsertKnowledgeEdge(clientId, sourceName, targetName, relationType, weight = 1, context = null, flags = {}) {
+export async function upsertKnowledgeEdge(clientId, sourceName, targetName, relationType, weight = 1, context = null, flags = {}, options = {}) {
     const flagsPayload = Array.isArray(flags) ? flags : [flags];
-    const canonicalSource = normalizeEntityName(sourceName) || String(sourceName || '').trim();
-    const canonicalTarget = normalizeEntityName(targetName) || String(targetName || '').trim();
+    const normalizedSource = normalizeEntityName(sourceName) || String(sourceName || '').trim();
+    const normalizedTarget = normalizeEntityName(targetName) || String(targetName || '').trim();
     const canonicalRelationType = sanitizeRelationType(relationType) || String(relationType || '').trim();
+    const { sourceNode: canonicalSource, targetNode: canonicalTarget } = canonicalizeEdgeDirection(
+        normalizedSource,
+        normalizedTarget,
+        canonicalRelationType
+    );
 
     if (!canonicalSource || !canonicalTarget || !canonicalRelationType) return false;
     if (canonicalSource === canonicalTarget) return false;
@@ -438,20 +1010,90 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
     }
 
     intWeight = Math.min(10, Math.max(1, intWeight || 5));
+    const canonicalContext = String(context || '').trim().slice(0, 500) || null;
+    const stagedMention = await upsertRelationMentionAggregate(
+        clientId,
+        canonicalSource,
+        canonicalTarget,
+        canonicalRelationType,
+        intWeight,
+        canonicalContext,
+        flagsPayload,
+        options
+    );
+    const { data: exactEdge } = await supabase
+        .from('knowledge_edges')
+        .select('id, support_count, stable_score, stability_tier, weight, context, cognitive_flags, source_tags, metadata')
+        .eq('client_id', clientId)
+        .eq('source_node', canonicalSource)
+        .eq('relation_type', canonicalRelationType)
+        .eq('target_node', canonicalTarget)
+        .maybeSingle();
+
+    const nextSupportCount = stagedMention
+        ? Math.max(Number(exactEdge?.support_count || 0), Number(stagedMention.supportCount || 0))
+        : Number(exactEdge?.support_count || 0) + 1;
+    const mergedFlags = [
+        ...new Set([
+            ...(Array.isArray(exactEdge?.cognitive_flags) ? exactEdge.cognitive_flags : []),
+            ...(Array.isArray(stagedMention?.cognitiveFlags) ? stagedMention.cognitiveFlags : []),
+            ...flagsPayload.filter(Boolean)
+        ])
+    ];
+    const mergedSourceTags = stagedMention?.sourceTags || mergeSourceTags(exactEdge?.source_tags || [], options.source || '');
+    const conflictingExclusiveEdge = await hasConflictingExclusiveEdge(
+        clientId,
+        canonicalSource,
+        canonicalRelationType,
+        canonicalTarget
+    );
+    if (conflictingExclusiveEdge && !mergedFlags.includes('conflicted')) {
+        mergedFlags.push('conflicted');
+    }
+    const stability = stagedMention?.stability || computeEdgeStability({
+        relationType: canonicalRelationType,
+        context: stagedMention?.context || canonicalContext || exactEdge?.context || '',
+        weight: intWeight,
+        supportCount: nextSupportCount,
+        source: options.source || '',
+        sourceTags: mergedSourceTags,
+        flags: mergedFlags,
+        existingScore: exactEdge?.stable_score || 0,
+        existingTier: exactEdge?.stability_tier || 'candidate'
+    });
+
+    if (!stability.promote) {
+        return false;
+    }
+
+    const mergedMetadata = {
+        ...(exactEdge?.metadata || {}),
+        ...(stagedMention?.metadata || {}),
+        ...(options.metadata || {})
+    };
+
     const { error } = await supabase.from('knowledge_edges').upsert({
         client_id: clientId,
         source_node: canonicalSource,
         target_node: canonicalTarget,
         relation_type: canonicalRelationType,
-        weight: intWeight,
-        context: String(context || '').trim().slice(0, 500) || null,
-        cognitive_flags: flagsPayload,
-        last_seen: new Date().toISOString()
+        weight: Math.max(intWeight, Number(exactEdge?.weight || 0)),
+        context: stagedMention?.context || canonicalContext || exactEdge?.context || null,
+        cognitive_flags: mergedFlags,
+        source_tags: mergedSourceTags,
+        metadata: mergedMetadata,
+        support_count: nextSupportCount,
+        stable_score: stability.score,
+        stability_tier: stability.tier,
+        last_seen: nowIso()
     }, { onConflict: 'client_id, source_node, relation_type, target_node' });
 
     if (error) {
         console.error('[Graph Service] Error upserting edge:', error.message);
         throw error;
+    }
+    if (stagedMention?.mentionId) {
+        await markRelationMentionPromoted(stagedMention.mentionId);
     }
     return true;
 }
@@ -603,7 +1245,9 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
                     aliases,
                     confidence: row.confidence,
                     owner_identity: isOwnerIdentity,
-                    identity_kind: isGroupIdentity ? 'group' : 'contact'
+                    identity_kind: isGroupIdentity ? 'group' : 'contact',
+                    support_count: 1,
+                    stability_tier: 'stable'
                 },
                 recall_score: 0.99
             }, { source: 'CONTACT_IDENTITY' }));
@@ -632,7 +1276,9 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
                 remote_id: 'self',
                 evidence_text: `El titular de esta memoria es ${ownerNames[0]}.`,
                 metadata: {
-                    owner_names: ownerNames
+                    owner_names: ownerNames,
+                    support_count: 1,
+                    stability_tier: 'stable'
                 },
                 recall_score: 0.995
             }, { source: 'OWNER_IDENTITY' }));
@@ -642,17 +1288,26 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
             ...lookup.aliasList,
             ...lookup.identityMatches.map(row => row.canonical_name).filter(Boolean)
         ]);
+        const directIdentityNames = new Set(
+            lookup.identityMatches
+                .flatMap(row => [row?.canonical_name, ...(row?.aliases || [])])
+                .map(value => normalizeComparableText(value))
+                .filter(Boolean)
+        );
         const exactNodeNames = new Set();
+        const exactMentionNames = new Set();
 
         for (const alias of [...candidateNodeNames].slice(0, 10)) {
             const { data: nodes } = await supabase
                 .from('knowledge_nodes')
-                .select('id, entity_name, entity_type, description, created_at, updated_at')
+                .select('id, entity_name, entity_type, description, created_at, updated_at, stable_score, stability_tier')
                 .eq('client_id', clientId)
+                .in('stability_tier', ['provisional', 'stable'])
                 .ilike('entity_name', alias)
                 .limit(4);
 
             for (const node of (nodes || [])) {
+                if (!isStableTier(node.stability_tier)) continue;
                 const normalizedName = normalizeComparableText(node.entity_name);
                 if (!lookup.normalizedAliases.has(normalizedName)) continue;
                 exactNodeNames.add(node.entity_name);
@@ -667,33 +1322,96 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
                         ? `${node.entity_name}: ${description}`
                         : `${node.entity_name} aparece como entidad ${node.entity_type || 'registrada'} en tu memoria.`,
                     metadata: {
-                        entity_type: node.entity_type
+                        entity_type: node.entity_type,
+                        support_count: node.support_count || 0,
+                        stable_score: node.stable_score || 0,
+                        stability_tier: node.stability_tier || 'candidate'
                     },
                     recall_score: 0.96
                 }, { source: 'KNOWLEDGE_NODE_EXACT' }));
             }
+
+            const { data: mentions } = await supabase
+                .from('entity_mentions')
+                .select('id, entity_name, entity_type, description, support_count, stable_score, stability_tier, last_seen, updated_at')
+                .eq('client_id', clientId)
+                .in('stability_tier', ['provisional', 'stable'])
+                .ilike('entity_name', alias)
+                .limit(4);
+
+            for (const mention of (mentions || [])) {
+                if (!isStableTier(mention.stability_tier)) continue;
+                const normalizedName = normalizeComparableText(mention.entity_name);
+                if (!lookup.normalizedAliases.has(normalizedName)) continue;
+                if (!shouldIncludeExactEntityMention(mention, directIdentityNames)) continue;
+                exactMentionNames.add(mention.entity_name);
+                const description = String(mention.description || '').trim();
+                pushResult(toFactEvidenceCandidate({
+                    fact_type: 'entity_mention',
+                    source_id: `entity_mention:${mention.id}`,
+                    entity_name: mention.entity_name,
+                    speaker: mention.entity_name,
+                    timestamp: mention.last_seen || mention.updated_at || null,
+                    evidence_text: description
+                        ? `${mention.entity_name} aparece mencionado en tus recuerdos como ${description}.`
+                        : `${mention.entity_name} aparece mencionado varias veces en tus recuerdos.`,
+                    metadata: {
+                        entity_type: mention.entity_type,
+                        support_count: mention.support_count || 0,
+                        stable_score: mention.stable_score || 0,
+                        stability_tier: mention.stability_tier || 'candidate'
+                    },
+                    recall_score: 0.955
+                }, { source: 'ENTITY_MENTION_EXACT' }));
+            }
         }
 
-        for (const entityName of [...exactNodeNames].slice(0, 8)) {
+        const exactGraphEntityNames = [...new Set([
+            ...exactNodeNames,
+            ...exactMentionNames
+        ])].slice(0, 8);
+
+        for (const entityName of exactGraphEntityNames) {
             const edgeQueries = await Promise.all([
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, support_count, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', entityName)
                     .order('last_seen', { ascending: false })
                     .limit(4),
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, support_count, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
                     .eq('target_node', entityName)
+                    .order('last_seen', { ascending: false })
+                    .limit(4),
+                supabase
+                    .from('relation_mentions')
+                    .select('id, source_node, target_node, relation_type, context, last_seen, support_count, stable_score, stability_tier, cognitive_flags, metadata')
+                    .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
+                    .eq('source_node', entityName)
+                    .order('stable_score', { ascending: false })
+                    .order('last_seen', { ascending: false })
+                    .limit(4),
+                supabase
+                    .from('relation_mentions')
+                    .select('id, source_node, target_node, relation_type, context, last_seen, support_count, stable_score, stability_tier, cognitive_flags, metadata')
+                    .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
+                    .eq('target_node', entityName)
+                    .order('stable_score', { ascending: false })
                     .order('last_seen', { ascending: false })
                     .limit(4)
             ]);
 
             for (const queryResult of edgeQueries) {
                 for (const edge of (queryResult.data || [])) {
+                    if (!isStableTier(edge.stability_tier)) continue;
                     pushResult(toFactEvidenceCandidate({
                         fact_type: 'knowledge_edge',
                         source_id: `knowledge_edge:${edge.source_node}:${edge.relation_type}:${edge.target_node}`,
@@ -706,10 +1424,43 @@ export async function exactEntityFactSearch(clientId, entityNames = [], matchCou
                         evidence_text: `${edge.source_node} tiene relacion ${edge.relation_type} con ${edge.target_node}.`,
                         metadata: {
                             context: edge.context || null,
-                            weight: edge.weight || null
+                            weight: edge.weight || null,
+                            support_count: edge.support_count || 0,
+                            stable_score: edge.stable_score || 0,
+                            stability_tier: edge.stability_tier || 'candidate',
+                            cognitive_flags: edge.cognitive_flags || []
                         },
                         recall_score: 0.95
                     }, { source: 'KNOWLEDGE_EDGE_EXACT' }));
+                }
+            }
+
+            for (const queryResult of edgeQueries.slice(2)) {
+                for (const mention of (queryResult.data || [])) {
+                    if (!isStableTier(mention.stability_tier)) continue;
+                    pushResult(toFactEvidenceCandidate({
+                        fact_type: 'relationship_mention',
+                        source_id: `relationship_mention:${mention.id}`,
+                        entity_name,
+                        speaker: mention.source_node,
+                        timestamp: mention.last_seen || null,
+                        relation_type: mention.relation_type,
+                        source_node: mention.source_node,
+                        target_node: mention.target_node,
+                        evidence_text: String(
+                            mention.metadata?.evidence
+                            || mention.context
+                            || `${mention.source_node} tiene relacion ${mention.relation_type} con ${mention.target_node}.`
+                        ).trim(),
+                        metadata: {
+                            context: mention.context || null,
+                            support_count: mention.support_count || 0,
+                            stable_score: mention.stable_score || 0,
+                            stability_tier: mention.stability_tier || 'candidate',
+                            cognitive_flags: mention.cognitive_flags || []
+                        },
+                        recall_score: 0.945
+                    }, { source: 'RELATION_MENTION_EXACT' }));
                 }
             }
         }
@@ -810,6 +1561,7 @@ export async function mediaMemorySearch(clientId, entityNames = [], queryText = 
                 if (!haystack) return false;
                 const matchedTerms = fallbackMediaTerms.filter(term => term && haystack.includes(term));
                 if (!matchedTerms.length) return null;
+                if (!hasExplicitMediaAnchor(row) && matchedTerms.length < 2) return null;
 
                 let entityMatched = !lookup.aliasList.length && !remoteIdSet.size;
 
@@ -833,7 +1585,7 @@ export async function mediaMemorySearch(clientId, entityNames = [], queryText = 
 
                 return {
                     row,
-                    mediaScore: matchedTerms.length + exactPhraseBoost + senderBoost + remoteBoost,
+                    mediaScore: matchedTerms.length + exactPhraseBoost + senderBoost + remoteBoost + (hasExplicitMediaAnchor(row) ? 4 : 0),
                     mediaSnippetTerms
                 };
             })
@@ -855,7 +1607,8 @@ export async function mediaMemorySearch(clientId, entityNames = [], queryText = 
                     ...(row.metadata || {}),
                     mediaMatchedTerms: mediaSnippetTerms,
                     mediaSnippet: mediaExtraction.snippet,
-                    mediaParticipants: mediaExtraction.participants
+                    mediaParticipants: mediaExtraction.participants,
+                    explicitMediaAnchor: hasExplicitMediaAnchor(row)
                 },
                 score_vector: 0.78 + Math.min(mediaScore * 0.02, 0.12),
                 score_fts: 0.92,
@@ -868,7 +1621,7 @@ export async function mediaMemorySearch(clientId, entityNames = [], queryText = 
     }
 }
 
-export async function exactRelationshipSearch(clientId, entityNames = [], matchCount = 10) {
+export async function exactRelationshipSearch(clientId, entityNames = [], matchCount = 10, options = {}) {
     const lookup = await buildEntityLookupContext(clientId, entityNames);
     const canonicalEntities = [...new Set([
         ...lookup.names,
@@ -893,28 +1646,54 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
             results.push(candidate);
         };
 
+        const requestedRelation = normalizeRelationFilterKey(options.relationFilter);
+
         for (const [left, right] of pairs.slice(0, 3)) {
             const queries = await Promise.all([
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, support_count, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', left)
                     .eq('target_node', right)
                     .order('last_seen', { ascending: false })
                     .limit(6),
                 supabase
                     .from('knowledge_edges')
-                    .select('source_node, target_node, relation_type, context, last_seen, weight')
+                    .select('source_node, target_node, relation_type, context, last_seen, weight, support_count, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', right)
                     .eq('target_node', left)
+                    .order('last_seen', { ascending: false })
+                    .limit(6),
+                supabase
+                    .from('relation_mentions')
+                    .select('source_node, target_node, relation_type, context, last_seen, support_count, stable_score, stability_tier, cognitive_flags, metadata')
+                    .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
+                    .eq('source_node', left)
+                    .eq('target_node', right)
+                    .order('stable_score', { ascending: false })
+                    .order('last_seen', { ascending: false })
+                    .limit(6),
+                supabase
+                    .from('relation_mentions')
+                    .select('source_node, target_node, relation_type, context, last_seen, support_count, stable_score, stability_tier, cognitive_flags, metadata')
+                    .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
+                    .eq('source_node', right)
+                    .eq('target_node', left)
+                    .order('stable_score', { ascending: false })
                     .order('last_seen', { ascending: false })
                     .limit(6)
             ]);
 
             for (const queryResult of queries) {
                 for (const edge of (queryResult.data || [])) {
+                    if (!isStableTier(edge.stability_tier)) continue;
+                    if (requestedRelation && requestedRelation !== 'ANY_RELATION' && normalizeRelationFilterKey(edge.relation_type) !== requestedRelation) continue;
                     pushCandidate(toFactEvidenceCandidate({
                         fact_type: 'relationship_edge',
                         source_id: `relationship_edge:${edge.source_node}:${edge.relation_type}:${edge.target_node}`,
@@ -924,15 +1703,31 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
                         relation_type: edge.relation_type,
                         source_node: edge.source_node,
                         target_node: edge.target_node,
-                        evidence_text: `${edge.source_node} tiene relacion ${edge.relation_type} con ${edge.target_node}.`,
+                        evidence_text: String(edge.metadata?.evidence || edge.context || `${edge.source_node} tiene relacion ${edge.relation_type} con ${edge.target_node}.`).trim(),
                         metadata: {
                             context: edge.context || null,
-                            weight: edge.weight || null
+                            weight: edge.weight || null,
+                            support_count: edge.support_count || 0,
+                            stable_score: edge.stable_score || 0,
+                            stability_tier: edge.stability_tier || 'candidate',
+                            cognitive_flags: edge.cognitive_flags || [],
+                            evidence: edge.metadata?.evidence || null
                         },
                         recall_score: 0.985
                     }, { source: 'RELATIONSHIP_EDGE_EXACT' }));
                 }
             }
+        }
+
+        const memoryCandidates = await exactRelationshipMemorySearch(
+            clientId,
+            lookup,
+            canonicalEntities,
+            options.relationFilter || null,
+            Math.max(4, Math.min(matchCount, 8))
+        );
+        for (const candidate of memoryCandidates) {
+            pushCandidate(candidate);
         }
 
         return results.slice(0, matchCount);
@@ -992,6 +1787,7 @@ export async function hybridSearch(clientId, queryText, queryVector, matchCount 
                 .from('knowledge_nodes')
                 .select('entity_name')
                 .eq('client_id', clientId)
+                .in('stability_tier', ['provisional', 'stable'])
                 .eq('entity_type', 'PERSONA');
             for (const node of (personaNodes || [])) {
                 if (node.entity_name) knownNamePool.add(node.entity_name);
@@ -1084,7 +1880,6 @@ export async function hybridSearch(clientId, queryText, queryVector, matchCount 
                     }
                 }
             }
-
             console.log(`[Name Filter] Busqueda finalizada. Resultados: ${results.length}`);
         } catch (e) {
             console.warn('[Name Resolution] Error:', e.message);
@@ -1114,4 +1909,95 @@ export async function hybridSearch(clientId, queryText, queryVector, matchCount 
     }
 
     return results;
+}
+
+/**
+ * NEW: Unified Relational Retrieval for Neural Brain (2026).
+ * Combines nodes, edges, and community summaries into a single enriched structure.
+ */
+export async function getEnrichedGraphContext(clientId, queryText, queryVector, options = {}) {
+    console.log(`[NeuralGraph] Building enriched relational context for: "${queryText.substring(0, 30)}..."`);
+    
+    // 1. Keyword extraction (simple) to improve graph hits
+    const keywords = queryText.split(/\s+/)
+        .map(w => w.replace(/[.,!?()[\]{}]/g, ''))
+        .filter(w => w.length > 3 && !['quien', 'como', 'cuando', 'donde', 'porque', 'para', 'tiene', 'esta', 'este', 'esta'].includes(w.toLowerCase()));
+    
+    // 2. Concurrent fetching of all relational assets
+    let [nodes, communities, facts] = await Promise.all([
+        supabase.rpc('search_knowledge_nodes_v2', { 
+            cid: clientId, 
+            query: keywords.length ? keywords.join(' ') : queryText,
+            lim: 15
+        }).then(r => r.data || []),
+        supabase.from('knowledge_communities')
+            .select('community_name, summary, temporal_horizon')
+            .eq('client_id', clientId)
+            .order('created_at', { ascending: false })
+            .limit(3)
+            .then(r => r.data || []),
+        // Retrieve explicit facts using keywords
+        exactEntityFactSearch(clientId, keywords.length ? keywords : [queryText], 10).catch(() => [])
+    ]);
+
+    // 2b. Fallback: If no nodes found with combined keywords, try top keywords individually
+    if (nodes.length < 3 && keywords.length > 1) {
+        console.log(`[NeuralGraph] Low node hits (${nodes.length}). Trying fallback individual keywords...`);
+        const individualPromises = keywords.slice(0, 3).map(kw => 
+            supabase.rpc('search_knowledge_nodes_v2', { cid: clientId, query: kw, lim: 5 }).then(r => r.data || [])
+        );
+        const individualResults = await Promise.all(individualPromises);
+        const allNewNodes = individualResults.flat();
+        
+        // Merge and unique
+        const seenNodes = new Set(nodes.map(n => n.id));
+        for (const n of allNewNodes) {
+            if (!seenNodes.has(n.id)) {
+                nodes.push(n);
+                seenNodes.add(n.id);
+            }
+        }
+    }
+
+    // 2. Extract neighbor edges for the top nodes to build local context
+    let edges = [];
+    if (nodes.length > 0) {
+        const topNodeNames = nodes.slice(0, 5).map(n => n.entity_name);
+        const { data: edgeData } = await supabase
+            .from('knowledge_edges')
+            .select('source_node, target_node, relation_type, context')
+            .eq('client_id', clientId)
+            .in('stability_tier', ['stable', 'provisional'])
+            .or(`source_node.in.(${topNodeNames.map(n => `"${n}"`).join(',')}),target_node.in.(${topNodeNames.map(n => `"${n}"`).join(',')})`)
+            .limit(15);
+        edges = edgeData || [];
+    }
+
+    return {
+        nodes,
+        edges,
+        communities,
+        facts,
+        unified_prompt_segment: formatEnrichedPrompt(nodes, edges, communities, facts)
+    };
+}
+
+function formatEnrichedPrompt(nodes, edges, communities, facts) {
+    const communityPart = communities.length 
+        ? `### ÁREAS DE VIDA (COMMUNITIES)\n${communities.map(c => `- ${c.community_name}: ${c.summary}`).join('\n')}`
+        : '';
+    
+    const nodePart = nodes.length
+        ? `### ENTIDADES RELEVANTES\n${nodes.map(n => `- ${n.entity_name} (${n.entity_type}): ${n.description}`).join('\n')}`
+        : '';
+        
+    const edgePart = edges.length
+        ? `### RELACIONES DETECTADAS\n${edges.map(e => `- ${e.source_node} --[${e.relation_type}]--> ${e.target_node} (${e.context || 'Sin contexto'})`).join('\n')}`
+        : '';
+
+    const factPart = facts.length
+        ? `### HECHOS CONFIRMADOS\n${facts.map(f => `- ${f.evidence_text}`).join('\n')}`
+        : '';
+
+    return [communityPart, nodePart, edgePart, factPart].filter(Boolean).join('\n\n');
 }

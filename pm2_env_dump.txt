@@ -1,2 +1,0 @@
-SUPABASE_URL: undefined
-SUPABASE_SERVICE_ROLE_KEY: none

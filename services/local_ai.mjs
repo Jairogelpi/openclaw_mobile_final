@@ -2,6 +2,7 @@ import { Worker } from 'worker_threads';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import redisClient from '../config/redis.mjs';
+import axios from 'axios';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -16,6 +17,39 @@ let messageIdCounter = 0;
 const pendingRequests = new Map();
 let lastWarmupAt = 0;
 let warmupPromise = null;
+const EMBEDDING_CACHE_MAX = Number(process.env.OPENCLAW_EMBEDDING_CACHE_MAX || 2000);
+const embeddingCache = new Map();
+const embeddingInFlight = new Map();
+const embeddingRuntimeStats = {
+    embedding_cache_hits: 0,
+    embedding_cache_misses: 0,
+    deferred_embedding_count: 0
+};
+
+function getCachedEmbedding(cacheKey) {
+    if (!embeddingCache.has(cacheKey)) return null;
+    const cached = embeddingCache.get(cacheKey);
+    embeddingCache.delete(cacheKey);
+    embeddingCache.set(cacheKey, cached);
+    embeddingRuntimeStats.embedding_cache_hits += 1;
+    return Array.isArray(cached) ? [...cached] : null;
+}
+
+function saveCachedEmbedding(cacheKey, vector) {
+    if (!cacheKey || !Array.isArray(vector)) return;
+    if (embeddingCache.has(cacheKey)) embeddingCache.delete(cacheKey);
+    embeddingCache.set(cacheKey, [...vector]);
+    while (embeddingCache.size > EMBEDDING_CACHE_MAX) {
+        const oldestKey = embeddingCache.keys().next().value;
+        if (!oldestKey) break;
+        embeddingCache.delete(oldestKey);
+    }
+}
+
+function clearEmbeddingCaches() {
+    embeddingCache.clear();
+    embeddingInFlight.clear();
+}
 
 function failPendingRequests(error) {
     for (const [id, resolver] of pendingRequests.entries()) {
@@ -55,26 +89,37 @@ function initWorker() {
 }
 
 // Función para liberar la RAM
-function unloadEmbedder() {
-    if (EMBEDDER_KEEP_WARM) return;
-    if (embedderWorker) {
-        console.log('💤 [AI Service] Descargando modelo de embeddings de la RAM por inactividad (Lazy Unload)...');
-        embedderWorker.postMessage({ action: 'unload', id: ++messageIdCounter });
-        // Optionally terminate the worker thread completely after unload
-        setTimeout(() => {
-            if (embedderWorker) {
-                embedderWorker.terminate();
-                embedderWorker = null;
-            }
-        }, 1000);
+async function unloadEmbedder({ force = false, clearCache = false, reason = 'idle' } = {}) {
+    if (EMBEDDER_KEEP_WARM && !force) return false;
+    if (pendingRequests.size > 0) {
+        console.warn(`💤 [AI Service] Omitiendo descarga del embedder (${reason}) porque hay ${pendingRequests.size} request(s) activas.`);
+        return false;
     }
+
+    if (clearCache) {
+        clearEmbeddingCaches();
+    }
+
+    if (embedderWorker) {
+        console.log(`💤 [AI Service] Descargando modelo de embeddings de la RAM (${reason})...`);
+        const worker = embedderWorker;
+        embedderWorker = null;
+        worker.postMessage({ action: 'unload', id: ++messageIdCounter });
+        setTimeout(() => {
+            worker.terminate().catch(() => { });
+        }, 1000);
+        return true;
+    }
+    return false;
 }
 
 // Resetea el reloj de arena cada vez que alguien necesita pensar
 function resetEmbedderTimer() {
     if (EMBEDDER_KEEP_WARM) return;
     if (embedderTimeout) clearTimeout(embedderTimeout);
-    embedderTimeout = setTimeout(unloadEmbedder, EMBEDDER_TTL_MS);
+    embedderTimeout = setTimeout(() => {
+        unloadEmbedder({ reason: 'ttl_idle' }).catch(() => { });
+    }, EMBEDDER_TTL_MS);
 }
 
 export async function warmupEmbedder(reason = 'startup', { force = false } = {}) {
@@ -105,28 +150,112 @@ export async function warmupEmbedder(reason = 'startup', { force = false } = {})
  * @returns {Promise<number[]>}
  */
 export async function generateEmbedding(text, isQuery = false) {
-    initWorker();
-    resetEmbedderTimer(); // Reiniciar temporizador en cada uso
+    if (process.env.SKIP_LOCAL_EMBEDDINGS === 'true') {
+        return null;
+    }
 
     const prefix = isQuery ? 'search_query: ' : 'search_document: ';
     const textToEmbed = prefix + text;
+    const cached = getCachedEmbedding(textToEmbed);
+    if (cached) return cached;
+    embeddingRuntimeStats.embedding_cache_misses += 1;
 
-    return new Promise((resolve, reject) => {
-        const id = ++messageIdCounter;
-        pendingRequests.set(id, { resolve, reject });
+    if (embeddingInFlight.has(textToEmbed)) {
+        return embeddingInFlight.get(textToEmbed);
+    }
 
-        // Timeout watchdog for the worker thread
-        setTimeout(() => {
-            if (pendingRequests.has(id)) {
-                pendingRequests.delete(id);
-                console.warn(`⏳ [AI Service] Timeout esperando embedding ${id} (Worker thread no responde en 60s)`);
-                reject(new Error('Embedding generation timeout (Worker stalled)'));
+    const requestPromise = (async () => {
+        // 1. Prefer OpenRouter (Cheaper/Free & Stable on low-RAM)
+        if (process.env.OPENROUTER_API_KEY && process.env.PREFER_OPENROUTER_EMBEDDINGS !== 'false') {
+            try {
+                const { generateOpenRouterEmbedding } = await import('./openrouter.mjs');
+                return await generateOpenRouterEmbedding(textToEmbed);
+            } catch (err) {
+                console.warn(`[AI Service] OpenRouter Embedding failed, falling back to OpenAI: ${err.message}`);
             }
-        }, 60000);
+        }
 
-        // console.log(`[AI Service] Enviando request de embedding ${id}...`);
-        embedderWorker.postMessage({ action: 'embed', id, text: textToEmbed });
+        // 2. Fallback to OpenAI if configured
+        if (process.env.OPENAI_API_KEY && process.env.PREFER_OPENAI_EMBEDDINGS !== 'false') {
+            try {
+                const response = await axios.post('https://api.openai.com/v1/embeddings', {
+                    model: 'text-embedding-3-small',
+                    input: textToEmbed,
+                    dimensions: 768
+                }, {
+                    headers: { 'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`, 'Content-Type': 'application/json' },
+                    timeout: 8000
+                });
+                return response.data.data[0].embedding;
+            } catch (err) {
+                console.warn(`[AI Service] OpenAI Embedding failed, falling back to local: ${err.message}`);
+            }
+        }
+
+        // 3. Fallback to Local Transformers.js
+        initWorker();
+        resetEmbedderTimer();
+        return new Promise((resolve, reject) => {
+            const id = ++messageIdCounter;
+            pendingRequests.set(id, { resolve, reject });
+            setTimeout(() => {
+                if (pendingRequests.has(id)) {
+                    pendingRequests.delete(id);
+                    reject(new Error('Embedding generation timeout (Local worker stalled)'));
+                }
+            }, 60000);
+            embedderWorker.postMessage({ action: 'embed', id, text: textToEmbed });
+        });
+    })().then(vector => {
+        saveCachedEmbedding(textToEmbed, vector);
+        return Array.isArray(vector) ? [...vector] : vector;
+    }).finally(() => {
+        embeddingInFlight.delete(textToEmbed);
     });
+
+    embeddingInFlight.set(textToEmbed, requestPromise);
+    return requestPromise;
+}
+
+export function trackDeferredEmbedding(delta = 1) {
+    const numericDelta = Number(delta || 0);
+    if (!Number.isFinite(numericDelta) || numericDelta === 0) return;
+    embeddingRuntimeStats.deferred_embedding_count = Math.max(
+        0,
+        embeddingRuntimeStats.deferred_embedding_count + numericDelta
+    );
+}
+
+export function getEmbeddingRuntimeStats() {
+    return {
+        embedding_cache_hits: embeddingRuntimeStats.embedding_cache_hits,
+        embedding_cache_misses: embeddingRuntimeStats.embedding_cache_misses,
+        deferred_embedding_count: embeddingRuntimeStats.deferred_embedding_count,
+        cache_size: embeddingCache.size,
+        in_flight: embeddingInFlight.size
+    };
+}
+
+export function getEmbedderRuntimeSnapshot() {
+    return {
+        keep_warm: EMBEDDER_KEEP_WARM,
+        ttl_ms: EMBEDDER_TTL_MS,
+        worker_active: Boolean(embedderWorker),
+        pending_requests: pendingRequests.size,
+        in_flight: embeddingInFlight.size,
+        cache_size: embeddingCache.size,
+        last_warmup_at: lastWarmupAt || null
+    };
+}
+
+export async function unloadEmbedderRuntime({ force = false, clearCache = false, reason = 'manual' } = {}) {
+    return unloadEmbedder({ force, clearCache, reason });
+}
+
+export function resetEmbeddingRuntimeStats() {
+    embeddingRuntimeStats.embedding_cache_hits = 0;
+    embeddingRuntimeStats.embedding_cache_misses = 0;
+    embeddingRuntimeStats.deferred_embedding_count = 0;
 }
 
 /**

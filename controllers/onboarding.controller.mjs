@@ -6,7 +6,7 @@ import { getNextAvailablePort } from '../utils/supabaseHelpers.mjs';
 import { transcribeAudio, analyzeImage } from '../utils/media.mjs';
 import { openrouterChat } from '../services/openrouter.mjs';
 import groq from '../services/groq.mjs';
-import { encrypt } from '../security.mjs';
+import { encrypt } from '../core/security.mjs';
 
 // --- Soul Completeness Validator ---
 // Tracks retry attempts to prevent infinite correction loops

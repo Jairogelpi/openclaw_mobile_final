@@ -54,11 +54,39 @@ function candidateRemoteIds(result) {
     return (result.candidates || []).map(candidate => candidate.remote_id).filter(Boolean);
 }
 
+function candidateSourceKinds(result) {
+    return [...new Set((result.candidates || []).map(candidate => candidate.source_kind).filter(Boolean))];
+}
+
+function candidateEdgeKeys(result) {
+    return (result.candidates || [])
+        .map(candidate => {
+            const source = candidate.metadata?.source_node;
+            const relation = candidate.metadata?.relation_type || candidate.relation_type;
+            const target = candidate.metadata?.target_node;
+            if (!source || !relation || !target) return null;
+            return `${source}|${relation}|${target}`;
+        })
+        .filter(Boolean);
+}
+
 function containsExpectedSubstrings(text, substrings = []) {
     if (!substrings.length) return 1;
     const haystack = normalizeComparableText(text);
     const hits = substrings.filter(item => haystack.includes(normalizeComparableText(item))).length;
     return hits / substrings.length;
+}
+
+function computeBundleCompleteness(bundle = null) {
+    if (!bundle) return 0;
+    let score = 0;
+    if (bundle.contact_profile) score += 0.25;
+    if ((bundle.dominant_topics || []).length) score += 0.2;
+    if ((bundle.recent_timeline || []).length) score += 0.2;
+    if (bundle.direct_quotes_by_speaker && Object.keys(bundle.direct_quotes_by_speaker).length) score += 0.2;
+    if (bundle.interaction_stats) score += 0.1;
+    if (Array.isArray(bundle.uncertainty_flags)) score += 0.05;
+    return Math.min(1, score);
 }
 
 function evaluateCase(testCase, result, latencyMs) {
@@ -67,9 +95,15 @@ function evaluateCase(testCase, result, latencyMs) {
     const expectedEntities = testCase.expected_entities || [];
     const expectedRemoteIds = testCase.expected_remote_ids || [];
     const expectedSubstrings = testCase.expected_substrings || [];
+    const expectedMemoryIds = testCase.expected_memory_ids || [];
+    const expectedEdgeKeys = testCase.expected_edge_keys || [];
+    const expectedEvidenceKinds = testCase.expected_evidence_kinds || [];
+    const expectedCitationMin = Number(testCase.expected_citation_min ?? 1);
 
     const entityAccuracy = overlapRatio(expectedEntities, candidateEntityNames(result));
     const remoteHit = overlapRatio(expectedRemoteIds, candidateRemoteIds(result));
+    const evidenceKindAccuracy = overlapRatio(expectedEvidenceKinds, candidateSourceKinds(result));
+    const edgeAccuracy = overlapRatio(expectedEdgeKeys, candidateEdgeKeys(result));
     const precisionAtK = Math.max(entityAccuracy, remoteHit);
     const temporalAccuracy = computeTemporalAccuracy(
         testCase.expected_time_start,
@@ -80,6 +114,12 @@ function evaluateCase(testCase, result, latencyMs) {
         `${result.reply}\n${(result.verification?.supportedClaims || []).map(claim => claim.text).join('\n')}`,
         expectedSubstrings
     );
+    const memoryHit = overlapRatio(
+        expectedMemoryIds,
+        (result.candidates || []).map(candidate => candidate.source_id).filter(Boolean)
+    );
+    const citationCount = [...new Set((result.verification?.supportedClaims || []).flatMap(claim => claim.citations || []))].length;
+    const bundleCompleteness = computeBundleCompleteness(result.evidenceBundle);
 
     const abstentionPrecision = expectedMode === 'abstain'
         ? (actualMode === 'abstain' ? 1 : 0)
@@ -93,10 +133,14 @@ function evaluateCase(testCase, result, latencyMs) {
         (expectedMode === actualMode || (expectedMode === 'answer' && actualMode === 'conflict')) &&
         precisionAtK >= 0.5 &&
         temporalAccuracy >= 0.5 &&
-        (expectedSubstrings.length === 0 || substringCoverage >= 0.34);
+        (expectedSubstrings.length === 0 || substringCoverage >= 0.34) &&
+        (expectedEvidenceKinds.length === 0 || evidenceKindAccuracy >= 0.5) &&
+        (expectedEdgeKeys.length === 0 || edgeAccuracy >= 0.5) &&
+        citationCount >= expectedCitationMin;
 
     return {
         category: testCase.category,
+        style_tag: testCase.style_tag || 'general',
         query: testCase.query,
         expected_mode: expectedMode,
         actual_mode: actualMode,
@@ -104,6 +148,10 @@ function evaluateCase(testCase, result, latencyMs) {
         precision_at_k: precisionAtK,
         entity_resolution_accuracy: entityAccuracy,
         temporal_accuracy: temporalAccuracy,
+        evidence_kind_accuracy: evidenceKindAccuracy,
+        edge_accuracy: edgeAccuracy,
+        memory_hit: memoryHit,
+        bundle_completeness: bundleCompleteness,
         citation_coverage: Number(result.citationCoverage || 0),
         abstention_precision: abstentionPrecision,
         hallucinated,
@@ -111,15 +159,16 @@ function evaluateCase(testCase, result, latencyMs) {
         substring_coverage: substringCoverage,
         top_citations: (result.verification?.supportedClaims || []).flatMap(claim => claim.citations || []).slice(0, 8),
         plan: result.plan,
-        reply: result.reply
+        reply: result.reply,
+        query_style: result.queryStyle || testCase.style_tag || 'general'
     };
 }
 
-async function main() {
-    const clientId = getArg('client') || process.env.CLIENT_ID;
-    const runName = getArg('run-name', `evidence-first-${new Date().toISOString()}`);
-    const limit = Number(getArg('limit', '200'));
-
+export async function runEvalForClient({
+    clientId,
+    runName = `evidence-first-${new Date().toISOString()}`,
+    limit = 200
+} = {}) {
     if (!clientId) {
         throw new Error('Missing client id. Use --client=<uuid> or CLIENT_ID env.');
     }
@@ -156,6 +205,11 @@ async function main() {
     const avg = metric => totalCases
         ? caseResults.reduce((sum, item) => sum + Number(item[metric] || 0), 0) / totalCases
         : 0;
+    const averageWhere = (metric, predicate) => {
+        const subset = caseResults.filter(predicate);
+        if (!subset.length) return 0;
+        return subset.reduce((sum, item) => sum + Number(item[metric] || 0), 0) / subset.length;
+    };
 
     const summary = {
         client_id: clientId,
@@ -167,7 +221,13 @@ async function main() {
         abstention_precision: avg('abstention_precision'),
         entity_resolution_accuracy: avg('entity_resolution_accuracy'),
         temporal_accuracy: avg('temporal_accuracy'),
+        evidence_kind_accuracy: avg('evidence_kind_accuracy'),
+        edge_accuracy: avg('edge_accuracy'),
+        memory_hit: avg('memory_hit'),
+        bundle_completeness: avg('bundle_completeness'),
         hallucination_rate: avg('hallucinated'),
+        relationship_edge_accuracy: averageWhere('edge_accuracy', item => item.category === 'relationship_lookup'),
+        relationship_negative_false_positive_rate: averageWhere('hallucinated', item => item.category === 'relationship_abstain'),
         p50_latency_ms: Math.round(percentile(caseResults.map(item => item.latency_ms), 50)),
         p95_latency_ms: Math.round(percentile(caseResults.map(item => item.latency_ms), 95)),
         metadata: {
@@ -177,6 +237,14 @@ async function main() {
                 }
                 acc[item.category].total += 1;
                 acc[item.category].passed += item.passed ? 1 : 0;
+                return acc;
+            }, {}),
+            styles: caseResults.reduce((acc, item) => {
+                if (!acc[item.style_tag]) {
+                    acc[item.style_tag] = { total: 0, passed: 0 };
+                }
+                acc[item.style_tag].total += 1;
+                acc[item.style_tag].passed += item.passed ? 1 : 0;
                 return acc;
             }, {}),
             sample_failures: caseResults.filter(item => !item.passed).slice(0, 25),
@@ -191,10 +259,19 @@ async function main() {
     if (insertError) throw insertError;
 
     console.log(JSON.stringify(summary, null, 2));
-    process.exit(0);
+    return summary;
 }
 
-main().catch(error => {
-    console.error('[RAG Eval] Failed:', error.message);
-    process.exitCode = 1;
-});
+async function main() {
+    const clientId = getArg('client') || process.env.CLIENT_ID;
+    const runName = getArg('run-name', `evidence-first-${new Date().toISOString()}`);
+    const limit = Number(getArg('limit', '200'));
+    await runEvalForClient({ clientId, runName, limit });
+}
+
+if (import.meta.url === new URL(process.argv[1], 'file:').href) {
+    main().catch(error => {
+        console.error('[RAG Eval] Failed:', error.message);
+        process.exitCode = 1;
+    });
+}

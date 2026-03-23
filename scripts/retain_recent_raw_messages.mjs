@@ -2,6 +2,7 @@ import supabase from '../config/supabase.mjs';
 import { distillAndVectorize } from '../memory_worker.mjs';
 import { hydrateContactIdentities, repairOwnerIdentity } from '../services/identity.service.mjs';
 import { invalidateSemanticCache } from '../services/local_ai.mjs';
+import { collectGraphHealthSnapshot, formatGraphHealthStatus } from '../services/graph_health.service.mjs';
 
 const clientId = process.argv[2];
 const keepCount = Number(process.argv[3] || 6000);
@@ -201,9 +202,10 @@ async function retainRecentRawMessages() {
     const totalAfter = await countRawMessages();
     console.log(`[Retain] raw_messages finales: ${totalAfter}`);
 
+    const health = await collectGraphHealthSnapshot(clientId);
     await supabase
         .from('user_souls')
-        .update({ is_processing: false, worker_status: `Corpus ready (${totalAfter} recent raw messages)` })
+        .update({ is_processing: false, worker_status: `${formatGraphHealthStatus(health)} | corpus ready (${totalAfter} recent raw messages)` })
         .eq('client_id', clientId);
 
     console.log(`[Retain] Corpus reciente reconstruido correctamente para ${clientId}.`);

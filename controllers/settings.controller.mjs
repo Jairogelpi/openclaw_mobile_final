@@ -50,6 +50,9 @@ export async function handleUpdateSettings(req, res, params, id, encrypt, decryp
                 gateway.slug = clientSlug;
                 gateway.models = { providers: { openrouter: { apiKey: process.env.OPENROUTER_API_KEY } } };
                 gateway.agents = { defaults: { model: { primary: "openrouter/deepseek/deepseek-chat" } } };
+                if (gateway.gateway && gateway.gateway.auth) {
+                    gateway.gateway.auth.token = process.env.OPENCLAW_GATEWAY_TOKEN;
+                }
             } catch (e) {
                 console.warn(`[Bridge] Warning parsing base gateway.json5 template:`, e.message);
             }

@@ -1,4 +1,4 @@
-import { distillAndVectorize } from '../memory_worker.mjs';
+import { distillAndVectorize } from '../workers/memory_worker.mjs';
 import supabase from '../config/supabase.mjs';
 
 const clientId = 'cc2afceb-4db2-4c1e-81e3-9adf8d6eaad6';

@@ -1,9 +1,17 @@
 import {
     fallbackNameFromRemoteId,
     isGenericSpeakerLabel,
+    normalizeEntityLikeText,
     normalizeComparableText,
     stripDecorativeText
 } from './message_guard.mjs';
+import { classifyIdentityLikeName } from './identity_policy.mjs';
+import {
+    compactDigits,
+    evaluateEntityAdmissibility,
+    evaluateRelationshipAdmissibility,
+    isPhoneLikeGraphName
+} from './graph_admissibility_policy.mjs';
 
 const OWNER_ALIASES = new Set([
     'usuario',
@@ -12,6 +20,7 @@ const OWNER_ALIASES = new Set([
     'yo',
     'me',
     'mi clon',
+    'mi clon (yo)',
     'mi clon yo',
     'titular'
 ]);
@@ -100,7 +109,11 @@ const ENTITY_TYPE_ALIASES = new Map([
     ['objeto', 'OBJETO'],
     ['object', 'OBJETO'],
     ['entity', 'ENTITY'],
-    ['concepto', 'ENTITY']
+    ['concepto', 'ENTITY'],
+    ['rasgo', 'RASGO_PERSONALIDAD'],
+    ['personalidad', 'RASGO_PERSONALIDAD'],
+    ['valor', 'VALOR_CENTRAL'],
+    ['creencia', 'VALOR_CENTRAL']
 ]);
 
 const PERSON_LIKE_ENTITY_TYPES = new Set(['PERSONA']);
@@ -146,7 +159,14 @@ const RELATION_TYPE_ALIASES = new Map([
     ['evento_con', 'EVENTO_CON'],
     ['event_with', 'EVENTO_CON'],
     ['conoce_a', 'CONOCE_A'],
-    ['knows', 'CONOCE_A']
+    ['knows', 'CONOCE_A'],
+    ['siente', 'SIENTE'],
+    ['emocion', 'SIENTE'],
+    ['sentiment', 'SIENTE'],
+    ['apoya', 'SIENTE'],
+    ['cuida', 'SIENTE'],
+    ['prioriza', 'PREFIERE'],
+    ['valora', 'PREFIERE']
 ]);
 
 const ALLOWED_RELATION_TYPES = new Set([
@@ -164,7 +184,8 @@ const ALLOWED_RELATION_TYPES = new Set([
     'PLANEA',
     'PREFIERE',
     'EVITA',
-    'EVENTO_CON'
+    'EVENTO_CON',
+    'SIENTE'
 ]);
 
 const EXPLICIT_RELATION_CUES = new Map([
@@ -172,15 +193,83 @@ const EXPLICIT_RELATION_CUES = new Map([
     ['[PAREJA_DE]', ['pareja', 'novia', 'novio', 'mi amor', 'te amo', 'amor', 'cariño', 'carino', 'beso']],
     ['[AMISTAD]', ['amigo', 'amiga', 'colega', 'bro', 'colegas']],
     ['[TRABAJA_EN]', ['trabajo', 'curro', 'empresa', 'oficina', 'jefe', 'jefa']],
-    ['[VIVE_EN]', ['vive', 'casa', 'piso', 'mudado', 'mudarse']],
-    ['[ESTUDIA_EN]', ['estudia', 'universidad', 'instituto', 'master', 'máster', 'curso']],
-    ['[CONOCE_A]', ['conoce', 'quedo con', 'quedé con', 'he hablado con', 'hablé con']],
-    ['[USA]', ['usa', 'utiliza', 'con esto', 'me he comprado', 'me he pillado']],
-    ['[POSEE]', ['tiene', 'tengo', 'posee', 'lleva', 'he pillado']],
-    ['[PLANEA]', ['voy a', 'quiero', 'planeo', 'plan', 'vamos a']],
-    ['[PREFIERE]', ['prefiero', 'me gusta', 'me encanta']],
-    ['[EVITA]', ['evita', 'no quiero', 'odio', 'paso de']]
+    ['[HABLA_DE]', ['habla de', 'hablar de', 'sobre', 'menciona', 'comenta', 'pregunta por', 'dice de']],
+    ['[RELACIONADO_CON]', ['relacionado con', 'conectado con', 'asociado con', 'vinculado con', 'tiene que ver con']],
+    ['[EVENTO_CON]', ['con', 'junto a', 'acompanado de', 'acompañado de']],
+    ['[SIENTE]', ['siente', 'se siente', 'siento', 'me siento', 'agobio', 'estrés', 'estres', 'feliz', 'miedo', 'triste', 'ilusion', 'ilusión', 'ganas']],
+    ['[PLANEA]', ['voy a', 'quiero', 'planeo', 'plan', 'vamos a', 'tengo que', 'haré', 'hare']]
 ]);
+
+const STRONG_FRIENDSHIP_PATTERNS = [
+    /\bes mi amig[oa]\b/i,
+    /\beres mi amig[oa]\b/i,
+    /\bsois amig[oa]s\b/i,
+    /\bsomos amig[oa]s\b/i,
+    /\bmi mejor amig[oa]\b/i,
+    /\bgran amig[oa]\b/i
+];
+
+const DETERMINISTIC_PRIVATE_RELATIONS = [
+    {
+        type: '[PAREJA_DE]',
+        weight: 9,
+        cues: ['te amo', 'mi amor', 'mi vida', 'amor mio']
+    },
+    {
+        type: '[AMISTAD]',
+        weight: 7,
+        cues: ['eres mi amigo', 'eres mi amiga', 'somos amigos', 'somos amigas', 'mi mejor amigo', 'mi mejor amiga']
+    }
+];
+
+const ROMANTIC_VOCATIVE_PATTERNS = [
+    /(^|[,:;!?\-]\s*)mi vida([!,. ]|$)/i,
+    /(^|[,:;!?\-]\s*)mi amor([!,. ]|$)/i,
+    /(^|[,:;!?\-]\s*)amor mio([!,. ]|$)/i,
+    /\bte amo\b/i
+];
+
+const ROMANTIC_SECOND_PERSON_PATTERNS = [
+    /\bte\b/i,
+    /\btu\b/i,
+    /\bti\b/i,
+    /\bcontigo\b/i,
+    /\beres\b/i,
+    /\bme estas\b/i,
+    /\bme est[aá]s\b/i
+];
+
+const ROMANTIC_NEGATIVE_PATTERNS = [
+    /\bde mi vida\b/i,
+    /\bpeor etapa de mi vida\b/i,
+    /\balegria a m[ií] vida\b/i,
+    /\balegría a m[ií] vida\b/i
+];
+
+const ROMANTIC_REPORTED_CONTEXT_PATTERNS = [
+    /\bnos dec[ií]amos te amo\b/i,
+    /\bnos dijimos te amo\b/i,
+    /\bdec[ií]amos te amo\b/i,
+    /\b(dijo|dec[ií]a|decia)\s+te amo\b/i,
+    /\bme dijo\s+te amo\b/i,
+    /\ble dije\s+te amo\b/i,
+    /\bse dijeron\s+te amo\b/i
+];
+
+const FRIENDSHIP_DIRECT_PATTERNS = [
+    /\beres mi amig[oa]\b/i,
+    /\bsomos amig[oa]s\b/i,
+    /\bmi mejor amig[oa]\b/i
+];
+
+const AFFECTIONATE_PAIR_SIGNALS = [
+    { key: 'te_como', pattern: /\bte como\b/i, score: 2 },
+    { key: 'besitos', pattern: /\bbesitos?\b/i, score: 2 },
+    { key: 'kiss', pattern: /\b(beso|besote|besazo)\b/i, score: 1 },
+    { key: 'heart_emoji', pattern: /[❤❤️💖💘💝💞💕🥰😍]/u, score: 1 },
+    { key: 'te_cuido', pattern: /\bte pienso cuidar\b/i, score: 2 },
+    { key: 'me_encantas', pattern: /\bme encantas\b/i, score: 2 }
+];
 
 function trimEntityEdges(value) {
     return String(value || '')
@@ -263,6 +352,40 @@ function hasExplicitCue(relationType, evidenceText, contextText = '') {
     return cues.some(cue => haystack.includes(normalizeComparableText(cue)));
 }
 
+function hasNegativeTalkCue(evidenceText, contextText = '') {
+    const haystack = normalizeComparableText(`${evidenceText || ''} ${contextText || ''}`);
+    return [
+        'hablar con',
+        'quiere hablar con',
+        'hablo con',
+        'habló con',
+        'respuesta sobre',
+        'respuesta a',
+        'contesta a',
+        'contestó a',
+        'gracias',
+        'expresion de afecto',
+        'expresión de afecto'
+    ].some(cue => haystack.includes(normalizeComparableText(cue)));
+}
+
+function isReportedRomanticContext(text = '') {
+    const raw = String(text || '');
+    if (!raw) return false;
+    return ROMANTIC_REPORTED_CONTEXT_PATTERNS.some(pattern => pattern.test(raw));
+}
+
+function hasDirectedRomanticAddress(text = '') {
+    const raw = String(text || '');
+    if (!raw) return false;
+    if (ROMANTIC_NEGATIVE_PATTERNS.some(pattern => pattern.test(raw))) return false;
+    if (isReportedRomanticContext(raw)) return false;
+
+    if (!ROMANTIC_VOCATIVE_PATTERNS.some(pattern => pattern.test(raw))) return false;
+
+    return ROMANTIC_SECOND_PERSON_PATTERNS.some(pattern => pattern.test(raw));
+}
+
 function relationshipHasStrongEvidence({
     relationType,
     sourceName,
@@ -279,8 +402,31 @@ function relationshipHasStrongEvidence({
     const contactKey = normalizeComparableText(contactName);
     const sourceKey = normalizeComparableText(sourceName);
     const targetKey = normalizeComparableText(targetName);
-    const mentionsSource = relationMentionsEntity(evidence, sourceName);
-    const mentionsTarget = relationMentionsEntity(evidence, targetName);
+    const normalizedOwner = normalizeComparableText(ownerName);
+    const normalizedContact = normalizeComparableText(contactName);
+    const normalizedEntity = normalizeComparableText(sourceName);
+    const normalizedTargetEntity = normalizeComparableText(targetName);
+    const normalizedEvidence = normalizeComparableText(evidence);
+
+    const isOwnerSource = normalizedEntity === normalizedOwner;
+    const isOwnerTarget = normalizedTargetEntity === normalizedOwner;
+    const isContactSource = normalizedEntity === normalizedContact;
+    const isContactTarget = normalizedTargetEntity === normalizedContact;
+
+    const ownerAliases = ['yo', 'mi ', 'mí ', 'me '];
+    const contactAliases = ['tú', 'tu ', 'tío', 'tio', 'tía', 'tia', 'colega'];
+
+    let mentionsSource = relationMentionsEntity(evidence, sourceName);
+    let mentionsTarget = relationMentionsEntity(evidence, targetName);
+
+    if (!mentionsSource) {
+        if (isOwnerSource) mentionsSource = ownerAliases.some(a => normalizedEvidence.includes(a));
+        if (isContactSource) mentionsSource = contactAliases.some(a => normalizedEvidence.includes(a));
+    }
+    if (!mentionsTarget) {
+        if (isOwnerTarget) mentionsTarget = ownerAliases.some(a => normalizedEvidence.includes(a));
+        if (isContactTarget) mentionsTarget = contactAliases.some(a => normalizedEvidence.includes(a));
+    }
     const speakerMatchesSource = speakerKey && speakerKey === sourceKey;
     const speakerMatchesTarget = speakerKey && speakerKey === targetKey;
     const privatePair =
@@ -290,13 +436,72 @@ function relationshipHasStrongEvidence({
         new Set([sourceKey, targetKey]).size === 2 &&
         [sourceKey, targetKey].includes(ownerKey) &&
         [sourceKey, targetKey].includes(contactKey);
+    const requiresDirectionalSpeakerAnchor = ['[PAREJA_DE]', '[AMISTAD]', '[FAMILIA_DE]', '[CONOCE_A]'].includes(relationType);
+
+    if (speakerKey && requiresDirectionalSpeakerAnchor && privatePair) {
+        if (relationType === '[PAREJA_DE]') {
+            if (speakerMatchesSource) {
+                return hasDirectedRomanticAddress(evidence);
+            }
+
+            if (speakerMatchesTarget) {
+                return false;
+            }
+        }
+
+        if (speakerMatchesSource) {
+            if (relationType === '[AMISTAD]') {
+                const friendshipText = `${evidence || ''} ${context || ''}`;
+                return STRONG_FRIENDSHIP_PATTERNS.some(pattern => pattern.test(friendshipText))
+                    && (mentionsTarget || hasExplicitCue(relationType, evidence, context));
+            }
+            return mentionsTarget || hasExplicitCue(relationType, evidence, context);
+        }
+
+        if (speakerMatchesTarget && !mentionsSource) {
+            return false;
+        }
+    }
 
     if (relationType === '[HABLA_DE]') {
-        return mentionsTarget;
+        if (hasNegativeTalkCue(evidence, context)) {
+            return false;
+        }
+        return hasExplicitCue(relationType, evidence, context)
+            && mentionsTarget
+            && (mentionsSource || speakerMatchesSource);
+    }
+
+    if (relationType === '[SIENTE]' || relationType === '[PLANEA]' || relationType === '[VALOR_CENTRAL]') {
+        // Relaciones de Nivel 5: Relaxed grounding
+        // Permitimos si hay un cue explícito (ej: "me siento") aunque no se mencione el nombre del sujeto
+        // ya que el contexto de "quién habla" suele ser implícito en el chat.
+        const ok = hasExplicitCue(relationType, evidence, context);
+        return ok && (mentionsSource || mentionsTarget || speakerMatchesSource || privatePair);
     }
 
     if (relationType === '[RELACIONADO_CON]' || relationType === '[EVENTO_CON]') {
-        return (mentionsSource || speakerMatchesSource || speakerMatchesTarget) && mentionsTarget;
+        return hasExplicitCue(relationType, evidence, context)
+            && (mentionsSource || speakerMatchesSource || speakerMatchesTarget)
+            && mentionsTarget;
+    }
+
+    if (relationType === '[AMISTAD]') {
+        const friendshipText = `${evidence || ''} ${context || ''}`;
+        const hasStrongFriendshipCue = STRONG_FRIENDSHIP_PATTERNS.some(pattern => pattern.test(friendshipText));
+        if (!hasStrongFriendshipCue) {
+            return false;
+        }
+
+        if (mentionsSource && mentionsTarget) {
+            return true;
+        }
+
+        if (privatePair && (speakerMatchesSource || speakerMatchesTarget)) {
+            return true;
+        }
+
+        return speakerMatchesSource && mentionsTarget;
     }
 
     if (mentionsSource && mentionsTarget) {
@@ -332,17 +537,12 @@ function resolveKnownEntity(name, entityMap, knownNames, ownerName) {
     return entity;
 }
 
-function compactDigits(value) {
-    return String(value || '').replace(/[^\d]/g, '');
-}
-
-function isPhoneLikeEntityName(value) {
-    const digits = compactDigits(value);
-    return digits.length >= 7;
-}
-
 function hasLeadingArticle(value) {
     return /^(el|la|los|las|un|una)\s+/i.test(String(value || '').trim());
+}
+
+function hasLowercaseArticleEntityShape(value) {
+    return /^(el|la|los|las|un|una)\s+[a-záéíóúñ]/.test(String(value || '').trim());
 }
 
 function isWeakEntityDescription(value) {
@@ -358,7 +558,57 @@ function isWeakEntityDescription(value) {
         'comunicacion en el chat',
         'comunicación en el chat',
         'fenomeno meteorologico',
-        'fenómeno meteorológico'
+        'fenómeno meteorológico',
+        'evento climatico',
+        'evento climático',
+        'lugar de descanso'
+    ].includes(normalized);
+}
+
+function matchesWeakEntityDescriptionPattern(value) {
+    const normalized = normalizeComparableText(value);
+    if (!normalized) return true;
+
+    return [
+        /^lugar\b/,
+        /^objeto\b/,
+        /^tema\b/,
+        /^asunto\b/,
+        /^evento\b/,
+        /^mascota\b/,
+        /^animal\b/,
+        /^fenomeno\b/,
+        /^fenómeno\b/,
+        /^sitio\b/
+    ].some(pattern => pattern.test(normalized));
+}
+
+function matchesWeakPersonDescriptionPattern(value) {
+    const normalized = normalizeComparableText(value);
+    if (!normalized) return true;
+
+    return [
+        /^interlocutor\b/,
+        /^usuario del chat\b/,
+        /^mencionado en la conversacion\b/,
+        /^mencionado en la conversación\b/,
+        /^persona que\b/,
+        /^(hijo|hija|hermano|hermana|novio|novia|pareja|amigo|amiga)\b/
+    ].some(pattern => pattern.test(normalized));
+}
+
+function isWeakRelationshipContext(value) {
+    const normalized = normalizeComparableText(value);
+    if (!normalized) return true;
+
+    return [
+        'conversacion',
+        'conversación',
+        'chat',
+        'mensaje',
+        'mensajes',
+        'hablan',
+        'comentario'
     ].includes(normalized);
 }
 
@@ -369,30 +619,30 @@ function isWeakStandaloneEntity({
     evidence,
     knownNames,
     remoteId,
-    isGroup
+    isGroup,
+    chunkText = '',
+    groundedBySpeaker = false,
+    groundedByEvidence = false,
+    groundedByMention = false
 }) {
-    const normalizedName = normalizeComparableText(name);
-    if (!normalizedName) return true;
-    const entityType = sanitizeEntityType(type);
-    const known = knownNames.has(normalizedName);
-
-    if (isPhoneLikeEntityName(name)) {
-        if (entityType === 'PERSONA' && !known) return true;
-        if (isGroup && compactDigits(remoteId) !== compactDigits(name)) return true;
-    }
-
-    if (known) return false;
-
-    if (['LUGAR', 'ORGANIZACION', 'EVENTO', 'TEMA', 'ENTITY'].includes(entityType)) {
-        const genericArticleEntity = hasLeadingArticle(name) && isWeakEntityDescription(desc || evidence || '');
-        if (genericArticleEntity) return true;
-    }
-
-    return false;
+    const admissibility = evaluateEntityAdmissibility({
+        name,
+        type: sanitizeEntityType(type),
+        desc,
+        evidence,
+        knownNames,
+        remoteId,
+        isGroup,
+        chunkText,
+        groundedBySpeaker,
+        groundedByEvidence,
+        groundedByMention
+    });
+    return !admissibility.allowed;
 }
 
 export function normalizeEntityName(value, ownerName = null) {
-    const rawValue = trimEntityEdges(stripDecorativeText(value));
+    const rawValue = trimEntityEdges(normalizeEntityLikeText(value));
     if (!rawValue) return null;
 
     const comparable = normalizeComparableText(rawValue);
@@ -410,6 +660,21 @@ export function sanitizeEntityType(value) {
     const normalized = normalizeComparableText(value);
     if (!normalized) return 'ENTITY';
     return ENTITY_TYPE_ALIASES.get(normalized) || 'ENTITY';
+}
+
+export function deriveEffectiveEntityType(entityName, entityType) {
+    const normalizedType = sanitizeEntityType(entityType);
+    const identityKind = classifyIdentityLikeName(entityName);
+
+    if (normalizedType === 'PERSONA' && identityKind === 'group_label') {
+        return 'GRUPO';
+    }
+
+    if (normalizedType === 'PERSONA' && identityKind === 'role_mention') {
+        return null;
+    }
+
+    return normalizedType;
 }
 
 export function sanitizeRelationType(value) {
@@ -482,7 +747,11 @@ export function validateGroundedGraph({
             evidence,
             knownNames,
             remoteId,
-            isGroup
+            isGroup,
+            chunkText,
+            groundedBySpeaker,
+            groundedByEvidence,
+            groundedByMention
         })) {
             continue;
         }
@@ -510,20 +779,17 @@ export function validateGroundedGraph({
 
         const evidence = pickEvidence(relationship);
         if (!evidence || !snippetExistsInText(chunkText, evidence)) continue;
-        if (relationType === '[HABLA_DE]') {
-            if (isPhoneLikeEntityName(targetEntity.name)) continue;
-            if (isGroup && isWeakStandaloneEntity({
-                name: targetEntity.name,
-                type: targetEntity.type,
-                desc: targetEntity.desc,
-                evidence,
-                knownNames,
-                remoteId,
-                isGroup
-            })) {
-                continue;
-            }
-        }
+        const relationAdmissibility = evaluateRelationshipAdmissibility({
+            relationType,
+            sourceEntity,
+            targetEntity,
+            evidence,
+            context: relationship?.context,
+            knownNames,
+            remoteId,
+            isGroup
+        });
+        if (!relationAdmissibility.allowed) continue;
         if (!relationshipHasStrongEvidence({
             relationType,
             sourceName: sourceEntity.name,
@@ -557,7 +823,11 @@ export function validateGroundedGraph({
         if (
             relationType === '[HABLA_DE]'
             && isGroup
-            && sanitizeEntityType(sourceEntity.type) === 'GRUPO'
+            && (
+                !isPersonLikeEntityType(sourceEntity.type)
+                || sanitizeEntityType(sourceEntity.type) === 'GRUPO'
+                || normalizeComparableText(sourceEntity.name) === normalizeComparableText(contactName)
+            )
             && isPersonLikeEntityType(targetEntity.type)
         ) {
             continue;
@@ -585,6 +855,155 @@ export function validateGroundedGraph({
         entities: [...entityMap.values()],
         relationships: [...relationshipMap.values()]
     };
+}
+
+export function extractDeterministicRelationships({
+    chunkText = '',
+    ownerName = null,
+    contactName = null,
+    isGroup = false
+}) {
+    if (isGroup || !ownerName || !contactName) return [];
+
+    const owner = normalizeEntityName(ownerName, ownerName);
+    const contact = normalizeEntityName(contactName, ownerName);
+    if (!owner || !contact || owner === contact) return [];
+
+    const lines = String(chunkText || '')
+        .split('\n')
+        .map(line => line.trim())
+        .filter(Boolean);
+
+    const results = [];
+    const seen = new Set();
+    const romanticScores = new Map([
+        [owner, { score: 0, lines: [], signals: new Set(), hasDirectedCue: false }],
+        [contact, { score: 0, lines: [], signals: new Set(), hasDirectedCue: false }]
+    ]);
+
+    for (const line of lines) {
+        const normalizedLine = normalizeComparableText(line);
+        if (!normalizedLine) continue;
+        const speaker = extractEvidenceSpeaker(line, ownerName);
+        const speakerKey = normalizeComparableText(speaker);
+        const ownerKey = normalizeComparableText(owner);
+        const contactKey = normalizeComparableText(contact);
+
+        if (!speakerKey) continue;
+        if (![ownerKey, contactKey].includes(speakerKey)) continue;
+        if (speakerKey === ownerKey && contactKey.includes(ownerKey)) continue;
+        if (speakerKey === contactKey && ownerKey.includes(contactKey)) continue;
+
+        const source = speakerKey === ownerKey ? owner : contact;
+        const target = speakerKey === ownerKey ? contact : owner;
+
+        for (const relation of DETERMINISTIC_PRIVATE_RELATIONS) {
+            const matchedCue = relation.cues.find(cue => normalizedLine.includes(normalizeComparableText(cue)));
+            if (!matchedCue) continue;
+            if (relation.type === '[PAREJA_DE]' && !ROMANTIC_VOCATIVE_PATTERNS.some(pattern => pattern.test(line))) {
+                continue;
+            }
+            if (relation.type === '[PAREJA_DE]' && ROMANTIC_NEGATIVE_PATTERNS.some(pattern => pattern.test(line))) {
+                continue;
+            }
+            if (relation.type === '[PAREJA_DE]' && !hasDirectedRomanticAddress(line)) {
+                continue;
+            }
+            if (relation.type === '[AMISTAD]' && !FRIENDSHIP_DIRECT_PATTERNS.some(pattern => pattern.test(line))) {
+                continue;
+            }
+
+            const key = `${normalizeComparableText(source)}::${relation.type}::${normalizeComparableText(target)}`;
+            if (seen.has(key)) continue;
+            seen.add(key);
+            results.push({
+                source,
+                target,
+                type: relation.type,
+                weight: relation.weight,
+                context: clampText(`cue:${matchedCue} | ${line}`, 300),
+                evidence: clampText(line, 300)
+            });
+
+            if (relation.type === '[PAREJA_DE]') {
+                const current = romanticScores.get(source);
+                if (current) {
+                    current.score += 3;
+                    current.lines.push(line);
+                    current.signals.add('explicit_romantic');
+                    current.hasDirectedCue = true;
+                }
+            }
+        }
+
+        if (hasDirectedRomanticAddress(line)) {
+            const current = romanticScores.get(source);
+            if (current) {
+                current.score += 1;
+                current.lines.push(line);
+                current.signals.add('vocative');
+                current.hasDirectedCue = true;
+            }
+        }
+
+        if (!ROMANTIC_NEGATIVE_PATTERNS.some(pattern => pattern.test(line)) && !isReportedRomanticContext(line)) {
+            const current = romanticScores.get(source);
+            if (current) {
+                if (ROMANTIC_SECOND_PERSON_PATTERNS.some(pattern => pattern.test(line))) {
+                    current.hasDirectedCue = true;
+                }
+                for (const signal of AFFECTIONATE_PAIR_SIGNALS) {
+                    if (!signal.pattern.test(line)) continue;
+                    current.score += signal.score;
+                    current.lines.push(line);
+                    current.signals.add(signal.key);
+                }
+            }
+        }
+    }
+
+    const ownerRomantic = romanticScores.get(owner) || { score: 0, lines: [], signals: new Set(), hasDirectedCue: false };
+    const contactRomantic = romanticScores.get(contact) || { score: 0, lines: [], signals: new Set(), hasDirectedCue: false };
+    const ownerToContactKey = `${normalizeComparableText(owner)}::[PAREJA_DE]::${normalizeComparableText(contact)}`;
+    const contactToOwnerKey = `${normalizeComparableText(contact)}::[PAREJA_DE]::${normalizeComparableText(owner)}`;
+
+    if (
+        !seen.has(ownerToContactKey)
+        && ownerRomantic.hasDirectedCue
+        && ownerRomantic.score >= 4
+        && ownerRomantic.signals.size >= 2
+        && ownerRomantic.lines.some(line => hasDirectedRomanticAddress(line))
+    ) {
+        seen.add(ownerToContactKey);
+        results.push({
+            source: owner,
+            target: contact,
+            type: '[PAREJA_DE]',
+            weight: 9,
+            context: clampText(`aggregate_romantic_score:${ownerRomantic.score}`, 300),
+            evidence: clampText(ownerRomantic.lines[0] || '', 300)
+        });
+    }
+
+    if (
+        !seen.has(contactToOwnerKey)
+        && contactRomantic.hasDirectedCue
+        && contactRomantic.score >= 4
+        && contactRomantic.signals.size >= 2
+        && contactRomantic.lines.some(line => hasDirectedRomanticAddress(line))
+    ) {
+        seen.add(contactToOwnerKey);
+        results.push({
+            source: contact,
+            target: owner,
+            type: '[PAREJA_DE]',
+            weight: 9,
+            context: clampText(`aggregate_romantic_score:${contactRomantic.score}`, 300),
+            evidence: clampText(contactRomantic.lines[0] || '', 300)
+        });
+    }
+
+    return results;
 }
 
 export function expandDetectedNamesConservatively(detectedNames, knownNames) {

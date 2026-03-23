@@ -1,5 +1,6 @@
 import supabase from '../config/supabase.mjs';
 import groq from '../services/groq.mjs';
+import { filterValidCommunityNodeIds } from '../utils/community_guard.mjs';
 
 const parseLLMJson = (text) => {
     try {
@@ -33,6 +34,7 @@ export async function detectAndSaveCommunities(clientId) {
         }
 
         const nodesList = nodes.map(n => `[ID: ${n.id}] ${n.entity_name} - ${n.description}`).join('\n');
+        const validNodeIds = new Set(nodes.map(node => node.id).filter(Boolean));
 
         // 2. LLM Clustering (Leiden Algorithm emulado por LLM)
         const clusterPrompt = `Eres un Algoritmo de Detección de Comunidades (GraphRAG Nivel 1).
@@ -72,7 +74,8 @@ Responde ÚNICAMENTE en JSON con esta estructura:
         if (discovery.communities && discovery.communities.length > 0) {
             console.log(`🌍 [Community] Se detectaron ${discovery.communities.length} nuevas comunidades.`);
             for (const comm of discovery.communities) {
-                if (!comm.node_ids || comm.node_ids.length < 2) continue; // Ignorar comunidades de 1 nodo
+                const validCommunityNodeIds = filterValidCommunityNodeIds(comm.node_ids, validNodeIds);
+                if (validCommunityNodeIds.length < 2) continue; // Ignorar comunidades de 1 nodo o IDs inválidos
 
                 // Insertar Comunidad
                 const { data: insertedComm, error: commError } = await supabase
@@ -92,10 +95,15 @@ Responde ÚNICAMENTE en JSON con esta estructura:
                 }
 
                 // Relacionar Nodos
-                const relations = comm.node_ids.map(nodeId => ({
+                const relations = filterValidCommunityNodeIds(validCommunityNodeIds, validNodeIds).map(nodeId => ({
                     node_id: nodeId,
                     community_id: insertedComm.id
                 }));
+
+                if (relations.length < 2) {
+                    console.warn(`ðŸŒ [Community] ${comm.name} descartada tras validaciÃ³n final de node_ids.`);
+                    continue;
+                }
 
                 const { error: relError } = await supabase
                     .from('node_communities')

@@ -1,7 +1,12 @@
 import supabase from '../config/supabase.mjs';
-import { normalizeComparableText } from '../utils/message_guard.mjs';
+import { fallbackNameFromRemoteId, normalizeComparableText, normalizeEntityLikeText } from '../utils/message_guard.mjs';
+import { classifyIdentityLikeName } from '../utils/identity_policy.mjs';
+import {
+    evaluateEntityAdmissibility,
+    evaluateRelationshipAdmissibility
+} from '../utils/graph_admissibility_policy.mjs';
 
-const clientId = process.argv[2];
+const clientId = String(process.argv[2] || '').trim();
 
 if (!clientId) {
     console.error('Usage: node scripts/audit_graph_quality.mjs <client_id>');
@@ -53,8 +58,10 @@ const BLOCKED_NODE_NAMES = new Set([
 const ROLE_LIKE_NODE_PATTERNS = [
     /^mi\s+(madre|padre|hermano|hermana|primo|prima|jefe|jefa|medico|médico)$/i,
     /^su\s+(madre|padre|hermano|hermana|primo|prima)$/i,
-    /^(el|la)\s+[a-záéíóúñ]{3,}$/i
+    /^(el|la)\s+(jefe|jefa|nino|niño|china|chino|tipo|tio|tío|piky|moraga|azid)$/i
 ];
+
+const ARTICLE_ACRONYM_ENTITY_PATTERN = /^(el|la|los|las)\s+[A-ZÁÉÍÓÚÑ0-9]{2,}(?:\s+[A-ZÁÉÍÓÚÑ0-9]{2,})*$/;
 
 const SUSPICIOUS_CONTEXT_PATTERNS = [
     /\busuario\b/i,
@@ -65,26 +72,83 @@ const SUSPICIOUS_CONTEXT_PATTERNS = [
 ];
 
 function normalize(value) {
-    return normalizeComparableText(String(value || ''));
+    return normalizeComparableText(normalizeEntityLikeText(String(value || '')));
+}
+
+function describeError(error) {
+    if (!error) return 'Unknown error';
+    if (typeof error === 'string') return error;
+    return error.message || error.details || JSON.stringify(error);
 }
 
 function isBlockedNodeName(value) {
+    const raw = String(value || '').trim();
+    if (ARTICLE_ACRONYM_ENTITY_PATTERN.test(raw)) return false;
+
     const normalized = normalize(value);
     if (!normalized) return true;
     if (BLOCKED_NODE_NAMES.has(normalized)) return true;
     if (/^\d{6,}$/.test(normalized)) return true;
     if (normalized.includes('@')) return true;
-    if (ROLE_LIKE_NODE_PATTERNS.some(pattern => pattern.test(String(value || '').trim()))) return true;
+    if (ROLE_LIKE_NODE_PATTERNS.some(pattern => pattern.test(raw))) return true;
     return false;
+}
+
+function isWeakGenericDescription(value) {
+    const normalized = normalize(value);
+    if (!normalized) return true;
+
+    return [
+        'interlocutor',
+        'usuario del chat',
+        'mencionado en la conversacion',
+        'mencionado en la conversación',
+        'conversacion',
+        'conversación'
+    ].includes(normalized);
+}
+
+function buildIdentityAnchorSet(rows = []) {
+    return new Set(
+        (rows || [])
+            .flatMap(row => [row?.canonical_name, ...(Array.isArray(row?.aliases) ? row.aliases : [])])
+            .map(value => normalize(value))
+            .filter(Boolean)
+    );
 }
 
 function isSuspiciousEdge(edge) {
     if (!edge) return false;
     if (isBlockedNodeName(edge.source_node) || isBlockedNodeName(edge.target_node)) return true;
+    const relationAdmissibility = evaluateRelationshipAdmissibility({
+        relationType: edge.relation_type,
+        sourceEntity: { name: edge.source_node, type: null, desc: '' },
+        targetEntity: { name: edge.target_node, type: null, desc: '' },
+        evidence: edge.context || '',
+        context: edge.context || '',
+        knownNames: new Set(),
+        remoteId: null,
+        isGroup: false
+    });
+    if (!relationAdmissibility.allowed) return true;
     const context = String(edge.context || '');
     if (SUSPICIOUS_CONTEXT_PATTERNS.some(pattern => pattern.test(context))) return true;
     if (!String(edge.relation_type || '').trim()) return true;
     return false;
+}
+
+function isFallbackNumericIdentity(row) {
+    const remoteId = String(row?.remote_id || '').trim();
+    if (!remoteId || String(remoteId).endsWith('@g.us')) return false;
+
+    const fallbackName = fallbackNameFromRemoteId(remoteId);
+    const canonical = String(row?.canonical_name || '').trim();
+    const aliases = Array.isArray(row?.aliases) ? row.aliases.map(alias => String(alias || '').trim()).filter(Boolean) : [];
+
+    if (!fallbackName || canonical !== fallbackName) return false;
+    if (!/^\d{6,}$/.test(canonical)) return false;
+
+    return aliases.length <= 1 && (!aliases.length || aliases[0] === fallbackName);
 }
 
 async function fetchRows(table, select, { pageSize = 1000 } = {}) {
@@ -129,13 +193,13 @@ async function fetchNodeCommunityCount() {
     const ids = (communities || []).map(row => row.id).filter(Boolean);
     if (!ids.length) return 0;
 
-    const { count, error: countError } = await supabase
+    const { data, error: countError } = await supabase
         .from('node_communities')
-        .select('*', { head: true, count: 'exact' })
+        .select('community_id')
         .in('community_id', ids);
 
     if (countError) throw countError;
-    return Number(count || 0);
+    return Number((data || []).length);
 }
 
 async function main() {
@@ -179,9 +243,39 @@ async function main() {
         return acc;
     }, {});
 
-    const suspiciousNodes = knowledgeNodes.filter(node => isBlockedNodeName(node.entity_name));
+    const identityAnchors = buildIdentityAnchorSet(contactIdentities);
+    const suspiciousNodes = knowledgeNodes.filter(node => {
+        if (isBlockedNodeName(node.entity_name)) return true;
+        const identityKind = classifyIdentityLikeName(node.entity_name);
+        const admissibility = evaluateEntityAdmissibility({
+            name: node.entity_name,
+            type: node.entity_type,
+            desc: node.description || '',
+            evidence: node.description || '',
+            knownNames: identityAnchors,
+            remoteId: null,
+            isGroup: false,
+            requireStrongAnchor: false
+        });
+        if (!admissibility.allowed) return true;
+        if (
+            String(node.entity_type || '').trim() === 'PERSONA'
+            && identityAnchors.has(normalize(node.entity_name))
+        ) {
+            return false;
+        }
+        if (
+            String(node.entity_type || '').trim() === 'PERSONA'
+            && identityKind === 'human_alias'
+        ) {
+            return false;
+        }
+        return ['PERSONA', 'OBJETO', 'LUGAR', 'ORGANIZACION', 'EVENTO'].includes(String(node.entity_type || '').trim())
+            && isWeakGenericDescription(node.description);
+    });
     const suspiciousEdges = knowledgeEdges.filter(edge => isSuspiciousEdge(edge));
     const suspiciousIdentities = contactIdentities.filter(row => {
+        if (isFallbackNumericIdentity(row)) return false;
         const aliases = Array.isArray(row.aliases) ? row.aliases : [];
         if (String(row.remote_id || '').endsWith('@g.us')) {
             return aliases.some(alias => {
@@ -224,6 +318,6 @@ async function main() {
 }
 
 main().catch(error => {
-    console.error('[Graph Audit] Error:', error.message);
+    console.error('[Graph Audit] Error:', describeError(error));
     process.exit(1);
 });

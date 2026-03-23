@@ -1,10 +1,14 @@
 version: '3.8'
 
 services:
-  bot_cliente_1:
+  # Plantilla para bots dinámicos. 
+  # Se puede invocar como: CLIENT_SLUG=mi-bot docker-compose up -d
+  openclaw_bot:
     image: ghcr.io/openclaw/openclaw:latest
-    container_name: openclaw_c1
+    container_name: openclaw_${CLIENT_SLUG:-default}
     restart: unless-stopped
+    environment:
+      - CLIENT_SLUG=${CLIENT_SLUG}
+      - CLIENT_ID=${CLIENT_ID}
     volumes:
-      # Aquí le indicamos tu nueva estructura de carpetas
-      - ./clients/cliente_1:/app/workspace
+      - ./clients/${CLIENT_SLUG:-default}:/app/workspace
