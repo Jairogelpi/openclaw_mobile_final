@@ -94,6 +94,19 @@ async function countClientRows(tableName) {
     return Number(count || 0);
 }
 
+async function countClientRows(tableName) {
+    const { count, error } = await supabase
+        .from(tableName)
+        .select('*', { head: true, count: 'exact' })
+        .eq('client_id', clientId);
+
+    if (error) {
+        throw error;
+    }
+
+    return Number(count || 0);
+}
+
 async function rebuild() {
     console.log(`[Rebuild] Iniciando saneado de relaciones para ${clientId}${resumeMode ? ' (resume)' : ''}${forceReprocessMode ? ' (force-reprocess)' : ''}...`);
 

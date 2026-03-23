@@ -45,6 +45,7 @@ export async function findEvidence(clientId, queryText, options = {}) {
         plan: { entities: cognitiveMap.knowledge.map(n => n.entity_name) }, // Injected from graph
         candidates
     });
+    trace?.setQueryStyle?.(detectQueryStyle(plan, queryText, candidates));
 
     return {
         candidates: assignCitationLabels(ranked.slice(0, 15)),

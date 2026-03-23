@@ -974,6 +974,10 @@ export async function upsertKnowledgeNode(clientId, entityName, entityType, desc
         await markEntityMentionPromoted(stagedMention.mentionId, inserted.id);
     }
 
+    if (stagedMention?.mentionId) {
+        await markEntityMentionPromoted(stagedMention.mentionId, inserted.id);
+    }
+
     return inserted.id;
 }
 
@@ -1091,6 +1095,9 @@ export async function upsertKnowledgeEdge(clientId, sourceName, targetName, rela
     if (error) {
         console.error('[Graph Service] Error upserting edge:', error.message);
         throw error;
+    }
+    if (stagedMention?.mentionId) {
+        await markRelationMentionPromoted(stagedMention.mentionId);
     }
     if (stagedMention?.mentionId) {
         await markRelationMentionPromoted(stagedMention.mentionId);
@@ -1648,6 +1655,8 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
 
         const requestedRelation = normalizeRelationFilterKey(options.relationFilter);
 
+        const requestedRelation = normalizeRelationFilterKey(options.relationFilter);
+
         for (const [left, right] of pairs.slice(0, 3)) {
             const queries = await Promise.all([
                 supabase
@@ -1681,6 +1690,26 @@ export async function exactRelationshipSearch(clientId, entityNames = [], matchC
                 supabase
                     .from('relation_mentions')
                     .select('source_node, target_node, relation_type, context, last_seen, support_count, stable_score, stability_tier, cognitive_flags, metadata')
+                    .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
+                    .eq('source_node', right)
+                    .eq('target_node', left)
+                    .order('stable_score', { ascending: false })
+                    .order('last_seen', { ascending: false })
+                    .limit(6),
+                supabase
+                    .from('relation_mentions')
+                    .select('source_node, target_node, relation_type, context, last_seen, support_count, stable_score, stability_tier, cognitive_flags')
+                    .eq('client_id', clientId)
+                    .in('stability_tier', ['provisional', 'stable'])
+                    .eq('source_node', left)
+                    .eq('target_node', right)
+                    .order('stable_score', { ascending: false })
+                    .order('last_seen', { ascending: false })
+                    .limit(6),
+                supabase
+                    .from('relation_mentions')
+                    .select('source_node, target_node, relation_type, context, last_seen, support_count, stable_score, stability_tier, cognitive_flags')
                     .eq('client_id', clientId)
                     .in('stability_tier', ['provisional', 'stable'])
                     .eq('source_node', right)
